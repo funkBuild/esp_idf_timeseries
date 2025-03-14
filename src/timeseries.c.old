@@ -1,0 +1,168 @@
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_partition.h"
+#include "timeseries.h"
+#include "timeseries_internal.h"
+#include "timeseries_iterator.h"
+
+#include "mbedtls/md5.h"
+
+#include <inttypes.h> // <-- for PRIu32, PRIu8, etc.
+#include <stdio.h>
+#include <string.h>
+
+static const char *TAG = "TimeseriesDB";
+
+// Global/Static DB Context
+static timeseries_db_t s_tsdb = {
+    .initialized = false,
+    .next_measurement_id = 1,
+    .partition = NULL,
+};
+
+// Forward declarations
+static bool load_pages_into_memory(void);
+static bool create_measurement_id(const char *measurement_name,
+                                  uint32_t *out_id);
+static bool find_measurement_id(const char *measurement_name, uint32_t *out_id);
+static bool insert_single_field(uint32_t measurement_id,
+                                const char *measurement_name,
+                                const char *field_name,
+                                const timeseries_field_value_t *field_val,
+                                const char **tag_keys, const char **tag_values,
+                                size_t num_tags, uint64_t timestamp_ms);
+
+static bool create_empty_metadata_page(uint32_t page_index);
+static bool insert_measurement_entry(const char *measurement_name, uint32_t id);
+static bool find_metadata_pages(uint32_t *out_pages, size_t max_pages,
+                                size_t *found_count);
+
+static bool ensure_series_type_in_metadata(const unsigned char series_id[16],
+                                           timeseries_field_type_e field_type);
+static bool index_tags_for_series(uint32_t measurement_id,
+                                  const char **tag_keys,
+                                  const char **tag_values, size_t num_tags,
+                                  const unsigned char series_id[16]);
+static bool append_field_data(const unsigned char series_id[16],
+                              uint64_t timestamp_ms,
+                              const timeseries_field_value_t *field_val);
+static bool soft_delete_entry(uint32_t page_idx, uint32_t current_entry_offset);
+static bool create_new_tagindex_entry(uint32_t page_idx, const char *key_str,
+                                      const unsigned char *series_ids,
+                                      size_t series_ids_len);
+
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// load_pages_into_memory (using iterators)
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// Create an empty metadata page
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// Other internal stubs
+//------------------------------------------------------------------------------
+
+/**
+ * @brief Append a single data point (timestamp + field_val) to a field data
+ * page. In a real system, you'd find free space or do compaction as needed.
+ */
+static bool append_field_data(const unsigned char series_id[16],
+                              uint64_t timestamp_ms,
+                              const timeseries_field_value_t *field_val) {
+  ESP_LOGD(TAG, "append_field_data: seriesID=%.2X%.2X%.2X%.2X..., ts=%" PRIu64,
+           series_id[0], series_id[1], series_id[2], series_id[3],
+           timestamp_ms);
+
+  // Real logic might do:
+  // 1. Find or create a field data page
+  // 2. Append an entry like:
+  //    key_type = TIMESERIES_KEYTYPE_FIELDDATA
+  //    key = series_id (16 bytes)
+  //    value = struct { start_ts, end_ts, data? } or store single timestamp +
+  //    value
+  // 3. In a minimal approach, store just (timestamp, raw value) => compress
+  // later.
+
+  // For demonstration, just log success
+  return true;
+}
+
+static bool create_new_tagindex_entry(uint32_t page_idx, const char *key_str,
+                                      const unsigned char *series_ids,
+                                      size_t series_ids_len) {
+  // 1) Find end offset in the given page
+  uint32_t page_offset = page_idx * TIMESERIES_PAGE_SIZE;
+  timeseries_entity_iterator_t ent_iter;
+  if (!timeseries_entity_iterator_init(&s_tsdb, page_idx, &ent_iter)) {
+    return false;
+  }
+
+  uint32_t last_offset = ent_iter.offset;
+  timeseries_entry_header_t e_hdr;
+  while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
+    last_offset = ent_iter.offset;
+  }
+  uint32_t entry_offset = page_offset + last_offset;
+
+  // 2) Construct the header
+  timeseries_entry_header_t new_hdr;
+  memset(&new_hdr, 0, sizeof(new_hdr));
+  new_hdr.delete_marker = TIMESERIES_DELETE_MARKER_VALID; // 0xFF
+  new_hdr.key_type = TIMESERIES_KEYTYPE_TAGINDEX;         // 0x02
+  new_hdr.key_len = (uint16_t)strlen(key_str);
+  new_hdr.value_len =
+      (uint16_t)series_ids_len; // must be multiple of 16 if multiple IDs
+
+  // 3) Write the header
+  esp_err_t err = esp_partition_write(s_tsdb.partition, entry_offset, &new_hdr,
+                                      sizeof(new_hdr));
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to write tagindex header (err=0x%x)", err);
+    return false;
+  }
+  entry_offset += sizeof(new_hdr);
+
+  // 4) Write the key string
+  err = esp_partition_write(s_tsdb.partition, entry_offset, key_str,
+                            new_hdr.key_len);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to write tagindex key (err=0x%x)", err);
+    return false;
+  }
+  entry_offset += new_hdr.key_len;
+
+  // 5) Write the series ID list
+  err = esp_partition_write(s_tsdb.partition, entry_offset, series_ids,
+                            series_ids_len);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to write tagindex value (err=0x%x)", err);
+    return false;
+  }
+
+  ESP_LOGV(TAG, "Created new tagindex entry for '%s', value_len=%" PRIu16,
+           key_str, new_hdr.value_len);
+  return true;
+}
+
+static bool soft_delete_entry(uint32_t page_idx,
+                              uint32_t current_entry_offset) {
+  // The absolute offset in flash for the start of this entry's header:
+  uint32_t page_offset = page_idx * TIMESERIES_PAGE_SIZE;
+  uint32_t entry_addr = page_offset + current_entry_offset;
+
+  // Overwrite delete_marker with 0x00
+  uint8_t marker = TIMESERIES_DELETE_MARKER_DELETED; // 0x00
+  esp_err_t err = esp_partition_write(s_tsdb.partition, entry_addr, &marker, 1);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG,
+             "Failed to soft-delete entry at offset=0x%08" PRIx32 " (err=0x%x)",
+             entry_addr, err);
+    return false;
+  }
+  ESP_LOGD(TAG, "Soft-deleted old tagindex entry at offset=0x%08" PRIx32,
+           entry_addr);
+  return true;
+}

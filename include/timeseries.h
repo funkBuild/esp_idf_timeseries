@@ -23,7 +23,7 @@ typedef struct {
     int64_t int_val;
     bool bool_val;
     struct {
-      const char *str;
+      char *str;
       size_t length;
     } string_val;
   } data;
@@ -89,14 +89,15 @@ typedef struct timeseries_query_t {
    * Optional time-range filtering (if supported in your query logic).
    * If start_ms or end_ms is 0, it might signify "no bound" on that side.
    */
-  uint64_t start_ms;
-  uint64_t end_ms;
+  int64_t start_ms;
+  int64_t end_ms;
 
   /**
    * A maximum total number of data points to return across all columns.
    * If limit=0, treat as "no limit".
    */
   size_t limit;
+  uint32_t rollup_interval;
 
 } timeseries_query_t;
 
@@ -171,6 +172,8 @@ bool timeseries_query(const timeseries_query_t *query,
                       timeseries_query_result_t *result);
 
 void timeseries_query_free_result(timeseries_query_result_t *result);
+
+bool timeseries_clear_all();
 
 #ifdef __cplusplus
 }

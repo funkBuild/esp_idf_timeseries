@@ -14,6 +14,11 @@ extern "C" {
 #endif
 
 typedef struct {
+  uint32_t length;
+  char *str;
+} string_array_t;
+
+typedef struct {
   timeseries_db_t *db;
   bool valid;
 
@@ -42,6 +47,7 @@ typedef struct {
     double *float_array;
     int64_t *int_array;
     bool *bool_array;
+    string_array_t *string_array;
   };
 
   // ********** ADD THESE FIELDS **********

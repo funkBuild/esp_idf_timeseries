@@ -162,11 +162,20 @@ bool timeseries_points_iterator_init(
     iter->val_decoder_context.cb = &iter->val_cb_storage;
     iter->val_decoder_context.offset = 0;
 
-    gorilla_stream_type_t val_mode = GORILLA_STREAM_INT;
-    if (series_type == TIMESERIES_FIELD_TYPE_FLOAT) {
+    gorilla_stream_type_t val_mode;
+    switch (series_type) {
+    case TIMESERIES_FIELD_TYPE_FLOAT:
       val_mode = GORILLA_STREAM_FLOAT;
-    } else if (series_type == TIMESERIES_FIELD_TYPE_BOOL) {
+      break;
+    case TIMESERIES_FIELD_TYPE_BOOL:
       val_mode = GORILLA_STREAM_BOOL;
+      break;
+    case TIMESERIES_FIELD_TYPE_STRING:
+      val_mode = GORILLA_STREAM_STRING;
+      break;
+    default:
+      val_mode = GORILLA_STREAM_INT;
+      break;
     }
 
     if (!gorilla_decoder_init(&iter->val_decoder, val_mode,
@@ -182,7 +191,7 @@ bool timeseries_points_iterator_init(
       return false;
     }
 
-    ESP_LOGD(TAG, "Iterator init: compressed, record_count=%u", record_count);
+    ESP_LOGV(TAG, "Iterator init: compressed, record_count=%u", record_count);
   } else {
     /* ----------------------------------------------------------------------
      * 3) Not compressed => read timestamps and values from partition
@@ -309,6 +318,78 @@ bool timeseries_points_iterator_init(
       }
       break;
     }
+    case TIMESERIES_FIELD_TYPE_STRING: {
+      // Allocate array for string values
+      iter->string_array =
+          (string_array_t *)malloc(record_count * sizeof(string_array_t));
+
+      if (!iter->string_array) {
+        ESP_LOGE(TAG, "OOM for string_array of size=%u", record_count);
+        free(iter->ts_array);
+        free(val_buf);
+        iter->ts_array = NULL;
+        iter->valid = false;
+        return false;
+      }
+
+      size_t offset = 0;
+      size_t i; // Move i declaration outside the loop for later use in cleanup
+      for (i = 0; i < record_count; i++) {
+        // Read string length (4 bytes)
+        uint32_t str_len = 0;
+        if (offset + 4 > col_hdr.val_len) {
+          ESP_LOGE(TAG, "Value buffer too small for string length at i=%zu", i);
+          iter->valid = false;
+          break;
+        }
+        memcpy(&str_len, val_buf + offset, 4);
+        offset += 4;
+
+        // Store the length
+        iter->string_array[i].length = str_len;
+
+        // Allocate and copy the string data
+        if (str_len > 0) {
+          if (offset + str_len > col_hdr.val_len) {
+            ESP_LOGE(TAG, "Value buffer too small for string data at i=%zu", i);
+            iter->valid = false;
+            break;
+          }
+
+          iter->string_array[i].str =
+              (char *)malloc(str_len + 1); // +1 for null terminator
+          if (!iter->string_array[i].str) {
+            ESP_LOGE(TAG, "OOM for string data of length=%u",
+                     (unsigned)str_len);
+            iter->valid = false;
+            break;
+          }
+
+          memcpy(iter->string_array[i].str, val_buf + offset, str_len);
+          iter->string_array[i].str[str_len] = '\0'; // Null-terminate
+          offset += str_len;
+        } else {
+          iter->string_array[i].str = NULL;
+        }
+      }
+
+      // Handle any error that occurred in the loop
+      if (!iter->valid) {
+        // Clean up previously allocated strings
+        for (size_t j = 0; j < i; j++) {
+          if (iter->string_array[j].str) {
+            free(iter->string_array[j].str);
+          }
+        }
+        free(iter->string_array);
+        free(iter->ts_array);
+        free(val_buf);
+        iter->string_array = NULL;
+        iter->ts_array = NULL;
+        return false;
+      }
+      break;
+    }
     default: {
       ESP_LOGE(TAG, "Unsupported uncompressed type=%d", (int)series_type);
       iter->valid = false;
@@ -375,6 +456,7 @@ bool timeseries_points_iterator_next_value(
   if (!out_value) {
     return false;
   }
+
   out_value->type = iter->series_type;
 
   // If uncompressed:
@@ -387,6 +469,7 @@ bool timeseries_points_iterator_next_value(
       return true;
     }
     case TIMESERIES_FIELD_TYPE_INT: {
+      ESP_LOGI(TAG, "iter->int_array[idx] = %lld", iter->int_array[idx]);
       int64_t i64 = iter->int_array[idx];
       out_value->data.int_val = i64;
       return true;
@@ -394,6 +477,11 @@ bool timeseries_points_iterator_next_value(
     case TIMESERIES_FIELD_TYPE_BOOL: {
       bool b = iter->bool_array[idx];
       out_value->data.bool_val = b;
+      return true;
+    }
+    case TIMESERIES_FIELD_TYPE_STRING: {
+      out_value->data.string_val.length = iter->string_array[idx].length;
+      out_value->data.string_val.str = iter->string_array[idx].str;
       return true;
     }
     default:
@@ -423,7 +511,10 @@ bool timeseries_points_iterator_next_value(
       iter->valid = false;
       return false;
     }
-    out_value->data.int_val = (int64_t)i64;
+
+    // convert to int64_t
+    memcpy(&out_value->data.int_val, &i64, sizeof(i64));
+
     break;
   }
   case TIMESERIES_FIELD_TYPE_BOOL: {
@@ -434,6 +525,22 @@ bool timeseries_points_iterator_next_value(
       return false;
     }
     out_value->data.bool_val = bval;
+    break;
+  }
+  case TIMESERIES_FIELD_TYPE_STRING: {
+    char *str = NULL;
+    size_t str_len = 0;
+
+    if (gorilla_decoder_get_string(&iter->val_decoder, (uint8_t **)&str,
+                                   &str_len)) {
+
+      out_value->data.string_val.str = str;
+      out_value->data.string_val.length = str_len;
+    } else {
+      ESP_LOGE(TAG, "Failed to decode next string at idx=%u", idx);
+      iter->valid = false;
+      return false;
+    }
     break;
   }
   default:
@@ -482,6 +589,16 @@ void timeseries_points_iterator_deinit(timeseries_points_iterator_t *iter) {
     if (iter->bool_array) {
       free(iter->bool_array);
       iter->bool_array = NULL;
+    }
+    if (iter->string_array) {
+      // Free each string allocation
+      for (size_t i = 0; i < iter->ts_count; i++) {
+        if (iter->string_array[i].str) {
+          free(iter->string_array[i].str);
+        }
+      }
+      free(iter->string_array);
+      iter->string_array = NULL;
     }
   }
 

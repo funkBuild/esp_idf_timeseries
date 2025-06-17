@@ -66,6 +66,9 @@ bool gorilla_stream_add_float(gorilla_stream_t *stream, double value);
 
 bool gorilla_stream_add_boolean(gorilla_stream_t *stream, bool value);
 
+bool gorilla_stream_add_string(gorilla_stream_t *stream, const char *data,
+                               size_t length);
+
 /**
  * @brief Finish the Gorilla stream, flushing remaining bits and writing any
  * footer.

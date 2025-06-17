@@ -109,8 +109,8 @@ void app_main(void) {
     return;
   }
 
-  example_query_weather_data();
-  return;
+  // example_query_weather_data();
+  // return;
 
   // Common tags & field definitions
   const char *tags_keys[] = {"suburb", "city"};

@@ -3,9 +3,15 @@
 #include "gorilla/float_stream_encoder.h" // New float encoder interface.
 #include "gorilla/gorilla_stream_types.h"
 #include "gorilla/integer_stream_encoder.h" // Existing integer encoder interface.
+#include "gorilla/string_stream_encoder.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "esp_log.h"
+
+const char *TAG = "GorillaStreamEncoder";
 
 /*
  * The original flush callback type (from gorilla_stream_flush_cb)
@@ -49,6 +55,11 @@ typedef struct {
   BooleanStreamEncoder *encoder;
   FlushAdapter *adapter;
 } BooleanEncoderWrapper;
+
+typedef struct {
+  StringStreamEncoder *encoder;
+  FlushAdapter *adapter;
+} StringEncoderWrapper;
 
 /**
  * @brief Initialize the Gorilla stream.
@@ -151,7 +162,38 @@ bool gorilla_stream_init(gorilla_stream_t *stream,
     wrapper->encoder = enc;
     wrapper->adapter = adapter;
     stream->encoder_impl = wrapper;
+  } else if (stream_type == GORILLA_STREAM_STRING) {
+    FlushAdapter *adapter = (FlushAdapter *)malloc(sizeof(FlushAdapter));
+
+    if (!adapter) {
+      ESP_LOGE(TAG, "Failed to allocate memory for flush adapter");
+      return false;
+    }
+
+    adapter->orig_flush_cb = flush_cb;
+    adapter->orig_flush_ctx = flush_ctx;
+
+    StringStreamEncoder *enc =
+        string_stream_encoder_create(flush_adapter_cb, adapter);
+    if (!enc) {
+      ESP_LOGE(TAG, "Failed to create string stream encoder");
+      free(adapter);
+      return false;
+    }
+
+    StringEncoderWrapper *wrapper =
+        (StringEncoderWrapper *)malloc(sizeof(StringEncoderWrapper));
+    if (!wrapper) {
+      ESP_LOGE(TAG, "Failed to allocate memory for string encoder wrapper");
+      string_stream_encoder_destroy(enc);
+      free(adapter);
+      return false;
+    }
+    wrapper->encoder = enc;
+    wrapper->adapter = adapter;
+    stream->encoder_impl = wrapper;
   }
+
   return true;
 }
 
@@ -222,6 +264,21 @@ bool gorilla_stream_add_boolean(gorilla_stream_t *stream, bool value) {
   }
 }
 
+bool gorilla_stream_add_string(gorilla_stream_t *stream, const char *data,
+                               size_t length) {
+  if (!stream) {
+    return false;
+  }
+  if (stream->stream_type == GORILLA_STREAM_STRING) {
+    StringEncoderWrapper *wrapper =
+        (StringEncoderWrapper *)stream->encoder_impl;
+    return string_stream_encoder_add_value(wrapper->encoder, data, length);
+  } else {
+    /* Fallback: immediately flush raw string if it's not a string stream. */
+    return stream->flush_cb(stream->flush_ctx, (const uint8_t *)data, length);
+  }
+}
+
 /**
  * @brief Finalize the Gorilla stream.
  *
@@ -245,7 +302,12 @@ bool gorilla_stream_finish(gorilla_stream_t *stream) {
     BooleanEncoderWrapper *wrapper =
         (BooleanEncoderWrapper *)stream->encoder_impl;
     return boolean_stream_encoder_finish(wrapper->encoder);
+  } else if (stream->stream_type == GORILLA_STREAM_STRING) {
+    StringEncoderWrapper *wrapper =
+        (StringEncoderWrapper *)stream->encoder_impl;
+    return string_stream_encoder_finish(wrapper->encoder);
   }
+
   return true;
 }
 
@@ -291,6 +353,19 @@ void gorilla_stream_deinit(gorilla_stream_t *stream) {
     if (wrapper) {
       if (wrapper->encoder) {
         boolean_stream_encoder_destroy(wrapper->encoder);
+      }
+      if (wrapper->adapter) {
+        free(wrapper->adapter);
+      }
+      free(wrapper);
+      stream->encoder_impl = NULL;
+    }
+  } else if (stream->stream_type == GORILLA_STREAM_STRING) {
+    StringEncoderWrapper *wrapper =
+        (StringEncoderWrapper *)stream->encoder_impl;
+    if (wrapper) {
+      if (wrapper->encoder) {
+        string_stream_encoder_destroy(wrapper->encoder);
       }
       if (wrapper->adapter) {
         free(wrapper->adapter);

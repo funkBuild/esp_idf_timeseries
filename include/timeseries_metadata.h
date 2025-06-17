@@ -170,6 +170,12 @@ bool tsdb_list_fields_for_measurement(timeseries_db_t *db,
                                       uint32_t measurement_id,
                                       timeseries_string_list_t *out_fields);
 
+bool timeseries_metadata_create_page(timeseries_db_t *db);
+
+bool tsdb_find_all_series_ids_for_measurement(
+    timeseries_db_t *db, uint32_t measurement_id,
+    timeseries_series_id_list_t *out_series_list);
+
 #ifdef __cplusplus
 }
 #endif

@@ -11,4 +11,6 @@ bool tsdb_pagecache_remove_entry(timeseries_db_t *db, uint32_t offset);
 uint32_t tsdb_pagecache_get_total_active_size(const timeseries_db_t *db);
 uint32_t tsdb_pagecache_get_page_size(const timeseries_db_t *db,
                                       uint32_t page_offset);
+void tsdb_pagecache_clear(timeseries_db_t *db);
+
 #endif // TIMESERIES_PAGE_CACHE_H

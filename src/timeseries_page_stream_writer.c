@@ -279,11 +279,22 @@ bool timeseries_page_stream_writer_begin_series(
 
   // For values, pick an appropriate Gorilla mode
   gorilla_stream_type_t val_mode = GORILLA_STREAM_INT; // default
-  if (ftype == TIMESERIES_FIELD_TYPE_FLOAT) {
+  switch (ftype) {
+  case TIMESERIES_FIELD_TYPE_FLOAT:
     val_mode = GORILLA_STREAM_FLOAT;
-  } else if (ftype == TIMESERIES_FIELD_TYPE_BOOL) {
+    break;
+  case TIMESERIES_FIELD_TYPE_BOOL:
     val_mode = GORILLA_STREAM_BOOL;
+    break;
+  case TIMESERIES_FIELD_TYPE_STRING:
+    ESP_LOGI(TAG, "Setting val_mode to GORILLA_STREAM_STRING");
+    val_mode = GORILLA_STREAM_STRING;
+    break;
+  default:
+    val_mode = GORILLA_STREAM_INT;
+    break;
   }
+
   if (!gorilla_stream_init(&writer->val_stream, val_mode,
                            /*initial_xor=*/NULL, 0 /*leading_zeros*/,
                            gorilla_flush_to_flash, &writer->val_flush_ctx)) {
@@ -407,6 +418,15 @@ bool timeseries_page_stream_writer_write_value(
       ESP_LOGE(TAG, "Failed adding BOOL value to val_stream");
       return false;
     }
+    break;
+  }
+  case TIMESERIES_FIELD_TYPE_STRING: {
+    if (!gorilla_stream_add_string(&writer->val_stream, fv->data.string_val.str,
+                                   fv->data.string_val.length)) {
+      ESP_LOGE(TAG, "Failed adding STRING value to val_stream");
+      return false;
+    }
+
     break;
   }
   default:
@@ -542,7 +562,7 @@ bool timeseries_page_stream_writer_finalize(
            writer->base_offset, final_size);
 
   float page_utilization = (float)used_bytes / final_size;
-  ESP_LOGE(TAG, "Page utilization: %.2f%%. page_size=%u level=%u",
+  ESP_LOGI(TAG, "Page utilization: %.2f%%. page_size=%u level=%u",
            page_utilization * 100.0, (unsigned int)final_size,
            (unsigned int)hdr.field_data_level);
 

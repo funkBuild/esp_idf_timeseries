@@ -67,6 +67,7 @@ static bool multi_iter_advance_sub(timeseries_multi_points_iterator_t *multi,
   multi_points_sub_iter_t *sub = &multi->subs[i];
   uint64_t ts = 0;
   timeseries_field_value_t val;
+
   if (!timeseries_points_iterator_next_timestamp(sub->sub_iter, &ts)) {
     sub->valid = false;
     return false;
@@ -76,6 +77,12 @@ static bool multi_iter_advance_sub(timeseries_multi_points_iterator_t *multi,
     sub->valid = false;
     return false;
   }
+
+  // Free string memory if needed
+  if (sub->current_val.type == TIMESERIES_FIELD_TYPE_STRING) {
+    free(sub->current_val.data.string_val.str);
+  }
+
   sub->current_ts = ts;
   sub->current_val = val;
 
@@ -241,6 +248,14 @@ void timeseries_multi_points_iterator_deinit(
   if (!multi_iter) {
     return;
   }
+
+  // Free any string memory
+  for (size_t i = 0; i < multi_iter->sub_count; i++) {
+    if (multi_iter->subs[i].current_val.type == TIMESERIES_FIELD_TYPE_STRING) {
+      free(multi_iter->subs[i].current_val.data.string_val.str);
+    }
+  }
+
   if (multi_iter->subs) {
     // We do NOT deinit sub->sub_iter here unless we own them
     // They might be owned externally.

@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "gorilla/bit_reader.h"
+
 /**
  * @brief Callback signature for filling the internal buffer with compressed
  * data.
@@ -34,5 +36,5 @@ typedef enum {
   GORILLA_STREAM_INT,
   GORILLA_STREAM_TYPE_SIMPLE8B,
   GORILLA_STREAM_BOOL,
-  // Add more types as needed (e.g. bool, etc.)
+  GORILLA_STREAM_STRING,
 } gorilla_stream_type_t;

@@ -70,6 +70,40 @@ static bool tsdb_upsert_fieldlist_entry(timeseries_db_t *db,
 // Public API Implementations
 // -----------------------------------------------------------------------------
 
+bool timeseries_metadata_create_page(timeseries_db_t *db) {
+  if (!db) {
+    return false;
+  }
+
+  timeseries_blank_iterator_t blank_iter;
+  if (!timeseries_blank_iterator_init(db, &blank_iter,
+                                      TIMESERIES_METADATA_PAGE_SIZE)) {
+    ESP_LOGE(TAG, "Failed to init blank iterator");
+    return false;
+  }
+
+  uint32_t blank_offset = 0, blank_length = 0;
+  bool found_blank =
+      timeseries_blank_iterator_next(&blank_iter, &blank_offset, &blank_length);
+
+  if (!found_blank) {
+    ESP_LOGE(TAG, "No blank region found to create metadata page!");
+    return false;
+  }
+
+  ESP_LOGV(TAG,
+           "Found blank region @0x%08" PRIx32 " (length=%" PRIu32 " bytes).",
+           blank_offset, blank_length);
+
+  // 3) Create the empty metadata page here
+  if (!tsdb_create_empty_metadata_page(db, blank_offset)) {
+    ESP_LOGE(TAG, "Failed to create metadata page @0x%08" PRIx32, blank_offset);
+    return false;
+  }
+
+  return true;
+}
+
 bool tsdb_load_pages_into_memory(timeseries_db_t *db) {
   if (!db) {
     return false;
@@ -126,36 +160,7 @@ bool tsdb_load_pages_into_memory(timeseries_db_t *db) {
   // 2) If no metadata page found, create one
   if (!found_metadata_page) {
     ESP_LOGV(TAG, "No active metadata page found; creating one...");
-
-    // Use the BLANK iterator to find a region of at least 8KB (metadata size)
-    timeseries_blank_iterator_t blank_iter;
-    if (!timeseries_blank_iterator_init(db, &blank_iter,
-                                        TIMESERIES_METADATA_PAGE_SIZE)) {
-      ESP_LOGE(TAG, "Failed to init blank iterator");
-      return false;
-    }
-
-    uint32_t blank_offset = 0, blank_length = 0;
-    bool found_blank = timeseries_blank_iterator_next(
-        &blank_iter, &blank_offset, &blank_length);
-
-    if (!found_blank) {
-      ESP_LOGE(TAG, "No blank region found to create metadata page!");
-      return false;
-    }
-
-    ESP_LOGV(TAG,
-             "Found blank region @0x%08" PRIx32 " (length=%" PRIu32 " bytes).",
-             blank_offset, blank_length);
-
-    // 3) Create the empty metadata page here
-    if (!tsdb_create_empty_metadata_page(db, blank_offset)) {
-      ESP_LOGE(TAG, "Failed to create metadata page @0x%08" PRIx32,
-               blank_offset);
-      return false;
-    }
-
-    found_metadata_page = true;
+    found_metadata_page = timeseries_metadata_create_page(db);
   }
 
   return true;
@@ -1344,6 +1349,124 @@ bool tsdb_list_fields_for_measurement(timeseries_db_t *db,
       }
     }
   }
+
+  return found_any;
+}
+
+bool tsdb_find_all_series_ids_for_measurement(
+    timeseries_db_t *db, uint32_t measurement_id,
+    timeseries_series_id_list_t *out_series_list) {
+  if (!db || !out_series_list) {
+    return false;
+  }
+
+  // 1) Find all active METADATA pages
+  uint32_t meta_offsets[4];
+  size_t meta_count = 0;
+  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count) ||
+      meta_count == 0) {
+    ESP_LOGD(TAG, "No active metadata pages => no series to find.");
+    return false;
+  }
+
+  bool found_any = false;
+
+  // 2) Scan each metadata page for FIELDLISTINDEX entries
+  for (size_t p = 0; p < meta_count; p++) {
+    uint32_t page_offset = meta_offsets[p];
+    uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
+
+    timeseries_entity_iterator_t ent_iter;
+    if (!timeseries_entity_iterator_init(db, page_offset, page_size,
+                                         &ent_iter)) {
+      continue;
+    }
+
+    timeseries_entry_header_t e_hdr;
+    while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
+      // We only want valid FIELDLISTINDEX entries
+      if (e_hdr.key_type != TIMESERIES_KEYTYPE_FIELDLISTINDEX ||
+          e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
+        continue;
+      }
+
+      // The key should look like "1234:someField"
+      // Check that it fits in our buffer (just like we do for fields/tags)
+      if (e_hdr.key_len == 0 || e_hdr.key_len >= 128) {
+        continue; // skip invalid or overly large keys
+      }
+
+      // Value must be multiple of 16 (each series ID = 16 bytes)
+      if (e_hdr.value_len % 16 != 0) {
+        ESP_LOGW(TAG,
+                 "Unexpected fieldlist value_len=%" PRIu16
+                 " (not multiple of 16).",
+                 e_hdr.value_len);
+        continue;
+      }
+
+      char key_buf[128];
+      memset(key_buf, 0, sizeof(key_buf));
+      unsigned char *series_ids = malloc(e_hdr.value_len);
+      if (!series_ids) {
+        ESP_LOGE(TAG, "Out of memory reading fieldlist series IDs");
+        continue;
+      }
+
+      // Read the key and the array of series IDs
+      if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key_buf,
+                                                series_ids)) {
+        ESP_LOGW(TAG, "Failed reading fieldlist entry data");
+        free(series_ids);
+        continue;
+      }
+
+      // Null-terminate the key
+      key_buf[e_hdr.key_len] = '\0';
+
+      // key_buf has the form "<meas_id>:<field_name>"
+      // Let's parse out the meas_id portion before the first colon.
+      char *colon_ptr = strchr(key_buf, ':');
+      if (!colon_ptr) {
+        free(series_ids);
+        continue; // malformed key
+      }
+
+      *colon_ptr = '\0';                      // split into two strings
+      const char *field_part = colon_ptr + 1; // not used for this function
+
+      // Convert the prefix to an integer
+      uint32_t listed_meas_id = (uint32_t)strtoul(key_buf, NULL, 10);
+
+      // If the meas_id matches, we want to merge all series IDs
+      if (listed_meas_id == measurement_id) {
+        found_any = true;
+        size_t num_ids = e_hdr.value_len / 16;
+        for (size_t i = 0; i < num_ids; i++) {
+          unsigned char *sid = series_ids + (i * 16);
+
+          // Optional: check for duplicates so we only add unique
+          // series IDs once:
+          bool is_duplicate = false;
+          for (size_t j = 0; j < out_series_list->count; j++) {
+            if (memcmp(out_series_list->ids[j].bytes, sid, 16) == 0) {
+              is_duplicate = true;
+              break;
+            }
+          }
+          if (!is_duplicate) {
+            if (!tsdb_series_id_list_append(out_series_list, sid)) {
+              ESP_LOGE(TAG, "Failed appending a series ID (OOM?)");
+              free(series_ids);
+              return false;
+            }
+          }
+        }
+      }
+
+      free(series_ids);
+    } // while next entry
+  } // for meta_count
 
   return found_any;
 }

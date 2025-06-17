@@ -1,3 +1,6 @@
 example/.cache
 example/build
 example/managed_components
+build
+.cache
+managed_components

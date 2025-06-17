@@ -81,12 +81,14 @@ bool timeseries_query_execute(timeseries_db_t *db,
     return true; // empty result
   }
 
-  // 2) Collect all series IDs matching query tags
+  // 2) Collect all series IDs either by intersecting tags or by grabbing
+  //    all series for the measurement if no tags were specified.
   timeseries_series_id_list_t matched_series;
   tsdb_series_id_list_init(&matched_series);
 
   if (query->num_tags > 0) {
-    // For the first tag, we gather matched series, then intersect.
+    // For the first tag, gather matched series, then intersect with subsequent
+    // tags.
     timeseries_series_id_list_t temp_list;
     tsdb_series_id_list_init(&temp_list);
 
@@ -99,7 +101,7 @@ bool timeseries_query_execute(timeseries_db_t *db,
                                        query->tag_values[i], &temp_list);
 
       if (i == 0) {
-        // first tag => copy
+        // first tag => copy into matched_series
         tsdb_series_id_list_copy(&matched_series, &temp_list);
       } else {
         // intersect
@@ -107,12 +109,20 @@ bool timeseries_query_execute(timeseries_db_t *db,
       }
     }
   } else {
-    // If no tags => you could gather all series for the measurement
-    // This code snippet is omitted for brevity
+    // If no tags => gather all series for this measurement (skip tag filtering)
+    if (!tsdb_find_all_series_ids_for_measurement(db, measurement_id,
+                                                  &matched_series) ||
+        matched_series.count == 0) {
+      ESP_LOGI(TAG, "No series found for measurement '%s'.",
+               query->measurement_name);
+      tsdb_series_id_list_free(&matched_series);
+      return true;
+    }
   }
 
+  // If, after tag intersection (or “all series” lookup), we have no series:
   if (matched_series.count == 0) {
-    ESP_LOGI(TAG, "No series matched the tag filters.");
+    ESP_LOGI(TAG, "No series matched the tag filters (or none exist).");
     tsdb_series_id_list_free(&matched_series);
     return true;
   }
@@ -134,15 +144,14 @@ bool timeseries_query_execute(timeseries_db_t *db,
     }
   } else {
     // => user-specified fields
-    // we'll copy them into the fields_to_query list
     for (size_t i = 0; i < query->num_fields; i++) {
       tsdb_string_list_append_unique(&fields_to_query, query->field_names[i]);
     }
   }
 
-  // 4) For each field, find the relevant series (that also appear in
-  // matched_series),
-  //    store them in field_info_t
+  // 4) For each field, find the relevant series.
+  //    - We first find all series for that field
+  //    - then, if tags were used, we intersect with matched_series
   field_info_t *fields_array =
       calloc(fields_to_query.count, sizeof(field_info_t));
   if (!fields_array) {
@@ -157,7 +166,7 @@ bool timeseries_query_execute(timeseries_db_t *db,
   for (size_t f = 0; f < fields_to_query.count; f++) {
     const char *fname = fields_to_query.items[f];
 
-    // 1) find all series for that field
+    // 1) find all series that have this field
     timeseries_series_id_list_t field_series;
     tsdb_series_id_list_init(&field_series);
 
@@ -169,9 +178,10 @@ bool timeseries_query_execute(timeseries_db_t *db,
       continue;
     }
 
-    // 2) intersect with matched_series
-    intersect_series_id_lists(&field_series, &matched_series);
-
+    // 2) If tags were used, intersect with matched_series (otherwise skip)
+    if (query->num_tags > 0) {
+      intersect_series_id_lists(&field_series, &matched_series);
+    }
     if (field_series.count == 0) {
       // no relevant series => skip
       tsdb_series_id_list_free(&field_series);
@@ -587,7 +597,6 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
   // Example aggregator settings. In real usage, these might come from the
   // query:
   timeseries_aggregation_method_e agg_method = TSDB_AGGREGATION_AVG;
-  uint64_t rollup_interval = 5ULL * 60ULL * 1000ULL; // e.g. 5 minutes
 
   for (size_t f = 0; f < num_fields; f++) {
     field_info_t *fld = &fields_array[f];
@@ -596,7 +605,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     }
 
     // Determine a consistent field_type for all series in this field
-    timeseries_field_type_e field_type;
+    timeseries_field_type_e field_type = TIMESERIES_FIELD_TYPE_FLOAT;
     bool field_type_determined = false;
     bool skip_this_field = false;
 
@@ -738,9 +747,9 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
 
     // Use multi_series_iterator to aggregate across all series in the field
     timeseries_multi_series_iterator_t ms_iter;
-    if (!timeseries_multi_series_iterator_init(series_multi_iters,
-                                               fld->num_series, rollup_interval,
-                                               agg_method, &ms_iter)) {
+    if (!timeseries_multi_series_iterator_init(
+            series_multi_iters, fld->num_series, query->rollup_interval,
+            agg_method, &ms_iter)) {
       ESP_LOGW(TAG, "Failed multi-series aggregator for '%s'", fld->field_name);
     } else {
       // We'll pull aggregated points until exhausted, or until limit/time-range
@@ -771,33 +780,12 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
         // Actually store this aggregator result into the result struct
         size_t row_index = find_or_create_row(result, rollup_ts);
 
-        // Save the type + union data
-        result->columns[col_index].values[row_index].type = field_type;
-        switch (field_type) {
-        case TIMESERIES_FIELD_TYPE_FLOAT:
-          result->columns[col_index].values[row_index].data.float_val =
-              val_agg.data.float_val;
-          break;
-        case TIMESERIES_FIELD_TYPE_INT:
-          result->columns[col_index].values[row_index].data.int_val =
-              val_agg.data.int_val;
-          break;
-        case TIMESERIES_FIELD_TYPE_BOOL:
-          result->columns[col_index].values[row_index].data.bool_val =
-              val_agg.data.bool_val;
-          break;
-          /*
-        case TIMESERIES_FIELD_TYPE_STRING:
-          // Depending on how you store string data in val_agg,
-          // you might need strdup or reference it differently
-          result->columns[col_index].values[row_index].data.str_val =
-              val_agg.data.str_val; // caution with ownership
-          break;
-          */
-        default:
-          // handle others or log
-          break;
-        }
+        // Use the type from the aggregated value as it may be different from
+        // the original field type
+        result->columns[col_index].values[row_index].type = val_agg.type;
+
+        // Copy the aggregated value into the result
+        result->columns[col_index].values[row_index].data = val_agg.data;
 
         inserted_for_this_field++;
         total_points_aggregated++;

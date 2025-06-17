@@ -79,6 +79,8 @@ bool gorilla_decoder_get_float(gorilla_decoder_stream_t *decoder,
 
 bool gorilla_decoder_get_boolean(gorilla_decoder_stream_t *decoder,
                                  bool *value);
+bool gorilla_decoder_get_string(gorilla_decoder_stream_t *decoder,
+                                uint8_t **out_data, size_t *out_length);
 
 /**
  * @brief Finalize the decoding process.

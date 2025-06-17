@@ -164,3 +164,14 @@ uint32_t tsdb_pagecache_get_page_size(const timeseries_db_t *db,
 
   return 0; // not found
 }
+
+void tsdb_pagecache_clear(timeseries_db_t *db) {
+  if (!db || !db->page_cache) {
+    return;
+  }
+
+  free(db->page_cache);
+  db->page_cache = NULL;
+  db->page_cache_count = 0;
+  db->page_cache_capacity = 0;
+}

@@ -7,6 +7,7 @@
 #include "timeseries_internal.h"
 #include "timeseries_iterator.h"
 #include "timeseries_metadata.h"
+#include "timeseries_page_cache.h"
 #include "timeseries_query.h"
 
 #include "esp_timer.h"
@@ -235,4 +236,33 @@ void timeseries_query_free_result(timeseries_query_result_t *result) {
   // 4) Reset the numeric fields
   result->num_points = 0;
   result->num_columns = 0;
+}
+
+bool timeseries_clear_all() {
+  if (!s_tsdb.initialized) {
+    ESP_LOGE(TAG, "Timeseries DB not initialized yet.");
+    return false;
+  }
+
+  // Erase the entire partition
+  esp_err_t err =
+      esp_partition_erase_range(s_tsdb.partition, 0, s_tsdb.partition->size);
+
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to erase partition (err=0x%x)", err);
+    return false;
+  }
+
+  // Clear out any cached data
+  tsdb_pagecache_clear(&s_tsdb);
+
+  // Reset the last L0 cache
+  s_tsdb.last_l0_cache_valid = false;
+  s_tsdb.last_l0_page_offset = 0;
+  s_tsdb.last_l0_used_offset = 0;
+
+  // Add back the metadata page
+  timeseries_metadata_create_page(&s_tsdb);
+
+  return true;
 }

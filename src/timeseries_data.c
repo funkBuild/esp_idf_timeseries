@@ -21,9 +21,6 @@ static bool find_level0_page_with_space(timeseries_db_t *db,
                                         uint32_t *out_used_offset);
 static bool create_level0_field_page(timeseries_db_t *db, uint32_t *out_offset);
 
-// Helpers to measure or write the array of `(timestamp, fieldVal)`
-static size_t field_value_binary_size(const timeseries_field_value_t *val);
-
 // Writes a multi-point record: [field_data_header_t + data].
 static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
                                  uint32_t used_offset,
@@ -470,17 +467,4 @@ static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
            (page_offset + used_offset + sizeof(fhdr) + fhdr.record_length));
 
   return true;
-}
-
-static size_t field_value_binary_size(const timeseries_field_value_t *val) {
-  switch (val->type) {
-  case TIMESERIES_FIELD_TYPE_FLOAT:
-  case TIMESERIES_FIELD_TYPE_INT:
-    return 8;
-  case TIMESERIES_FIELD_TYPE_BOOL:
-    return 1;
-  case TIMESERIES_FIELD_TYPE_STRING:
-    return 4 + val->data.string_val.length;
-  }
-  return 0;
 }

@@ -5,9 +5,9 @@
 #include "esp_partition.h"
 
 #include "timeseries_compression.h"
-#include "timeseries_data.h" // for tsdb_write_levelX_page_dynamic()
+#include "timeseries_data.h"  // for tsdb_write_levelX_page_dynamic()
 #include "timeseries_internal.h"
-#include "timeseries_iterator.h" // for fielddata_iterator, points_iterator
+#include "timeseries_iterator.h"  // for fielddata_iterator, points_iterator
 #include "timeseries_metadata.h"
 #include "timeseries_multi_iterator.h"
 #include "timeseries_page_cache.h"
@@ -22,7 +22,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 
-static const char *TAG = "TimeseriesCompaction";
+static const char* TAG = "TimeseriesCompaction";
 
 /**
  * @brief Minimum number of pages needed at a level before compaction occurs.
@@ -38,27 +38,22 @@ static const char *TAG = "TimeseriesCompaction";
 // Forward Declarations
 // -----------------------------------------------------------------------------
 
-static bool tsdb_find_level_pages(timeseries_db_t *db, uint8_t source_level,
-                                  tsdb_level_page_t **out_pages,
-                                  size_t *out_count);
+static bool tsdb_find_level_pages(timeseries_db_t* db, uint8_t source_level, tsdb_level_page_t** out_pages,
+                                  size_t* out_count);
 
-static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t *db,
-                                               uint8_t source_level,
-                                               const tsdb_level_page_t *pages,
-                                               size_t page_count);
+static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t source_level,
+                                               const tsdb_level_page_t* pages, size_t page_count);
 
-static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
-                                        const tsdb_level_page_t *pages,
-                                        size_t page_count, uint8_t to_level);
+static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_page_t* pages, size_t page_count,
+                                        uint8_t to_level);
 
 typedef struct {
   size_t count;
   size_t capacity;
-  uint8_t (*list)[16]; // each element is a 16-byte series ID
+  uint8_t (*list)[16];  // each element is a 16-byte series ID
 } tsdb_series_id_list_t;
 
-static bool append_if_not_found_in_list(uint8_t (**list)[16], size_t *count,
-                                        size_t *capacity,
+static bool append_if_not_found_in_list(uint8_t (**list)[16], size_t* count, size_t* capacity,
                                         const uint8_t series_id[16]) {
   // 1) Check if this series_id is already in the array
   for (size_t i = 0; i < *count; i++) {
@@ -91,7 +86,7 @@ static bool append_if_not_found_in_list(uint8_t (**list)[16], size_t *count,
 // Public API
 // -----------------------------------------------------------------------------
 
-bool timeseries_compact_all_levels(timeseries_db_t *db) {
+bool timeseries_compact_all_levels(timeseries_db_t* db) {
   if (!db) {
     return false;
   }
@@ -107,7 +102,7 @@ bool timeseries_compact_all_levels(timeseries_db_t *db) {
     uint8_t to_level = (uint8_t)(from_level + 1);
 
     // 1) Figure out how many pages are at `from_level`
-    tsdb_level_page_t *pages = NULL;
+    tsdb_level_page_t* pages = NULL;
     size_t page_count = 0;
     if (!tsdb_find_level_pages(db, from_level, &pages, &page_count)) {
       // If we fail to even list pages, treat as an error
@@ -119,8 +114,8 @@ bool timeseries_compact_all_levels(timeseries_db_t *db) {
     // If no pages or fewer than MIN_PAGES_FOR_COMPACTION, skip compaction
     if (page_count < MIN_PAGES_FOR_COMPACTION) {
       free(pages);
-      ESP_LOGV(TAG, "Level-%u has %zu page(s), below threshold=%d => skip",
-               from_level, page_count, MIN_PAGES_FOR_COMPACTION);
+      ESP_LOGV(TAG, "Level-%u has %zu page(s), below threshold=%d => skip", from_level, page_count,
+               MIN_PAGES_FOR_COMPACTION);
       continue;
     }
     free(pages);
@@ -129,19 +124,18 @@ bool timeseries_compact_all_levels(timeseries_db_t *db) {
 
     // 2) We have enough pages => do the actual compaction
     if (!timeseries_compact_level_pages(db, from_level, to_level)) {
-      ESP_LOGE(TAG, "Compaction from level %u to %u failed.", from_level,
-               to_level);
+      ESP_LOGE(TAG, "Compaction from level %u to %u failed.", from_level, to_level);
       // Decide if you want to continue or break on failure
       return false;
     }
 
     int64_t end_time = esp_timer_get_time();
-    ESP_LOGI(TAG, "Compaction from level %u to %u took %.3f ms", from_level,
-             to_level, (end_time - start_time) / 1000.0);
+    ESP_LOGI(TAG, "Compaction from level %u to %u took %.3f ms", from_level, to_level,
+             (end_time - start_time) / 1000.0);
   }
 
   // Count the highest level for debug
-  tsdb_level_page_t *pages = NULL;
+  tsdb_level_page_t* pages = NULL;
   size_t page_count = 0;
 
   if (!tsdb_find_level_pages(db, 4, &pages, &page_count)) {
@@ -155,25 +149,21 @@ bool timeseries_compact_all_levels(timeseries_db_t *db) {
 
   uint32_t partition_size = db->partition->size;
   uint32_t used_space = tsdb_pagecache_get_total_active_size(db);
-  ESP_LOGI(TAG, "Total used space: %u, %f", (unsigned int)(used_space / 1024),
-           100.0f * used_space / partition_size);
+  ESP_LOGI(TAG, "Total used space: %u, %f", (unsigned int)(used_space / 1024), 100.0f * used_space / partition_size);
 
   free(pages);
 
   return true;
 }
 
-static bool gather_unique_series_ids(timeseries_db_t *db,
-                                     const tsdb_level_page_t *pages,
-                                     size_t page_count,
-                                     tsdb_series_id_list_t *out_ids) {
+static bool gather_unique_series_ids(timeseries_db_t* db, const tsdb_level_page_t* pages, size_t page_count,
+                                     tsdb_series_id_list_t* out_ids) {
   memset(out_ids, 0, sizeof(*out_ids));
 
   for (size_t p = 0; p < page_count; p++) {
-    const tsdb_level_page_t *pg = &pages[p];
+    const tsdb_level_page_t* pg = &pages[p];
     timeseries_fielddata_iterator_t f_iter;
-    if (!timeseries_fielddata_iterator_init(db, pg->offset, pg->size,
-                                            &f_iter)) {
+    if (!timeseries_fielddata_iterator_init(db, pg->offset, pg->size, &f_iter)) {
       ESP_LOGW(TAG, "Failed init iterator @0x%08" PRIx32, pg->offset);
       continue;
     }
@@ -185,24 +175,20 @@ static bool gather_unique_series_ids(timeseries_db_t *db,
         continue;
       }
       // Add the series_id to out_ids if not present
-      append_if_not_found_in_list(&out_ids->list, &out_ids->count,
-                                  &out_ids->capacity, fd_hdr.series_id);
+      append_if_not_found_in_list(&out_ids->list, &out_ids->count, &out_ids->capacity, fd_hdr.series_id);
     }
   }
   return true;
 }
 
-static bool
-collect_points_for_series(timeseries_db_t *db, const tsdb_level_page_t *pages,
-                          size_t page_count, const uint8_t series_id[16],
-                          tsdb_compact_data_point_t **out_pts, size_t *out_used,
-                          size_t *out_cap, timeseries_field_type_e *out_type,
-                          uint64_t *out_min_ts, uint64_t *out_max_ts) {
+static bool collect_points_for_series(timeseries_db_t* db, const tsdb_level_page_t* pages, size_t page_count,
+                                      const uint8_t series_id[16], tsdb_compact_data_point_t** out_pts,
+                                      size_t* out_used, size_t* out_cap, timeseries_field_type_e* out_type,
+                                      uint64_t* out_min_ts, uint64_t* out_max_ts) {
   for (size_t p = 0; p < page_count; p++) {
-    const tsdb_level_page_t *pg = &pages[p];
+    const tsdb_level_page_t* pg = &pages[p];
     timeseries_fielddata_iterator_t f_iter;
-    if (!timeseries_fielddata_iterator_init(db, pg->offset, pg->size,
-                                            &f_iter)) {
+    if (!timeseries_fielddata_iterator_init(db, pg->offset, pg->size, &f_iter)) {
       ESP_LOGW(TAG, "Failed init iterator @0x%08" PRIx32, pg->offset);
       continue;
     }
@@ -219,21 +205,17 @@ collect_points_for_series(timeseries_db_t *db, const tsdb_level_page_t *pages,
 
       // If we haven't yet looked up the field type, do so now
       if (*out_type == TIMESERIES_FIELD_TYPE_FLOAT) {
-        if (!tsdb_lookup_series_type_in_metadata(db, fd_hdr.series_id,
-                                                 out_type)) {
+        if (!tsdb_lookup_series_type_in_metadata(db, fd_hdr.series_id, out_type)) {
           ESP_LOGW(TAG, "No known field type for series => skipping");
           continue;
         }
       }
 
       // Points-iterator
-      uint32_t abs_offset = pg->offset + f_iter.current_record_offset +
-                            sizeof(timeseries_field_data_header_t);
+      uint32_t abs_offset = pg->offset + f_iter.current_record_offset + sizeof(timeseries_field_data_header_t);
       timeseries_points_iterator_t pts_iter;
-      if (!timeseries_points_iterator_init(db, abs_offset, fd_hdr.record_length,
-                                           fd_hdr.record_count, *out_type,
-                                           /*is_compressed=*/false,
-                                           &pts_iter)) {
+      if (!timeseries_points_iterator_init(db, abs_offset, fd_hdr.record_length, fd_hdr.record_count, *out_type,
+                                           /*is_compressed=*/false, &pts_iter)) {
         ESP_LOGW(TAG, "Failed init points iterator => skipping record");
         continue;
       }
@@ -250,8 +232,7 @@ collect_points_for_series(timeseries_db_t *db, const tsdb_level_page_t *pages,
         // Grow out_pts if needed
         if (*out_used == *out_cap) {
           size_t new_cap = (*out_cap == 0) ? 64 : (*out_cap * 2);
-          tsdb_compact_data_point_t *tmp =
-              realloc(*out_pts, new_cap * sizeof(tsdb_compact_data_point_t));
+          tsdb_compact_data_point_t* tmp = realloc(*out_pts, new_cap * sizeof(tsdb_compact_data_point_t));
           if (!tmp) {
             ESP_LOGE(TAG, "OOM collecting points for series");
             timeseries_points_iterator_deinit(&pts_iter);
@@ -265,10 +246,8 @@ collect_points_for_series(timeseries_db_t *db, const tsdb_level_page_t *pages,
         (*out_pts)[*out_used].field_val = fv;
         (*out_used)++;
 
-        if (ts < *out_min_ts)
-          *out_min_ts = ts;
-        if (ts > *out_max_ts)
-          *out_max_ts = ts;
+        if (ts < *out_min_ts) *out_min_ts = ts;
+        if (ts > *out_max_ts) *out_max_ts = ts;
       }
       timeseries_points_iterator_deinit(&pts_iter);
     }
@@ -276,20 +255,16 @@ collect_points_for_series(timeseries_db_t *db, const tsdb_level_page_t *pages,
   return true;
 }
 
-static int compare_points_by_timestamp(const void *a, const void *b) {
-  const tsdb_compact_data_point_t *A = (const tsdb_compact_data_point_t *)a;
-  const tsdb_compact_data_point_t *B = (const tsdb_compact_data_point_t *)b;
-  if (A->timestamp < B->timestamp)
-    return -1;
-  if (A->timestamp > B->timestamp)
-    return +1;
+static int compare_points_by_timestamp(const void* a, const void* b) {
+  const tsdb_compact_data_point_t* A = (const tsdb_compact_data_point_t*)a;
+  const tsdb_compact_data_point_t* B = (const tsdb_compact_data_point_t*)b;
+  if (A->timestamp < B->timestamp) return -1;
+  if (A->timestamp > B->timestamp) return +1;
   return 0;
 }
 
-static size_t remove_duplicates_in_place(tsdb_compact_data_point_t *pts,
-                                         size_t count) {
-  if (count < 2)
-    return count;
+static size_t remove_duplicates_in_place(tsdb_compact_data_point_t* pts, size_t count) {
+  if (count < 2) return count;
   size_t write_idx = 1;
   for (size_t i = 1; i < count; i++) {
     if (pts[i].timestamp != pts[write_idx - 1].timestamp) {
@@ -302,24 +277,21 @@ static size_t remove_duplicates_in_place(tsdb_compact_data_point_t *pts,
   return write_idx;
 }
 
-bool timeseries_compact_level_pages(timeseries_db_t *db, uint8_t from_level,
-                                    uint8_t to_level) {
+bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uint8_t to_level) {
   if (!db) {
     return false;
   }
-  ESP_LOGV(TAG, "Starting compaction from level=%u to level=%u ...", from_level,
-           to_level);
+  ESP_LOGV(TAG, "Starting compaction from level=%u to level=%u ...", from_level, to_level);
 
   // 1) Find all active pages at `from_level`.
-  tsdb_level_page_t *pages = NULL;
+  tsdb_level_page_t* pages = NULL;
   size_t page_count = 0;
   if (!tsdb_find_level_pages(db, from_level, &pages, &page_count)) {
     return false;
   }
   if (page_count < MIN_PAGES_FOR_COMPACTION) {
     // skip
-    ESP_LOGV(TAG, "Level-%u has only %zu pages => skip", from_level,
-             page_count);
+    ESP_LOGV(TAG, "Level-%u has only %zu pages => skip", from_level, page_count);
     free(pages);
     return true;
   }
@@ -331,8 +303,11 @@ bool timeseries_compact_level_pages(timeseries_db_t *db, uint8_t from_level,
     // LEVEL-0 => LEVEL-1
     // Use single-series-at-a-time with timeseries_page_stream_writer
     // --------------------------------------------------------------------
-    ESP_LOGI(TAG,
-             "Compacting from level-0 => level-1 (stream-writer per series).");
+    ESP_LOGI(TAG, "Compacting from level-0 => level-1 (stream-writer per series).");
+
+    int64_t start_time, end_time;
+
+    start_time = esp_timer_get_time();
 
     // (A) Gather all unique series IDs from L0
     tsdb_series_id_list_t uniq_ids;
@@ -342,6 +317,7 @@ bool timeseries_compact_level_pages(timeseries_db_t *db, uint8_t from_level,
       free(pages);
       return false;
     }
+
     if (uniq_ids.count == 0) {
       // No data => just mark pages obsolete
       ESP_LOGV(TAG, "No valid series in L0 => marking pages obsolete.");
@@ -350,13 +326,11 @@ bool timeseries_compact_level_pages(timeseries_db_t *db, uint8_t from_level,
       return true;
     }
 
-    // (B) Initialize one stream-writer for the new L1 page.
-    // We have no good estimate of "prev_data_size" in this simplistic example,
-    // so we might guess or set it to a small multiple. You could sum up
-    // the total uncompressed bytes if you want a better guess.
+    end_time = esp_timer_get_time();
+    ESP_LOGI(TAG, "Gathered %zu unique series IDs in %.3f ms", uniq_ids.count, (end_time - start_time) / 1000.0);
+
     timeseries_page_stream_writer_t sw;
-    if (!timeseries_page_stream_writer_init(db, &sw, to_level,
-                                            /*prev_data_size=*/4096)) {
+    if (!timeseries_page_stream_writer_init(db, &sw, to_level, 4096)) {
       ESP_LOGE(TAG, "Failed to init page_stream_writer for new L1 page.");
       free(pages);
       return false;
@@ -364,15 +338,16 @@ bool timeseries_compact_level_pages(timeseries_db_t *db, uint8_t from_level,
 
     // (C) For each series ID, read points, sort, deduplicate, then stream
     for (size_t i = 0; i < uniq_ids.count; i++) {
-      tsdb_compact_data_point_t *pts = NULL;
+      tsdb_compact_data_point_t* pts = NULL;
       size_t pts_used = 0, pts_cap = 0;
       timeseries_field_type_e ftype = TIMESERIES_FIELD_TYPE_FLOAT;
       uint64_t min_ts = UINT64_MAX, max_ts = 0;
 
+      start_time = esp_timer_get_time();
+
       // Collect this series’s points from all L0 pages
-      if (!collect_points_for_series(db, pages, page_count, uniq_ids.list[i],
-                                     &pts, &pts_used, &pts_cap, &ftype, &min_ts,
-                                     &max_ts)) {
+      if (!collect_points_for_series(db, pages, page_count, uniq_ids.list[i], &pts, &pts_used, &pts_cap, &ftype,
+                                     &min_ts, &max_ts)) {
         // If we fail, bail out
         free(pts);
         break;
@@ -382,16 +357,26 @@ bool timeseries_compact_level_pages(timeseries_db_t *db, uint8_t from_level,
         continue;
       }
 
+      end_time = esp_timer_get_time();
+      ESP_LOGI(TAG, "Collected %zu points in %.3f ms", pts_used, (end_time - start_time) / 1000.0);
+
+      start_time = esp_timer_get_time();
       // Sort by timestamp
-      qsort(pts, pts_used, sizeof(tsdb_compact_data_point_t),
-            compare_points_by_timestamp);
+      qsort(pts, pts_used, sizeof(tsdb_compact_data_point_t), compare_points_by_timestamp);
+
+      end_time = esp_timer_get_time();
+      ESP_LOGI(TAG, "Sorted %zu points in %.3f ms", pts_used, (end_time - start_time) / 1000.0);
 
       // Remove duplicates (by timestamp)
+      start_time = esp_timer_get_time();
       pts_used = remove_duplicates_in_place(pts, pts_used);
+      end_time = esp_timer_get_time();
+      ESP_LOGI(TAG, "Removed duplicates, now %zu points in %.3f ms", pts_used, (end_time - start_time) / 1000.0);
+
+      start_time = esp_timer_get_time();
 
       // Begin streaming this series
-      if (!timeseries_page_stream_writer_begin_series(&sw, uniq_ids.list[i],
-                                                      ftype)) {
+      if (!timeseries_page_stream_writer_begin_series(&sw, uniq_ids.list[i], ftype)) {
         ESP_LOGE(TAG, "Failed to begin_series for i=%zu", i);
         free(pts);
         break;
@@ -411,8 +396,7 @@ bool timeseries_compact_level_pages(timeseries_db_t *db, uint8_t from_level,
 
       // PASS #2: Write values
       for (size_t j = 0; j < pts_used; j++) {
-        if (!timeseries_page_stream_writer_write_value(&sw,
-                                                       &pts[j].field_val)) {
+        if (!timeseries_page_stream_writer_write_value(&sw, &pts[j].field_val)) {
           ESP_LOGE(TAG, "Failed writing value for j=%zu", j);
           // break or bail
         }
@@ -423,13 +407,16 @@ bool timeseries_compact_level_pages(timeseries_db_t *db, uint8_t from_level,
         }
       }
 
-      free(uniq_ids.list);
-
       // end this series
       timeseries_page_stream_writer_end_series(&sw);
 
       free(pts);
+
+      end_time = esp_timer_get_time();
+      ESP_LOGI(TAG, "Wrote series with %zu points in %.3f ms", i + 1, (end_time - start_time) / 1000.0);
     }
+
+    free(uniq_ids.list);
 
     // (D) Finalize the new page
     if (!timeseries_page_stream_writer_finalize(&sw)) {
@@ -444,16 +431,13 @@ bool timeseries_compact_level_pages(timeseries_db_t *db, uint8_t from_level,
     // LEVEL-1 (or higher) => LEVEL-2
     // Use your existing multi-iterator approach
     // --------------------------------------------------------------------
-    ESP_LOGI(TAG,
-             "Compacting from level-%u => level-%u using multi-iterator...",
-             from_level, to_level);
+    ESP_LOGI(TAG, "Compacting from level-%u => level-%u using multi-iterator...", from_level, to_level);
     success = tsdb_compact_multi_iterator(db, pages, page_count, to_level);
   }
 
   // If we succeeded, mark old pages as obsolete
   if (success) {
-    if (!tsdb_mark_old_level_pages_obsolete(db, from_level, pages,
-                                            page_count)) {
+    if (!tsdb_mark_old_level_pages_obsolete(db, from_level, pages, page_count)) {
       ESP_LOGW(TAG, "Failed marking old level-%u pages obsolete!", from_level);
     }
   }
@@ -462,7 +446,7 @@ bool timeseries_compact_level_pages(timeseries_db_t *db, uint8_t from_level,
   return success;
 }
 
-bool timeseries_compact_level0_pages(timeseries_db_t *db) {
+bool timeseries_compact_level0_pages(timeseries_db_t* db) {
   // Just call the generic function with from_level=0, to_level=1
   return timeseries_compact_level_pages(db, 0, 1);
 }
@@ -471,9 +455,8 @@ bool timeseries_compact_level0_pages(timeseries_db_t *db) {
 // Step 1) Find pages at the source level
 // -----------------------------------------------------------------------------
 
-static bool tsdb_find_level_pages(timeseries_db_t *db, uint8_t source_level,
-                                  tsdb_level_page_t **out_pages,
-                                  size_t *out_count) {
+static bool tsdb_find_level_pages(timeseries_db_t* db, uint8_t source_level, tsdb_level_page_t** out_pages,
+                                  size_t* out_count) {
   if (!db || !out_pages || !out_count) {
     return false;
   }
@@ -493,31 +476,26 @@ static bool tsdb_find_level_pages(timeseries_db_t *db, uint8_t source_level,
   tsdb_level_page_t temp[MAX_PAGES_PER_LEVEL];
   size_t found = 0;
 
-  while (
-      timeseries_page_cache_iterator_next(&page_iter, &hdr, &offset, &size)) {
+  while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &offset, &size)) {
     // Is it an active field-data page at the desired level?
-    if (hdr.magic_number == TIMESERIES_MAGIC_NUM &&
-        hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
-        hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE &&
-        hdr.field_data_level == source_level) {
+    if (hdr.magic_number == TIMESERIES_MAGIC_NUM && hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
+        hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE && hdr.field_data_level == source_level) {
       if (found < MAX_PAGES_PER_LEVEL) {
         temp[found].offset = offset;
         temp[found].size = size;
         found++;
       } else {
-        ESP_LOGW(TAG, "Too many pages found at level=%u (> %d).", source_level,
-                 MAX_PAGES_PER_LEVEL);
+        ESP_LOGW(TAG, "Too many pages found at level=%u (> %d).", source_level, MAX_PAGES_PER_LEVEL);
         break;
       }
     }
   }
 
   if (found == 0) {
-    return true; // no pages => nothing to do
+    return true;  // no pages => nothing to do
   }
 
-  tsdb_level_page_t *arr =
-      (tsdb_level_page_t *)malloc(found * sizeof(tsdb_level_page_t));
+  tsdb_level_page_t* arr = (tsdb_level_page_t*)malloc(found * sizeof(tsdb_level_page_t));
   if (!arr) {
     return false;
   }
@@ -531,42 +509,34 @@ static bool tsdb_find_level_pages(timeseries_db_t *db, uint8_t source_level,
 // Step 4) Mark old pages as obsolete
 // -----------------------------------------------------------------------------
 
-static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t *db,
-                                               uint8_t source_level,
-                                               const tsdb_level_page_t *pages,
-                                               size_t page_count) {
+static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t source_level,
+                                               const tsdb_level_page_t* pages, size_t page_count) {
   if (!db || !pages) {
     return false;
   }
 
   for (size_t i = 0; i < page_count; i++) {
     uint32_t pofs = pages[i].offset;
-    ESP_LOGV(TAG, "Marking level-%u page @0x%08" PRIx32 " as obsolete.",
-             source_level, pofs);
+    ESP_LOGV(TAG, "Marking level-%u page @0x%08" PRIx32 " as obsolete.", source_level, pofs);
 
     // 1) Read the existing page header
     timeseries_page_header_t hdr;
     esp_err_t err = esp_partition_read(db->partition, pofs, &hdr, sizeof(hdr));
     if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed to read page header @0x%08" PRIx32 " (err=0x%x)",
-               pofs, err);
+      ESP_LOGE(TAG, "Failed to read page header @0x%08" PRIx32 " (err=0x%x)", pofs, err);
       continue;
     }
 
     // 2) Verify it's the correct level
-    if (hdr.magic_number == TIMESERIES_MAGIC_NUM &&
-        hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
-        hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE &&
-        hdr.field_data_level == source_level) {
+    if (hdr.magic_number == TIMESERIES_MAGIC_NUM && hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
+        hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE && hdr.field_data_level == source_level) {
       // 3) Mark obsolete
       hdr.page_state = TIMESERIES_PAGE_STATE_OBSOLETE;
 
       // 4) Write updated header
       err = esp_partition_write(db->partition, pofs, &hdr, sizeof(hdr));
       if (err != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "Failed marking page @0x%08" PRIx32 " obsolete (err=0x%x)",
-                 pofs, err);
+        ESP_LOGE(TAG, "Failed marking page @0x%08" PRIx32 " obsolete (err=0x%x)", pofs, err);
         continue;
       }
 
@@ -575,70 +545,65 @@ static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t *db,
 
       ESP_LOGV(TAG, "Obsolete mark success for page @0x%08" PRIx32, pofs);
     } else {
-      ESP_LOGW(TAG,
-               "Skipping page @0x%08" PRIx32
-               " (not an active level-%u field-data page).",
-               pofs, source_level);
+      ESP_LOGW(TAG, "Skipping page @0x%08" PRIx32 " (not an active level-%u field-data page).", pofs, source_level);
     }
   }
 
   return true;
 }
 
-size_t
-timeseries_field_value_serialize_size(const timeseries_field_value_t *val) {
+size_t timeseries_field_value_serialize_size(const timeseries_field_value_t* val) {
   switch (val->type) {
-  case TIMESERIES_FIELD_TYPE_STRING:
-    // 4 + actual bytes
-    return 4 + val->data.string_val.length;
-  case TIMESERIES_FIELD_TYPE_FLOAT:
-  case TIMESERIES_FIELD_TYPE_INT:
-    return 8;
-  case TIMESERIES_FIELD_TYPE_BOOL:
-    return 1;
+    case TIMESERIES_FIELD_TYPE_STRING:
+      // 4 + actual bytes
+      return 4 + val->data.string_val.length;
+    case TIMESERIES_FIELD_TYPE_FLOAT:
+    case TIMESERIES_FIELD_TYPE_INT:
+      return 8;
+    case TIMESERIES_FIELD_TYPE_BOOL:
+      return 1;
   }
   return 0;
 }
 
-size_t timeseries_field_value_serialize(const timeseries_field_value_t *val,
-                                        unsigned char *out_buf) {
+size_t timeseries_field_value_serialize(const timeseries_field_value_t* val, unsigned char* out_buf) {
   size_t written = 0;
   switch (val->type) {
-  case TIMESERIES_FIELD_TYPE_STRING: {
-    uint32_t len = (uint32_t)val->data.string_val.length;
-    memcpy(out_buf, &len, 4);
-    written += 4;
-    if (len > 0) {
-      memcpy(out_buf + written, val->data.string_val.str, len);
-      written += len;
+    case TIMESERIES_FIELD_TYPE_STRING: {
+      uint32_t len = (uint32_t)val->data.string_val.length;
+      memcpy(out_buf, &len, 4);
+      written += 4;
+      if (len > 0) {
+        memcpy(out_buf + written, val->data.string_val.str, len);
+        written += len;
+      }
+      break;
     }
-    break;
-  }
-  case TIMESERIES_FIELD_TYPE_FLOAT: {
-    double d = (double)val->data.float_val;
-    memcpy(out_buf, &d, 8);
-    written += 8;
-    break;
-  }
-  case TIMESERIES_FIELD_TYPE_INT: {
-    int64_t i64 = (int64_t)val->data.int_val;
-    memcpy(out_buf, &i64, 8);
-    written += 8;
-    break;
-  }
-  case TIMESERIES_FIELD_TYPE_BOOL: {
-    out_buf[0] = val->data.bool_val ? 1 : 0;
-    written++;
-    break;
-  }
+    case TIMESERIES_FIELD_TYPE_FLOAT: {
+      double d = (double)val->data.float_val;
+      memcpy(out_buf, &d, 8);
+      written += 8;
+      break;
+    }
+    case TIMESERIES_FIELD_TYPE_INT: {
+      int64_t i64 = (int64_t)val->data.int_val;
+      memcpy(out_buf, &i64, 8);
+      written += 8;
+      break;
+    }
+    case TIMESERIES_FIELD_TYPE_BOOL: {
+      out_buf[0] = val->data.bool_val ? 1 : 0;
+      written++;
+      break;
+    }
   }
   return written;
 }
 
 // Example qsort compare function:
-static int sort_by_seq_and_offset(const void *a, const void *b) {
-  const tsdb_record_descriptor_t *A = (const tsdb_record_descriptor_t *)a;
-  const tsdb_record_descriptor_t *B = (const tsdb_record_descriptor_t *)b;
+static int sort_by_seq_and_offset(const void* a, const void* b) {
+  const tsdb_record_descriptor_t* A = (const tsdb_record_descriptor_t*)a;
+  const tsdb_record_descriptor_t* B = (const tsdb_record_descriptor_t*)b;
   if (A->page_seq < B->page_seq)
     return -1;
   else if (A->page_seq > B->page_seq)
@@ -652,9 +617,8 @@ static int sort_by_seq_and_offset(const void *a, const void *b) {
   return 0;
 }
 
-static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
-                                        const tsdb_level_page_t *pages,
-                                        size_t page_count, uint8_t to_level) {
+static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_page_t* pages, size_t page_count,
+                                        uint8_t to_level) {
   if (!db || !pages || page_count == 0) {
     return false;
   }
@@ -664,17 +628,15 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
   // ----------------------------------------------------------------
   // 1) Build a map of series => record descriptors (unchanged)
   // ----------------------------------------------------------------
-  tsdb_series_descriptors_t *series_map = NULL;
+  tsdb_series_descriptors_t* series_map = NULL;
   size_t series_map_used = 0;
   size_t series_map_cap = 0;
-  size_t total_record_bytes =
-      0; // Holds total bytes of all records minus headers
+  size_t total_record_bytes = 0;  // Holds total bytes of all records minus headers
 
   for (size_t i = 0; i < page_count; i++) {
-    const tsdb_level_page_t *pg = &pages[i];
+    const tsdb_level_page_t* pg = &pages[i];
     timeseries_page_header_t hdr;
-    if (esp_partition_read(db->partition, pg->offset, &hdr, sizeof(hdr)) !=
-        ESP_OK) {
+    if (esp_partition_read(db->partition, pg->offset, &hdr, sizeof(hdr)) != ESP_OK) {
       ESP_LOGW(TAG, "Failed reading header @0x%08" PRIx32, pg->offset);
       continue;
     }
@@ -683,8 +645,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
 
     // FieldData iterator on this page:
     timeseries_fielddata_iterator_t f_iter;
-    if (!timeseries_fielddata_iterator_init(db, pg->offset, pg->size,
-                                            &f_iter)) {
+    if (!timeseries_fielddata_iterator_init(db, pg->offset, pg->size, &f_iter)) {
       ESP_LOGW(TAG, "Failed init fielddata iterator @0x%08" PRIx32, pg->offset);
       continue;
     }
@@ -715,8 +676,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
       }
       desc.field_type = ftype;
       // data_offset = page_offset + <this record offset> + sizeof(fd_hdr)
-      desc.data_offset = pg->offset + f_iter.current_record_offset +
-                         sizeof(timeseries_field_data_header_t);
+      desc.data_offset = pg->offset + f_iter.current_record_offset + sizeof(timeseries_field_data_header_t);
       desc.page_seq = page_seq;
 
       // Insert into series_map
@@ -724,12 +684,10 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
       for (size_t s = 0; s < series_map_used; s++) {
         if (memcmp(series_map[s].series_id, fd_hdr.series_id, 16) == 0) {
           // Add to that vector
-          tsdb_series_descriptors_t *S = &series_map[s];
+          tsdb_series_descriptors_t* S = &series_map[s];
           if (S->record_used == S->record_capacity) {
-            size_t newcap =
-                (S->record_capacity == 0) ? 4 : (S->record_capacity * 2);
-            tsdb_record_descriptor_t *grow =
-                realloc(S->records, newcap * sizeof(tsdb_record_descriptor_t));
+            size_t newcap = (S->record_capacity == 0) ? 4 : (S->record_capacity * 2);
+            tsdb_record_descriptor_t* grow = realloc(S->records, newcap * sizeof(tsdb_record_descriptor_t));
             if (!grow) {
               return false;
             }
@@ -746,21 +704,18 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
         // Create a new entry in the series_map
         if (series_map_used == series_map_cap) {
           size_t newcap = (series_map_cap == 0) ? 4 : (series_map_cap * 2);
-          tsdb_series_descriptors_t *grow =
-              realloc(series_map, newcap * sizeof(tsdb_series_descriptors_t));
+          tsdb_series_descriptors_t* grow = realloc(series_map, newcap * sizeof(tsdb_series_descriptors_t));
           if (!grow) {
             return false;
           }
           series_map = grow;
           series_map_cap = newcap;
         }
-        memset(&series_map[series_map_used], 0,
-               sizeof(series_map[series_map_used]));
+        memset(&series_map[series_map_used], 0, sizeof(series_map[series_map_used]));
         memcpy(series_map[series_map_used].series_id, fd_hdr.series_id, 16);
         series_map[series_map_used].record_used = 1;
         series_map[series_map_used].record_capacity = 4;
-        series_map[series_map_used].records =
-            calloc(4, sizeof(tsdb_record_descriptor_t));
+        series_map[series_map_used].records = calloc(4, sizeof(tsdb_record_descriptor_t));
         if (!series_map[series_map_used].records) {
           return false;
         }
@@ -768,10 +723,9 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
         series_map_used++;
       }
 
-      ESP_LOGV(TAG, "Added seriesId=%.2X%.2X%.2X%.2X... to map",
-               fd_hdr.series_id[0], fd_hdr.series_id[1], fd_hdr.series_id[2],
-               fd_hdr.series_id[3]);
-    } // end while
+      ESP_LOGV(TAG, "Added seriesId=%.2X%.2X%.2X%.2X... to map", fd_hdr.series_id[0], fd_hdr.series_id[1],
+               fd_hdr.series_id[2], fd_hdr.series_id[3]);
+    }  // end while
 
     ESP_LOGV(TAG, "Read %u records from page", records_read);
   }
@@ -779,7 +733,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
   if (series_map_used == 0) {
     ESP_LOGV(TAG, "No data found among these pages; nothing to compact.");
     free(series_map);
-    return true; // no error
+    return true;  // no error
   }
 
   // printf("TWO free heap size:%ld\n", esp_get_free_heap_size());
@@ -788,8 +742,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
   // 2) Create one stream writer for a new page that will hold multiple series
   // ----------------------------------------------------------------
   timeseries_page_stream_writer_t writer;
-  if (!timeseries_page_stream_writer_init(db, &writer, to_level,
-                                          total_record_bytes)) {
+  if (!timeseries_page_stream_writer_init(db, &writer, to_level, total_record_bytes)) {
     ESP_LOGE(TAG, "Failed to initialize stream-writer for multi-series page");
     for (size_t s = 0; s < series_map_used; s++) {
       free(series_map[s].records);
@@ -808,24 +761,22 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
   //      - Pass 2: Write values
   // ----------------------------------------------------------------
   for (size_t s = 0; s < series_map_used; s++) {
-    tsdb_series_descriptors_t *S = &series_map[s];
+    tsdb_series_descriptors_t* S = &series_map[s];
     if (S->record_used == 0) {
       continue;
     }
 
     // Sort records by page_seq (and data_offset as tie-breaker)
-    qsort(S->records, S->record_used, sizeof(tsdb_record_descriptor_t),
-          sort_by_seq_and_offset);
+    qsort(S->records, S->record_used, sizeof(tsdb_record_descriptor_t), sort_by_seq_and_offset);
 
     // Build sub-iterators for each record
-    timeseries_points_iterator_t **sub_iters =
-        calloc(S->record_used, sizeof(*sub_iters));
+    timeseries_points_iterator_t** sub_iters = calloc(S->record_used, sizeof(*sub_iters));
     if (!sub_iters) {
       ESP_LOGE(TAG, "OOM allocating sub-iterators for series s=%zu", s);
       continue;
     }
 
-    uint32_t *seqs = calloc(S->record_used, sizeof(uint32_t));
+    uint32_t* seqs = calloc(S->record_used, sizeof(uint32_t));
     if (!seqs) {
       free(sub_iters);
       ESP_LOGE(TAG, "OOM allocating seqs for series s=%zu", s);
@@ -833,18 +784,15 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
     }
 
     for (size_t r = 0; r < S->record_used; r++) {
-      const tsdb_record_descriptor_t *RD = &S->records[r];
+      const tsdb_record_descriptor_t* RD = &S->records[r];
       sub_iters[r] = calloc(1, sizeof(timeseries_points_iterator_t));
       if (!sub_iters[r]) {
-        ESP_LOGW(TAG, "OOM creating sub-iter for series s=%zu, record r=%zu", s,
-                 r);
+        ESP_LOGW(TAG, "OOM creating sub-iter for series s=%zu, record r=%zu", s, r);
         continue;
       }
-      if (!timeseries_points_iterator_init(
-              db, RD->data_offset, RD->record_length, RD->record_count,
-              RD->field_type, RD->is_compressed, sub_iters[r])) {
-        ESP_LOGW(TAG, "Failed init sub-iter offset=0x%08" PRIx32,
-                 RD->data_offset);
+      if (!timeseries_points_iterator_init(db, RD->data_offset, RD->record_length, RD->record_count, RD->field_type,
+                                           RD->is_compressed, sub_iters[r])) {
+        ESP_LOGW(TAG, "Failed init sub-iter offset=0x%08" PRIx32, RD->data_offset);
         free(sub_iters[r]);
         sub_iters[r] = NULL;
         continue;
@@ -855,13 +803,11 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
     // printf("PRE timeseries_multi_points_iterator_init free heap
     // size:%ld\n",esp_get_free_heap_size());
 
-    ESP_LOGV(TAG, "Built %zu sub-iterators for series s=%zu", S->record_used,
-             s);
+    ESP_LOGV(TAG, "Built %zu sub-iterators for series s=%zu", S->record_used, s);
 
     // Initialize the multi-iterator for pass #1 (timestamps)
     timeseries_multi_points_iterator_t multi_iter;
-    if (!timeseries_multi_points_iterator_init(sub_iters, seqs, S->record_used,
-                                               &multi_iter)) {
+    if (!timeseries_multi_points_iterator_init(sub_iters, seqs, S->record_used, &multi_iter)) {
       ESP_LOGW(TAG, "Failed init multi-iter for series s=%zu (pass 1)", s);
       // Cleanup sub-iters
       for (size_t r = 0; r < S->record_used; r++) {
@@ -879,8 +825,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
     // size:%ld\n",esp_get_free_heap_size());
 
     // Begin a new series in the already-open page
-    if (!timeseries_page_stream_writer_begin_series(&writer, S->series_id,
-                                                    S->records[0].field_type)) {
+    if (!timeseries_page_stream_writer_begin_series(&writer, S->series_id, S->records[0].field_type)) {
       ESP_LOGE(TAG, "Failed to begin series for s=%zu", s);
       timeseries_multi_points_iterator_deinit(&multi_iter);
       for (size_t r = 0; r < S->record_used; r++) {
@@ -928,18 +873,15 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
 
     // Build sub-iterators again:
     for (size_t r = 0; r < S->record_used; r++) {
-      const tsdb_record_descriptor_t *RD = &S->records[r];
+      const tsdb_record_descriptor_t* RD = &S->records[r];
       sub_iters[r] = calloc(1, sizeof(timeseries_points_iterator_t));
       if (!sub_iters[r]) {
-        ESP_LOGW(TAG, "OOM re-creating sub-iter for series s=%zu, record r=%zu",
-                 s, r);
+        ESP_LOGW(TAG, "OOM re-creating sub-iter for series s=%zu, record r=%zu", s, r);
         continue;
       }
-      if (!timeseries_points_iterator_init(
-              db, RD->data_offset, RD->record_length, RD->record_count,
-              RD->field_type, RD->is_compressed, sub_iters[r])) {
-        ESP_LOGW(TAG, "Failed re-init sub-iter offset=0x%08" PRIx32,
-                 RD->data_offset);
+      if (!timeseries_points_iterator_init(db, RD->data_offset, RD->record_length, RD->record_count, RD->field_type,
+                                           RD->is_compressed, sub_iters[r])) {
+        ESP_LOGW(TAG, "Failed re-init sub-iter offset=0x%08" PRIx32, RD->data_offset);
         free(sub_iters[r]);
         sub_iters[r] = NULL;
         continue;
@@ -949,8 +891,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
     // printf("VALUE WRITE free heap size:%ld\n",
     // esp_get_free_heap_size());
 
-    if (!timeseries_multi_points_iterator_init(sub_iters, seqs, S->record_used,
-                                               &multi_iter)) {
+    if (!timeseries_multi_points_iterator_init(sub_iters, seqs, S->record_used, &multi_iter)) {
       ESP_LOGW(TAG, "Failed init multi-iter for series s=%zu (pass 2)", s);
       // Cleanup sub-iters
       for (size_t r = 0; r < S->record_used; r++) {
@@ -1035,24 +976,19 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t *db,
  * @return true on success, or if the page was skipped (not active field-data);
  *         false if there's a fatal error.
  */
-static bool tsdb_rewrite_page_without_deleted(timeseries_db_t *db,
-                                              uint32_t old_page_ofs) {
+static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_page_ofs) {
   // 1) Read the old page header.
   timeseries_page_header_t hdr;
-  esp_err_t err =
-      esp_partition_read(db->partition, old_page_ofs, &hdr, sizeof(hdr));
+  esp_err_t err = esp_partition_read(db->partition, old_page_ofs, &hdr, sizeof(hdr));
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to read old page header @0x%08X (err=0x%x)",
-             (unsigned int)old_page_ofs, err);
+    ESP_LOGE(TAG, "Failed to read old page header @0x%08X (err=0x%x)", (unsigned int)old_page_ofs, err);
     return false;
   }
 
   // 2) Check if it's an active field-data page.
-  if (hdr.magic_number != TIMESERIES_MAGIC_NUM ||
-      hdr.page_type != TIMESERIES_PAGE_TYPE_FIELD_DATA ||
+  if (hdr.magic_number != TIMESERIES_MAGIC_NUM || hdr.page_type != TIMESERIES_PAGE_TYPE_FIELD_DATA ||
       hdr.page_state != TIMESERIES_PAGE_STATE_ACTIVE) {
-    ESP_LOGW(TAG, "Page @0x%08X is not an active field-data page; skipping",
-             (unsigned int)old_page_ofs);
+    ESP_LOGW(TAG, "Page @0x%08X is not an active field-data page; skipping", (unsigned int)old_page_ofs);
     return true;
   }
 
@@ -1060,8 +996,7 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t *db,
   uint32_t old_page_size = hdr.page_size;
   uint8_t level = hdr.field_data_level;
 
-  ESP_LOGW(TAG, "Compacting page @0x%08X (level=%u) size=%u",
-           (unsigned int)old_page_ofs, (unsigned int)level,
+  ESP_LOGW(TAG, "Compacting page @0x%08X (level=%u) size=%u", (unsigned int)old_page_ofs, (unsigned int)level,
            (unsigned int)old_page_size);
 
   // 3) First pass: iterate over the field data records to compute the total
@@ -1069,10 +1004,8 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t *db,
   uint32_t total_data_size = 0;
   uint32_t total_records = 0;
   timeseries_fielddata_iterator_t f_iter;
-  if (!timeseries_fielddata_iterator_init(db, old_page_ofs, old_page_size,
-                                          &f_iter)) {
-    ESP_LOGE(TAG, "Failed to init fielddata iterator @0x%08X",
-             (unsigned int)old_page_ofs);
+  if (!timeseries_fielddata_iterator_init(db, old_page_ofs, old_page_size, &f_iter)) {
+    ESP_LOGE(TAG, "Failed to init fielddata iterator @0x%08X", (unsigned int)old_page_ofs);
     return false;
   }
 
@@ -1080,44 +1013,35 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t *db,
   while (timeseries_fielddata_iterator_next(&f_iter, &fd_hdr)) {
     // If DELETED bit is 0, the record is deleted: skip.
     if ((fd_hdr.flags & TSDB_FIELDDATA_FLAG_DELETED) == 0) {
-      ESP_LOGE(
-          TAG,
-          "Skipping deleted record in page=0x%08X header_abs_offset=0x%08X",
-          (unsigned int)old_page_ofs,
-          (unsigned int)f_iter.current_record_offset);
+      ESP_LOGE(TAG, "Skipping deleted record in page=0x%08X header_abs_offset=0x%08X", (unsigned int)old_page_ofs,
+               (unsigned int)f_iter.current_record_offset);
       continue;
     }
-    total_data_size +=
-        sizeof(timeseries_field_data_header_t) + fd_hdr.record_length;
+    total_data_size += sizeof(timeseries_field_data_header_t) + fd_hdr.record_length;
     total_records++;
 
     ESP_LOGW(TAG,
              "Record in page=0x%08X: record_count=%zu, record_length=%u, "
              "header_abs_offset=0x%08X",
-             (unsigned int)old_page_ofs, (unsigned int)fd_hdr.record_count,
-             (unsigned int)fd_hdr.record_length,
+             (unsigned int)old_page_ofs, (unsigned int)fd_hdr.record_count, (unsigned int)fd_hdr.record_length,
              (unsigned int)f_iter.current_record_offset);
   }
 
-  ESP_LOGI(TAG, "Page @0x%08X: total_records=%u, total_data_size=%u",
-           (unsigned int)old_page_ofs, (unsigned int)total_records,
-           (unsigned int)total_data_size);
+  ESP_LOGI(TAG, "Page @0x%08X: total_records=%u, total_data_size=%u", (unsigned int)old_page_ofs,
+           (unsigned int)total_records, (unsigned int)total_data_size);
 
   // 4) Allocate a new page using the rewriter, passing the computed total size.
   if (total_records > 0) {
     timeseries_page_rewriter_t rewriter;
-    if (!timeseries_page_rewriter_start(db, level, total_data_size,
-                                        &rewriter)) {
+    if (!timeseries_page_rewriter_start(db, level, total_data_size, &rewriter)) {
       ESP_LOGE(TAG, "Failed to initialize page rewriter");
       return false;
     }
     // The new page offset is now rewriter.base_offset.
 
     // 5) Second pass: reinitialize the iterator to copy over records.
-    if (!timeseries_fielddata_iterator_init(db, old_page_ofs, old_page_size,
-                                            &f_iter)) {
-      ESP_LOGE(TAG, "Failed to re-init fielddata iterator @0x%08X",
-               (unsigned int)old_page_ofs);
+    if (!timeseries_fielddata_iterator_init(db, old_page_ofs, old_page_size, &f_iter)) {
+      ESP_LOGE(TAG, "Failed to re-init fielddata iterator @0x%08X", (unsigned int)old_page_ofs);
       timeseries_page_rewriter_abort(&rewriter);
       return false;
     }
@@ -1127,10 +1051,8 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t *db,
         continue;
       }
       // Write the record into the new page.
-      if (!timeseries_page_rewriter_write_field_data(
-              &rewriter, old_page_ofs, f_iter.current_record_offset, &fd_hdr)) {
-        ESP_LOGE(TAG, "Failed writing field data to new page @0x%08X",
-                 (unsigned int)rewriter.base_offset);
+      if (!timeseries_page_rewriter_write_field_data(&rewriter, old_page_ofs, f_iter.current_record_offset, &fd_hdr)) {
+        ESP_LOGE(TAG, "Failed writing field data to new page @0x%08X", (unsigned int)rewriter.base_offset);
         timeseries_page_rewriter_abort(&rewriter);
         return false;
       }
@@ -1138,8 +1060,7 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t *db,
 
     // 6) Finalize the new page.
     if (!timeseries_page_rewriter_finalize(&rewriter)) {
-      ESP_LOGE(TAG, "Failed to finalize new page @0x%08X",
-               (unsigned int)rewriter.base_offset);
+      ESP_LOGE(TAG, "Failed to finalize new page @0x%08X", (unsigned int)rewriter.base_offset);
       return false;
     }
   }
@@ -1148,22 +1069,18 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t *db,
   hdr.page_state = TIMESERIES_PAGE_STATE_OBSOLETE;
   err = esp_partition_write(db->partition, old_page_ofs, &hdr, sizeof(hdr));
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed marking old page @0x%08X obsolete (err=0x%x)",
-             (unsigned int)old_page_ofs, err);
+    ESP_LOGE(TAG, "Failed marking old page @0x%08X obsolete (err=0x%x)", (unsigned int)old_page_ofs, err);
     // Not strictly fatal, so continue.
   }
 
   // Remove the old page from the cache.
   tsdb_pagecache_remove_entry(db, old_page_ofs);
 
-  ESP_LOGI(TAG, "Page @0x%08X compacted into new page",
-           (unsigned int)old_page_ofs);
+  ESP_LOGI(TAG, "Page @0x%08X compacted into new page", (unsigned int)old_page_ofs);
   return true;
 }
 
-bool timeseries_compact_page_list(timeseries_db_t *db,
-                                  const uint32_t *page_offsets,
-                                  size_t page_count) {
+bool timeseries_compact_page_list(timeseries_db_t* db, const uint32_t* page_offsets, size_t page_count) {
   if (!db || !page_offsets || page_count == 0) {
     // Nothing to do
     return true;

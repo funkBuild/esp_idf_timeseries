@@ -3,6 +3,8 @@
 
 #include "timeseries.h"
 #include "timeseries_internal.h"
+#include "esp_partition.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -14,40 +16,39 @@ extern "C" {
 // Page Iterator
 // -----------------------------------------------------------------------------
 typedef struct {
-  timeseries_db_t *db;
-  uint32_t current_offset; // Current byte offset in the partition
+  timeseries_db_t* db;
+  uint32_t current_offset;  // Current byte offset in the partition
   bool valid;
 } timeseries_page_iterator_t;
 
-bool timeseries_page_iterator_init(timeseries_db_t *db,
-                                   timeseries_page_iterator_t *iter);
+bool timeseries_page_iterator_init(timeseries_db_t* db, timeseries_page_iterator_t* iter);
 
-bool timeseries_page_iterator_next(timeseries_page_iterator_t *iter,
-                                   timeseries_page_header_t *out_header,
-                                   uint32_t *out_offset, uint32_t *out_size);
+bool timeseries_page_iterator_next(timeseries_page_iterator_t* iter, timeseries_page_header_t* out_header,
+                                   uint32_t* out_offset, uint32_t* out_size);
 
 // -----------------------------------------------------------------------------
 // Metadata (key-value) Entry Iterator
 // -----------------------------------------------------------------------------
 typedef struct {
-  timeseries_db_t *db;
+  timeseries_db_t* db;
   uint32_t page_offset;
   uint32_t page_size;
   uint32_t offset;
   uint32_t current_entry_offset;
   bool valid;
+  const uint8_t* page_ptr; /* mmap’d view, NULL if mmap failed   */
+  esp_partition_mmap_handle_t mmap_hdl;
 } timeseries_entity_iterator_t;
 
-bool timeseries_entity_iterator_init(timeseries_db_t *db, uint32_t page_offset,
-                                     uint32_t page_size,
-                                     timeseries_entity_iterator_t *ent_iter);
+bool timeseries_entity_iterator_init(timeseries_db_t* db, uint32_t page_offset, uint32_t page_size,
+                                     timeseries_entity_iterator_t* ent_iter);
 
-bool timeseries_entity_iterator_next(timeseries_entity_iterator_t *ent_iter,
-                                     timeseries_entry_header_t *out_header);
+void timeseries_entity_iterator_deinit(timeseries_entity_iterator_t* ent_iter);
 
-bool timeseries_entity_iterator_read_data(
-    timeseries_entity_iterator_t *ent_iter,
-    const timeseries_entry_header_t *header, void *key_buf, void *value_buf);
+bool timeseries_entity_iterator_next(timeseries_entity_iterator_t* ent_iter, timeseries_entry_header_t* out_header);
+
+bool timeseries_entity_iterator_read_data(timeseries_entity_iterator_t* ent_iter,
+                                          const timeseries_entry_header_t* header, void* key_buf, void* value_buf);
 
 // -----------------------------------------------------------------------------
 // Field Data Iterator (using timeseries_field_data_header_t)
@@ -56,10 +57,10 @@ bool timeseries_entity_iterator_read_data(
  * @brief Iterator struct for field-data records in a field-data page.
  */
 typedef struct {
-  timeseries_db_t *db;
+  timeseries_db_t* db;
   uint32_t page_offset;
   uint32_t page_size;
-  uint32_t offset; // next read offset relative to page_offset
+  uint32_t offset;  // next read offset relative to page_offset
   uint32_t current_record_offset;
   bool valid;
 } timeseries_fielddata_iterator_t;
@@ -71,8 +72,8 @@ typedef struct {
 typedef struct {
   bool valid;
   uint32_t min_size;
-  uint32_t current_offset; // where we are scanning in the partition
-  size_t current_index;    // which entry in the page_cache we're examining
+  uint32_t current_offset;  // where we are scanning in the partition
+  size_t current_index;     // which entry in the page_cache we're examining
 
   // We'll accumulate a "free region" start + length as we go
   uint32_t run_start;
@@ -80,12 +81,12 @@ typedef struct {
   bool in_blank_run;
 
   // We still store a pointer to db->partition for partition->size
-  const esp_partition_t *partition;
-  timeseries_db_t *db;
+  const esp_partition_t* partition;
+  timeseries_db_t* db;
 } timeseries_blank_iterator_t;
 
 typedef struct {
-  timeseries_db_t *db;
+  timeseries_db_t* db;
   size_t index;
   bool valid;
 } timeseries_page_cache_iterator_t;
@@ -100,9 +101,8 @@ typedef struct {
  * @param f_iter       The field-data iterator to initialize.
  * @return true if success, false if invalid parameters.
  */
-bool timeseries_fielddata_iterator_init(
-    timeseries_db_t *db, uint32_t page_offset, uint32_t page_size,
-    timeseries_fielddata_iterator_t *f_iter);
+bool timeseries_fielddata_iterator_init(timeseries_db_t* db, uint32_t page_offset, uint32_t page_size,
+                                        timeseries_fielddata_iterator_t* f_iter);
 
 /**
  * @brief Move to the next field-data record in the page, returning its header.
@@ -114,9 +114,8 @@ bool timeseries_fielddata_iterator_init(
  * @return true if a valid record was found, false if end of page or invalid
  * data.
  */
-bool timeseries_fielddata_iterator_next(
-    timeseries_fielddata_iterator_t *f_iter,
-    timeseries_field_data_header_t *out_hdr);
+bool timeseries_fielddata_iterator_next(timeseries_fielddata_iterator_t* f_iter,
+                                        timeseries_field_data_header_t* out_hdr);
 
 /**
  * @brief Optionally read the raw data after the header if your format stores
@@ -126,9 +125,8 @@ bool timeseries_fielddata_iterator_next(
  * For example, if you have "n" data points after the header, you can read them
  * with timeseries_fielddata_iterator_read_data(...) into a buffer.
  */
-bool timeseries_fielddata_iterator_read_data(
-    timeseries_fielddata_iterator_t *f_iter,
-    const timeseries_field_data_header_t *hdr, void *out_buf, size_t buf_len);
+bool timeseries_fielddata_iterator_read_data(timeseries_fielddata_iterator_t* f_iter,
+                                             const timeseries_field_data_header_t* hdr, void* out_buf, size_t buf_len);
 
 /**
  * @brief Initialize the blank-region iterator.
@@ -138,9 +136,7 @@ bool timeseries_fielddata_iterator_read_data(
  * @param min_size       Minimum contiguous size (in bytes) required
  * @return true if success, false if invalid args
  */
-bool timeseries_blank_iterator_init(timeseries_db_t *db,
-                                    timeseries_blank_iterator_t *iter,
-                                    uint32_t min_size);
+bool timeseries_blank_iterator_init(timeseries_db_t* db, timeseries_blank_iterator_t* iter, uint32_t min_size);
 
 /**
  * @brief Find the next blank region that has at least `min_size` contiguous
@@ -151,19 +147,15 @@ bool timeseries_blank_iterator_init(timeseries_db_t *db,
  * @param out_size   The contiguous blank size (>= min_size)
  * @return true if a blank region was found; false if no more found or error
  */
-bool timeseries_blank_iterator_next(timeseries_blank_iterator_t *iter,
-                                    uint32_t *out_offset, uint32_t *out_size);
+bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t* out_offset, uint32_t* out_size);
 
-bool timeseries_page_cache_iterator_init(
-    timeseries_db_t *db, timeseries_page_cache_iterator_t *iter);
+bool timeseries_page_cache_iterator_init(timeseries_db_t* db, timeseries_page_cache_iterator_t* iter);
 
-bool timeseries_page_cache_iterator_next(timeseries_page_cache_iterator_t *iter,
-                                         timeseries_page_header_t *out_header,
-                                         uint32_t *out_offset,
-                                         uint32_t *out_size);
+bool timeseries_page_cache_iterator_next(timeseries_page_cache_iterator_t* iter, timeseries_page_header_t* out_header,
+                                         uint32_t* out_offset, uint32_t* out_size);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // TIMESERIES_ITERATOR_H
+#endif  // TIMESERIES_ITERATOR_H

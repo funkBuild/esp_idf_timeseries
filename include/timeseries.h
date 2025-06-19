@@ -23,7 +23,7 @@ typedef struct {
     int64_t int_val;
     bool bool_val;
     struct {
-      char *str;
+      char* str;
       size_t length;
     } string_val;
   } data;
@@ -37,20 +37,20 @@ typedef struct {
  * Timestamps are timestamps_ms[p].
  */
 typedef struct {
-  const char *measurement_name;
+  const char* measurement_name;
 
   // Tags
-  const char **tag_keys;
-  const char **tag_values;
+  const char** tag_keys;
+  const char** tag_values;
   size_t num_tags;
 
   // Fields
-  const char **field_names;
-  timeseries_field_value_t *field_values; // length = num_fields * num_points
+  const char** field_names;
+  timeseries_field_value_t* field_values;  // length = num_fields * num_points
   size_t num_fields;
 
   // Timestamps
-  uint64_t *timestamps_ms; // length = num_points
+  uint64_t* timestamps_ms;  // length = num_points
   size_t num_points;
 } timeseries_insert_data_t;
 
@@ -65,24 +65,23 @@ typedef struct {
  *   - A limit on the total number of data points to return
  */
 typedef struct timeseries_query_t {
-
   /**
    * The measurement name to query, e.g. "weather".
    */
-  const char *measurement_name;
+  const char* measurement_name;
 
   /**
    * Arrays of tag keys and values. If num_tags=2, then tag_keys[0] matches
    * tag_values[0], etc. If num_tags=0, no tag-based filtering is applied.
    */
-  const char **tag_keys;
-  const char **tag_values;
+  const char** tag_keys;
+  const char** tag_values;
   size_t num_tags;
 
   /**
    * Array of field names to select. If num_fields=0, treat it as "all fields".
    */
-  const char **field_names;
+  const char** field_names;
   size_t num_fields;
 
   /**
@@ -112,7 +111,7 @@ typedef struct timeseries_query_result_column_t {
    * The name of this column, typically the field name in the measurement.
    * Dynamically allocated if needed (strdup, etc.).
    */
-  char *name;
+  char* name;
 
   /**
    * The field type (e.g., float, int, bool, string).
@@ -123,7 +122,7 @@ typedef struct timeseries_query_result_column_t {
    * An array of timeseries_field_value_t, one for each data point.
    * The length of this array matches timeseries_query_result_t.num_points.
    */
-  timeseries_field_value_t *values;
+  timeseries_field_value_t* values;
 } timeseries_query_result_column_t;
 
 /**
@@ -137,7 +136,7 @@ typedef struct timeseries_query_result_t {
    * Array of timestamps (in milliseconds).
    * Length = num_points.
    */
-  uint64_t *timestamps;
+  uint64_t* timestamps;
 
   /**
    * The number of data points (rows).
@@ -148,7 +147,7 @@ typedef struct timeseries_query_result_t {
    * An array of columns, each representing a field.
    * Length = num_columns.
    */
-  timeseries_query_result_column_t *columns;
+  timeseries_query_result_column_t* columns;
 
   /**
    * The number of columns (distinct fields) in the result.
@@ -162,16 +161,15 @@ bool timeseries_init(void);
  * @brief Insert multiple data points for multiple fields in one call.
  *        Each field is stored in a single entry (multi (ts,value) array).
  */
-bool timeseries_insert(const timeseries_insert_data_t *data);
+bool timeseries_insert(const timeseries_insert_data_t* data);
 
 bool timeseries_compact(void);
 
 bool timeseries_expire(void);
 
-bool timeseries_query(const timeseries_query_t *query,
-                      timeseries_query_result_t *result);
+bool timeseries_query(const timeseries_query_t* query, timeseries_query_result_t* result);
 
-void timeseries_query_free_result(timeseries_query_result_t *result);
+void timeseries_query_free_result(timeseries_query_result_t* result);
 
 bool timeseries_clear_all();
 
@@ -179,4 +177,4 @@ bool timeseries_clear_all();
 }
 #endif
 
-#endif // TIMESERIES_H
+#endif  // TIMESERIES_H

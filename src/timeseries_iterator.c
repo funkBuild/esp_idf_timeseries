@@ -12,36 +12,31 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *TAG = "TimeseriesIterator";
+static const char* TAG = "TimeseriesIterator";
 
-bool timeseries_page_iterator_init(timeseries_db_t *db,
-                                   timeseries_page_iterator_t *iter) {
+bool timeseries_page_iterator_init(timeseries_db_t* db, timeseries_page_iterator_t* iter) {
   if (!db || !iter || !db->partition) {
     return false;
   }
   iter->db = db;
-  iter->current_offset = 0; // Start at partition start
+  iter->current_offset = 0;  // Start at partition start
   iter->valid = true;
   return true;
 }
 
-bool timeseries_page_iterator_next(timeseries_page_iterator_t *iter,
-                                   timeseries_page_header_t *out_header,
-                                   uint32_t *out_offset, uint32_t *out_size) {
+bool timeseries_page_iterator_next(timeseries_page_iterator_t* iter, timeseries_page_header_t* out_header,
+                                   uint32_t* out_offset, uint32_t* out_size) {
   if (!iter || !iter->valid) {
     return false;
   }
 
   while (iter->current_offset < iter->db->partition->size) {
-
     // Read 4 bytes for magic
     uint32_t possible_magic = 0xFFFFFFFF;
     esp_err_t err =
-        esp_partition_read(iter->db->partition, iter->current_offset,
-                           &possible_magic, sizeof(possible_magic));
+        esp_partition_read(iter->db->partition, iter->current_offset, &possible_magic, sizeof(possible_magic));
     if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed reading magic @0x%08" PRIx32 " (err=0x%x)",
-               iter->current_offset, err);
+      ESP_LOGE(TAG, "Failed reading magic @0x%08" PRIx32 " (err=0x%x)", iter->current_offset, err);
       iter->valid = false;
       return false;
     }
@@ -50,22 +45,18 @@ bool timeseries_page_iterator_next(timeseries_page_iterator_t *iter,
     if (possible_magic == TIMESERIES_MAGIC_NUM) {
       // Read the full page header
       timeseries_page_header_t hdr;
-      err = esp_partition_read(iter->db->partition, iter->current_offset, &hdr,
-                               sizeof(hdr));
+      err = esp_partition_read(iter->db->partition, iter->current_offset, &hdr, sizeof(hdr));
       if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed reading header @0x%08" PRIx32 " (err=0x%x)",
-                 iter->current_offset, err);
+        ESP_LOGE(TAG, "Failed reading header @0x%08" PRIx32 " (err=0x%x)", iter->current_offset, err);
         iter->valid = false;
         return false;
       }
 
       // Validate magic, type, etc.
       if (hdr.magic_number == TIMESERIES_MAGIC_NUM &&
-          (hdr.page_type == TIMESERIES_PAGE_TYPE_METADATA ||
-           hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA)) {
+          (hdr.page_type == TIMESERIES_PAGE_TYPE_METADATA || hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA)) {
         uint32_t page_size = hdr.page_size;
-        if (page_size < sizeof(hdr) ||
-            (iter->current_offset + page_size) > iter->db->partition->size) {
+        if (page_size < sizeof(hdr) || (iter->current_offset + page_size) > iter->db->partition->size) {
           // Invalid size => skip one sector
           iter->current_offset += 4096;
           continue;
@@ -105,9 +96,8 @@ bool timeseries_page_iterator_next(timeseries_page_iterator_t *iter,
 // Metadata (Entity) Iterator
 // -----------------------------------------------------------------------------
 
-bool timeseries_entity_iterator_init(timeseries_db_t *db, uint32_t page_offset,
-                                     uint32_t page_size,
-                                     timeseries_entity_iterator_t *ent_iter) {
+bool timeseries_entity_iterator_init(timeseries_db_t* db, uint32_t page_offset, uint32_t page_size,
+                                     timeseries_entity_iterator_t* ent_iter) {
   if (!db || !ent_iter) {
     return false;
   }
@@ -128,8 +118,9 @@ bool timeseries_entity_iterator_init(timeseries_db_t *db, uint32_t page_offset,
   return true;
 }
 
-bool timeseries_entity_iterator_next(timeseries_entity_iterator_t *ent_iter,
-                                     timeseries_entry_header_t *out_header) {
+void timeseries_entity_iterator_deinit(timeseries_entity_iterator_t* ent_iter) {}
+
+bool timeseries_entity_iterator_next(timeseries_entity_iterator_t* ent_iter, timeseries_entry_header_t* out_header) {
   if (!ent_iter || !ent_iter->valid) {
     return false;
   }
@@ -150,17 +141,15 @@ bool timeseries_entity_iterator_next(timeseries_entity_iterator_t *ent_iter,
 
   // read the header
   timeseries_entry_header_t hdr;
-  esp_err_t err = esp_partition_read(ent_iter->db->partition, curr_offset, &hdr,
-                                     sizeof(hdr));
+  esp_err_t err = esp_partition_read(ent_iter->db->partition, curr_offset, &hdr, sizeof(hdr));
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to read entity header @0x%08" PRIx32 " (err=0x%x)",
-             curr_offset, err);
+    ESP_LOGE(TAG, "Failed to read entity header @0x%08" PRIx32 " (err=0x%x)", curr_offset, err);
     ent_iter->valid = false;
     return false;
   }
 
   // check for blank (all 0xFF)
-  const uint8_t *hdr_bytes = (const uint8_t *)&hdr;
+  const uint8_t* hdr_bytes = (const uint8_t*)&hdr;
   bool blank = true;
   for (size_t i = 0; i < sizeof(hdr); i++) {
     if (hdr_bytes[i] != 0xFF) {
@@ -191,9 +180,8 @@ bool timeseries_entity_iterator_next(timeseries_entity_iterator_t *ent_iter,
   return true;
 }
 
-bool timeseries_entity_iterator_read_data(
-    timeseries_entity_iterator_t *ent_iter,
-    const timeseries_entry_header_t *header, void *key_buf, void *value_buf) {
+bool timeseries_entity_iterator_read_data(timeseries_entity_iterator_t* ent_iter,
+                                          const timeseries_entry_header_t* header, void* key_buf, void* value_buf) {
   if (!ent_iter || !ent_iter->valid || !header) {
     return false;
   }
@@ -205,8 +193,7 @@ bool timeseries_entity_iterator_read_data(
 
   // read the key
   if (key_buf && header->key_len > 0) {
-    esp_err_t err = esp_partition_read(ent_iter->db->partition, key_offset,
-                                       key_buf, header->key_len);
+    esp_err_t err = esp_partition_read(ent_iter->db->partition, key_offset, key_buf, header->key_len);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed to read entry key (err=0x%x)", err);
       return false;
@@ -214,8 +201,7 @@ bool timeseries_entity_iterator_read_data(
   }
   // read the value
   if (value_buf && header->value_len > 0) {
-    esp_err_t err = esp_partition_read(ent_iter->db->partition, value_offset,
-                                       value_buf, header->value_len);
+    esp_err_t err = esp_partition_read(ent_iter->db->partition, value_offset, value_buf, header->value_len);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed to read entry value (err=0x%x)", err);
       return false;
@@ -228,9 +214,8 @@ bool timeseries_entity_iterator_read_data(
 // Field Data Iterator
 // -----------------------------------------------------------------------------
 
-bool timeseries_fielddata_iterator_init(
-    timeseries_db_t *db, uint32_t page_offset, uint32_t page_size,
-    timeseries_fielddata_iterator_t *f_iter) {
+bool timeseries_fielddata_iterator_init(timeseries_db_t* db, uint32_t page_offset, uint32_t page_size,
+                                        timeseries_fielddata_iterator_t* f_iter) {
   if (!db || !f_iter) {
     return false;
   }
@@ -250,9 +235,8 @@ bool timeseries_fielddata_iterator_init(
   return true;
 }
 
-bool timeseries_fielddata_iterator_next(
-    timeseries_fielddata_iterator_t *f_iter,
-    timeseries_field_data_header_t *out_hdr) {
+bool timeseries_fielddata_iterator_next(timeseries_fielddata_iterator_t* f_iter,
+                                        timeseries_field_data_header_t* out_hdr) {
   if (!f_iter || !f_iter->valid) {
     return false;
   }
@@ -270,15 +254,14 @@ bool timeseries_fielddata_iterator_next(
 
   // read the header
   timeseries_field_data_header_t local_hdr;
-  esp_err_t err = esp_partition_read(f_iter->db->partition, curr_offset,
-                                     &local_hdr, sizeof(local_hdr));
+  esp_err_t err = esp_partition_read(f_iter->db->partition, curr_offset, &local_hdr, sizeof(local_hdr));
   if (err != ESP_OK) {
     f_iter->valid = false;
     return false;
   }
 
   // check blank => done
-  const uint8_t *p = (const uint8_t *)&local_hdr;
+  const uint8_t* p = (const uint8_t*)&local_hdr;
   bool blank = true;
   for (size_t i = 0; i < sizeof(local_hdr); i++) {
     if (p[i] != 0xFF) {
@@ -292,11 +275,10 @@ bool timeseries_fielddata_iterator_next(
   }
 
   // Debug print the header
-  ESP_LOGV(TAG, "FieldData record: series_id=%.2X%.2X%.2X%.2X...",
-           local_hdr.series_id[0], local_hdr.series_id[1],
+  ESP_LOGV(TAG, "FieldData record: series_id=%.2X%.2X%.2X%.2X...", local_hdr.series_id[0], local_hdr.series_id[1],
            local_hdr.series_id[2], local_hdr.series_id[3]);
-  ESP_LOGV(TAG, "  flags=0x%02X, record_count=%u, record_length=%u",
-           local_hdr.flags, local_hdr.record_count, local_hdr.record_length);
+  ESP_LOGV(TAG, "  flags=0x%02X, record_count=%u, record_length=%u", local_hdr.flags, local_hdr.record_count,
+           local_hdr.record_length);
 
   // Provide the header if requested
   if (out_hdr) {
@@ -304,8 +286,7 @@ bool timeseries_fielddata_iterator_next(
   }
 
   // skip the entire record => header + data
-  uint32_t record_size =
-      sizeof(timeseries_field_data_header_t) + local_hdr.record_length;
+  uint32_t record_size = sizeof(timeseries_field_data_header_t) + local_hdr.record_length;
   if (curr_offset + record_size > page_end) {
     // out of boundary
     f_iter->valid = false;
@@ -316,9 +297,8 @@ bool timeseries_fielddata_iterator_next(
   return true;
 }
 
-bool timeseries_fielddata_iterator_read_data(
-    timeseries_fielddata_iterator_t *f_iter,
-    const timeseries_field_data_header_t *hdr, void *out_buf, size_t buf_len) {
+bool timeseries_fielddata_iterator_read_data(timeseries_fielddata_iterator_t* f_iter,
+                                             const timeseries_field_data_header_t* hdr, void* out_buf, size_t buf_len) {
   if (!f_iter || !f_iter->valid || !hdr || !out_buf) {
     return false;
   }
@@ -329,8 +309,7 @@ bool timeseries_fielddata_iterator_read_data(
 
   // boundary checks
   if (buf_len > hdr->record_length) {
-    ESP_LOGW(TAG, "Requested buf_len=%zu but record_length=%u", buf_len,
-             (unsigned int)hdr->record_length);
+    ESP_LOGW(TAG, "Requested buf_len=%zu but record_length=%u", buf_len, (unsigned int)hdr->record_length);
     return false;
   }
   uint32_t page_end = f_iter->page_offset + f_iter->page_size;
@@ -338,8 +317,7 @@ bool timeseries_fielddata_iterator_read_data(
     return false;
   }
 
-  esp_err_t err =
-      esp_partition_read(f_iter->db->partition, data_offset, out_buf, buf_len);
+  esp_err_t err = esp_partition_read(f_iter->db->partition, data_offset, out_buf, buf_len);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed reading field-data entry data (err=0x%x)", err);
     return false;
@@ -351,9 +329,7 @@ bool timeseries_fielddata_iterator_read_data(
 // Blank Iterator
 // -----------------------------------------------------------------------------
 
-bool timeseries_blank_iterator_init(timeseries_db_t *db,
-                                    timeseries_blank_iterator_t *iter,
-                                    uint32_t min_size) {
+bool timeseries_blank_iterator_init(timeseries_db_t* db, timeseries_blank_iterator_t* iter, uint32_t min_size) {
   if (!db || !iter || !db->partition) {
     return false;
   }
@@ -372,19 +348,17 @@ bool timeseries_blank_iterator_init(timeseries_db_t *db,
   return true;
 }
 
-bool timeseries_blank_iterator_next(timeseries_blank_iterator_t *iter,
-                                    uint32_t *out_offset, uint32_t *out_size) {
+bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t* out_offset, uint32_t* out_size) {
   if (!iter || !iter->valid) {
     return false;
   }
 
-  timeseries_db_t *db = iter->db;
-  const esp_partition_t *part = iter->partition;
+  timeseries_db_t* db = iter->db;
+  const esp_partition_t* part = iter->partition;
   uint32_t part_size = part->size;
 
   // Continue until we either find a run >= min_size or exhaust partition
   while (true) {
-
     // If we've already found a run >= min_size, return it:
     if (iter->in_blank_run && iter->run_length >= iter->min_size) {
       // Return the run
@@ -430,10 +404,8 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t *iter,
         } else {
           // finalize old run if >= min_size
           if (iter->run_length >= iter->min_size) {
-            if (out_offset)
-              *out_offset = iter->run_start;
-            if (out_size)
-              *out_size = iter->run_length;
+            if (out_offset) *out_offset = iter->run_start;
+            if (out_size) *out_size = iter->run_length;
             iter->current_offset = iter->run_start + iter->run_length;
             // reset
             iter->in_blank_run = false;
@@ -467,7 +439,7 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t *iter,
     }
 
     // 2) Get the next cached page
-    timeseries_cached_page_t *entry = &db->page_cache[iter->current_index];
+    timeseries_cached_page_t* entry = &db->page_cache[iter->current_index];
     uint32_t page_offset = entry->offset;
     uint32_t page_size = entry->header.page_size;
     uint8_t page_state = entry->header.page_state;
@@ -493,10 +465,8 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t *iter,
         } else {
           // finalize old run if big enough
           if (iter->run_length >= iter->min_size) {
-            if (out_offset)
-              *out_offset = iter->run_start;
-            if (out_size)
-              *out_size = iter->run_length;
+            if (out_offset) *out_offset = iter->run_start;
+            if (out_size) *out_size = iter->run_length;
             iter->current_offset = iter->run_start + iter->run_length;
             // reset
             iter->in_blank_run = false;
@@ -534,10 +504,8 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t *iter,
         } else {
           // finalize old run if big enough
           if (iter->run_length >= iter->min_size) {
-            if (out_offset)
-              *out_offset = iter->run_start;
-            if (out_size)
-              *out_size = iter->run_length;
+            if (out_offset) *out_offset = iter->run_start;
+            if (out_size) *out_size = iter->run_length;
             iter->current_offset = iter->run_start + iter->run_length;
             iter->in_blank_run = false;
             iter->run_start = 0;
@@ -554,10 +522,8 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t *iter,
     } else {
       // This page is used => finalize any blank run before it
       if (iter->in_blank_run && iter->run_length >= iter->min_size) {
-        if (out_offset)
-          *out_offset = iter->run_start;
-        if (out_size)
-          *out_size = iter->run_length;
+        if (out_offset) *out_offset = iter->run_start;
+        if (out_size) *out_size = iter->run_length;
         iter->current_offset = iter->run_start + iter->run_length;
         iter->in_blank_run = false;
         iter->run_start = 0;
@@ -579,8 +545,7 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t *iter,
 /**
  * @brief Initialize the page cache iterator.
  */
-bool timeseries_page_cache_iterator_init(
-    timeseries_db_t *db, timeseries_page_cache_iterator_t *iter) {
+bool timeseries_page_cache_iterator_init(timeseries_db_t* db, timeseries_page_cache_iterator_t* iter) {
   if (!db || !iter) {
     return false;
   }
@@ -593,17 +558,15 @@ bool timeseries_page_cache_iterator_init(
 /**
  * @brief Return the *next* ACTIVE page from the cache.
  */
-bool timeseries_page_cache_iterator_next(timeseries_page_cache_iterator_t *iter,
-                                         timeseries_page_header_t *out_header,
-                                         uint32_t *out_offset,
-                                         uint32_t *out_size) {
+bool timeseries_page_cache_iterator_next(timeseries_page_cache_iterator_t* iter, timeseries_page_header_t* out_header,
+                                         uint32_t* out_offset, uint32_t* out_size) {
   if (!iter || !iter->valid) {
     return false;
   }
-  timeseries_db_t *db = iter->db;
+  timeseries_db_t* db = iter->db;
 
   while (iter->index < db->page_cache_count) {
-    timeseries_cached_page_t *entry = &db->page_cache[iter->index++];
+    timeseries_cached_page_t* entry = &db->page_cache[iter->index++];
     if (entry->header.page_state == TIMESERIES_PAGE_STATE_ACTIVE) {
       // Return it
       if (out_header) {

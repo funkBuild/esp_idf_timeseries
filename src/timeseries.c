@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *TAG = "TimeseriesDB";
+static const char* TAG = "TimeseriesDB";
 
 // Global/Static DB Context
 static timeseries_db_t s_tsdb = {
@@ -33,8 +33,7 @@ bool timeseries_init(void) {
 
   ESP_LOGV(TAG, "Initializing Timeseries DB...");
 
-  const esp_partition_t *part = esp_partition_find_first(
-      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "storage");
+  const esp_partition_t* part = esp_partition_find_first(0x40, ESP_PARTITION_SUBTYPE_ANY, "timeseries");
   if (!part) {
     ESP_LOGE(TAG, "Failed to find 'storage' partition in partition table.");
     return false;
@@ -51,11 +50,11 @@ bool timeseries_init(void) {
   s_tsdb.last_l0_used_offset = 0;
   s_tsdb.initialized = true;
 
-  ESP_LOGV(TAG, "Timeseries DB initialized successfully.");
+  ESP_LOGI(TAG, "Timeseries DB initialized successfully.");
   return true;
 }
 
-bool timeseries_insert(const timeseries_insert_data_t *data) {
+bool timeseries_insert(const timeseries_insert_data_t* data) {
   if (!s_tsdb.initialized) {
     ESP_LOGE(TAG, "Timeseries DB not initialized yet.");
     return false;
@@ -69,12 +68,12 @@ bool timeseries_insert(const timeseries_insert_data_t *data) {
     return true;
   }
 
+  uint64_t start_time = esp_timer_get_time();
+
   // 1) Find or create measurement ID
   uint32_t measurement_id = 0;
-  if (!tsdb_find_measurement_id(&s_tsdb, data->measurement_name,
-                                &measurement_id)) {
-    if (!tsdb_create_measurement_id(&s_tsdb, data->measurement_name,
-                                    &measurement_id)) {
+  if (!tsdb_find_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
+    if (!tsdb_create_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
       return false;
     }
   }
@@ -87,19 +86,15 @@ bool timeseries_insert(const timeseries_insert_data_t *data) {
     char buffer[256];
     memset(buffer, 0, sizeof(buffer));
     size_t offset = 0;
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%s",
-                       data->measurement_name);
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%s", data->measurement_name);
     for (size_t t = 0; t < data->num_tags; t++) {
-      offset += snprintf(buffer + offset, sizeof(buffer) - offset, ":%s:%s",
-                         data->tag_keys[t], data->tag_values[t]);
+      offset += snprintf(buffer + offset, sizeof(buffer) - offset, ":%s:%s", data->tag_keys[t], data->tag_values[t]);
       if (offset >= sizeof(buffer)) {
-        ESP_LOGE(TAG, "MD5 input buffer overflow for field '%s'",
-                 data->field_names[i]);
+        ESP_LOGE(TAG, "MD5 input buffer overflow for field '%s'", data->field_names[i]);
         return false;
       }
     }
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ":%s",
-                       data->field_names[i]);
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ":%s", data->field_names[i]);
     if (offset >= sizeof(buffer)) {
       ESP_LOGE(TAG, "MD5 buffer overflow (field_name too long?)");
       return false;
@@ -107,11 +102,10 @@ bool timeseries_insert(const timeseries_insert_data_t *data) {
 
     // MD5 => series_id
     unsigned char series_id[16];
-    mbedtls_md5((const unsigned char *)buffer, strlen(buffer), series_id);
+    mbedtls_md5((const unsigned char*)buffer, strlen(buffer), series_id);
 
     // Ensure the field name to series_id mapping is in metadata
-    if (!tsdb_index_field_for_series(&s_tsdb, measurement_id,
-                                     data->field_names[i], series_id)) {
+    if (!tsdb_index_field_for_series(&s_tsdb, measurement_id, data->field_names[i], series_id)) {
       ESP_LOGE(TAG, "Failed to index field '%s'", data->field_names[i]);
       return false;
     }
@@ -119,34 +113,32 @@ bool timeseries_insert(const timeseries_insert_data_t *data) {
     // Ensure field type in metadata
     // We'll assume all data points in this field are the same type,
     // so we check the first one
-    const timeseries_field_value_t *first_val =
-        &data->field_values[i * data->num_points + 0];
-    if (!tsdb_ensure_series_type_in_metadata(&s_tsdb, series_id,
-                                             first_val->type)) {
+    const timeseries_field_value_t* first_val = &data->field_values[i * data->num_points + 0];
+    if (!tsdb_ensure_series_type_in_metadata(&s_tsdb, series_id, first_val->type)) {
       return false;
     }
 
     // Index tags
-    if (!tsdb_index_tags_for_series(&s_tsdb, measurement_id, data->tag_keys,
-                                    data->tag_values, data->num_tags,
+    if (!tsdb_index_tags_for_series(&s_tsdb, measurement_id, data->tag_keys, data->tag_values, data->num_tags,
                                     series_id)) {
       return false;
     }
 
     // Gather the array of values for this field
-    const timeseries_field_value_t *field_array =
-        &data->field_values[i * data->num_points];
+    const timeseries_field_value_t* field_array = &data->field_values[i * data->num_points];
 
     // 2) Insert multi data points in one entry
-    if (!tsdb_append_multiple_points(&s_tsdb, series_id, data->timestamps_ms,
-                                     field_array, data->num_points)) {
-      ESP_LOGE(TAG, "Failed to insert multi points for field '%s'",
-               data->field_names[i]);
+    if (!tsdb_append_multiple_points(&s_tsdb, series_id, data->timestamps_ms, field_array, data->num_points)) {
+      ESP_LOGE(TAG, "Failed to insert multi points for field '%s'", data->field_names[i]);
       return false;
     }
-    ESP_LOGV(TAG, "Inserted field='%s' with %zu points for measurement=%s",
-             data->field_names[i], data->num_points, data->measurement_name);
+    ESP_LOGV(TAG, "Inserted field='%s' with %zu points for measurement=%s", data->field_names[i], data->num_points,
+             data->measurement_name);
   }
+
+  uint64_t end_time = esp_timer_get_time();
+  ESP_LOGI(TAG, "Inserted %zu points in %zu fields for measurement '%s' in %.3f ms", data->num_points, data->num_fields,
+           data->measurement_name, (end_time - start_time) / 1000.0);
 
   return true;
 }
@@ -185,14 +177,13 @@ bool timeseries_expire(void) {
   return true;
 }
 
-bool timeseries_query(const timeseries_query_t *query,
-                      timeseries_query_result_t *result) {
+bool timeseries_query(const timeseries_query_t* query, timeseries_query_result_t* result) {
   return timeseries_query_execute(&s_tsdb, query, result);
 }
 
-void timeseries_query_free_result(timeseries_query_result_t *result) {
+void timeseries_query_free_result(timeseries_query_result_t* result) {
   if (!result) {
-    return; // nothing to do
+    return;  // nothing to do
   }
 
   // 1) Free the timestamps array
@@ -204,7 +195,7 @@ void timeseries_query_free_result(timeseries_query_result_t *result) {
   // 2) Free each column
   if (result->columns) {
     for (size_t col = 0; col < result->num_columns; col++) {
-      timeseries_query_result_column_t *c = &result->columns[col];
+      timeseries_query_result_column_t* c = &result->columns[col];
 
       // Free the column name
       if (c->name) {
@@ -219,7 +210,7 @@ void timeseries_query_free_result(timeseries_query_result_t *result) {
           if (c->values[row].type == TIMESERIES_FIELD_TYPE_STRING) {
             // Only free if you know it was dynamically allocated
             if (c->values[row].data.string_val.str) {
-              free((void *)c->values[row].data.string_val.str);
+              free((void*)c->values[row].data.string_val.str);
             }
           }
         }
@@ -245,8 +236,7 @@ bool timeseries_clear_all() {
   }
 
   // Erase the entire partition
-  esp_err_t err =
-      esp_partition_erase_range(s_tsdb.partition, 0, s_tsdb.partition->size);
+  esp_err_t err = esp_partition_erase_range(s_tsdb.partition, 0, s_tsdb.partition->size);
 
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to erase partition (err=0x%x)", err);

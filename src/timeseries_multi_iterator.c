@@ -5,7 +5,7 @@
 
 #include "esp_log.h"
 
-static void heap_swap(size_t *heap, size_t i, size_t j) {
+static void heap_swap(size_t* heap, size_t i, size_t j) {
   size_t tmp = heap[i];
   heap[i] = heap[j];
   heap[j] = tmp;
@@ -14,16 +14,14 @@ static void heap_swap(size_t *heap, size_t i, size_t j) {
 /**
  * @brief Compare two sub-iterators by timestamp ascending
  */
-static bool heap_less(const timeseries_multi_points_iterator_t *multi,
-                      size_t a_idx, size_t b_idx) {
-  const multi_points_sub_iter_t *A = &multi->subs[a_idx];
-  const multi_points_sub_iter_t *B = &multi->subs[b_idx];
+static bool heap_less(const timeseries_multi_points_iterator_t* multi, size_t a_idx, size_t b_idx) {
+  const multi_points_sub_iter_t* A = &multi->subs[a_idx];
+  const multi_points_sub_iter_t* B = &multi->subs[b_idx];
   // ascending by current_ts
   return A->current_ts < B->current_ts;
 }
 
-static void heap_sift_up(timeseries_multi_points_iterator_t *multi,
-                         size_t pos) {
+static void heap_sift_up(timeseries_multi_points_iterator_t* multi, size_t pos) {
   while (pos > 0) {
     size_t parent = (pos - 1) / 2;
     if (heap_less(multi, multi->heap[pos], multi->heap[parent])) {
@@ -35,19 +33,16 @@ static void heap_sift_up(timeseries_multi_points_iterator_t *multi,
   }
 }
 
-static void heap_sift_down(timeseries_multi_points_iterator_t *multi,
-                           size_t pos) {
+static void heap_sift_down(timeseries_multi_points_iterator_t* multi, size_t pos) {
   size_t size = multi->heap_size;
   while (true) {
     size_t left = 2 * pos + 1;
     size_t right = 2 * pos + 2;
     size_t smallest = pos;
-    if (left < size &&
-        heap_less(multi, multi->heap[left], multi->heap[smallest])) {
+    if (left < size && heap_less(multi, multi->heap[left], multi->heap[smallest])) {
       smallest = left;
     }
-    if (right < size &&
-        heap_less(multi, multi->heap[right], multi->heap[smallest])) {
+    if (right < size && heap_less(multi, multi->heap[right], multi->heap[smallest])) {
       smallest = right;
     }
     if (smallest == pos) {
@@ -62,9 +57,8 @@ static void heap_sift_down(timeseries_multi_points_iterator_t *multi,
  * @brief Helper: read the next point from sub-iter i
  * and update multi->subs[i]. If exhausted, mark valid=false.
  */
-static bool multi_iter_advance_sub(timeseries_multi_points_iterator_t *multi,
-                                   size_t i) {
-  multi_points_sub_iter_t *sub = &multi->subs[i];
+static bool multi_iter_advance_sub(timeseries_multi_points_iterator_t* multi, size_t i) {
+  multi_points_sub_iter_t* sub = &multi->subs[i];
   uint64_t ts = 0;
   timeseries_field_value_t val;
 
@@ -79,12 +73,15 @@ static bool multi_iter_advance_sub(timeseries_multi_points_iterator_t *multi,
   }
 
   // Free string memory if needed
-  if (sub->current_val.type == TIMESERIES_FIELD_TYPE_STRING) {
-    free(sub->current_val.data.string_val.str);
-  }
+  /* Save old value for later free */
+  timeseries_field_value_t old = sub->current_val;
 
   sub->current_ts = ts;
-  sub->current_val = val;
+  sub->current_val = val; /* new value now installed */
+
+  if (old.type == TIMESERIES_FIELD_TYPE_STRING) {
+    free(old.data.string_val.str); /* safe to free old string */
+  }
 
   return true;
 }
@@ -92,21 +89,19 @@ static bool multi_iter_advance_sub(timeseries_multi_points_iterator_t *multi,
 /**
  * Init function
  */
-bool timeseries_multi_points_iterator_init(
-    timeseries_points_iterator_t **sub_iters, const uint32_t *page_seqs,
-    size_t sub_count, timeseries_multi_points_iterator_t *out_iter) {
+bool timeseries_multi_points_iterator_init(timeseries_points_iterator_t** sub_iters, const uint32_t* page_seqs,
+                                           size_t sub_count, timeseries_multi_points_iterator_t* out_iter) {
   if (!out_iter || !sub_iters || sub_count == 0) {
     return false;
   }
   memset(out_iter, 0, sizeof(*out_iter));
 
   // Allocate sub-iterator array
-  out_iter->subs = (multi_points_sub_iter_t *)calloc(
-      sub_count, sizeof(multi_points_sub_iter_t));
+  out_iter->subs = (multi_points_sub_iter_t*)calloc(sub_count, sizeof(multi_points_sub_iter_t));
   if (!out_iter->subs) {
     return false;
   }
-  out_iter->heap = (size_t *)calloc(sub_count, sizeof(size_t));
+  out_iter->heap = (size_t*)calloc(sub_count, sizeof(size_t));
   if (!out_iter->heap) {
     free(out_iter->subs);
     out_iter->subs = NULL;
@@ -119,7 +114,7 @@ bool timeseries_multi_points_iterator_init(
 
   // Initialize each sub-iterator state
   for (size_t i = 0; i < sub_count; i++) {
-    multi_points_sub_iter_t *sub = &out_iter->subs[i];
+    multi_points_sub_iter_t* sub = &out_iter->subs[i];
     sub->sub_iter = sub_iters[i];
     sub->page_seq = page_seqs[i];
     sub->valid = true;
@@ -148,9 +143,8 @@ bool timeseries_multi_points_iterator_init(
 /**
  * Next function
  */
-bool timeseries_multi_points_iterator_next(
-    timeseries_multi_points_iterator_t *multi_iter, uint64_t *out_ts,
-    timeseries_field_value_t *out_val) {
+bool timeseries_multi_points_iterator_next(timeseries_multi_points_iterator_t* multi_iter, uint64_t* out_ts,
+                                           timeseries_field_value_t* out_val) {
   if (!multi_iter || !multi_iter->valid) {
     return false;
   }
@@ -173,7 +167,7 @@ bool timeseries_multi_points_iterator_next(
   // We'll pop from the heap each sub-iterator that has the same timestamp
   // keep them in a temporary list
   size_t same_ts_pop_count = 0;
-  size_t *popped = (size_t *)malloc(sizeof(size_t) * multi_iter->heap_size);
+  size_t* popped = (size_t*)malloc(sizeof(size_t) * multi_iter->heap_size);
   if (!popped) {
     // Not enough memory for pop buffer => fail or just handle them one by one
     return false;
@@ -243,8 +237,7 @@ bool timeseries_multi_points_iterator_next(
   return true;
 }
 
-void timeseries_multi_points_iterator_deinit(
-    timeseries_multi_points_iterator_t *multi_iter) {
+void timeseries_multi_points_iterator_deinit(timeseries_multi_points_iterator_t* multi_iter) {
   if (!multi_iter) {
     return;
   }
@@ -269,9 +262,8 @@ void timeseries_multi_points_iterator_deinit(
   memset(multi_iter, 0, sizeof(*multi_iter));
 }
 
-bool timeseries_multi_points_iterator_peek(
-    timeseries_multi_points_iterator_t *multi_iter, uint64_t *out_ts,
-    timeseries_field_value_t *out_val) {
+bool timeseries_multi_points_iterator_peek(timeseries_multi_points_iterator_t* multi_iter, uint64_t* out_ts,
+                                           timeseries_field_value_t* out_val) {
   if (!multi_iter || !multi_iter->valid || multi_iter->heap_size == 0) {
     return false;
   }
@@ -281,7 +273,7 @@ bool timeseries_multi_points_iterator_peek(
 
   // The top of the heap is the sub-iterator with the smallest current_ts
   size_t top_index = multi_iter->heap[0];
-  multi_points_sub_iter_t *sub = &multi_iter->subs[top_index];
+  multi_points_sub_iter_t* sub = &multi_iter->subs[top_index];
 
   if (!sub->valid) {
     // Shouldn't happen if heap_size > 0, but just in case

@@ -469,7 +469,6 @@ bool timeseries_points_iterator_next_value(
       return true;
     }
     case TIMESERIES_FIELD_TYPE_INT: {
-      ESP_LOGI(TAG, "iter->int_array[idx] = %lld", iter->int_array[idx]);
       int64_t i64 = iter->int_array[idx];
       out_value->data.int_val = i64;
       return true;

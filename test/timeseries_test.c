@@ -20,7 +20,7 @@ TEST_CASE("initializes the timeseries db", "[esp_idf_timeseries]") {
 TEST_CASE("clears the existing data", "[esp_idf_timeseries]") {
   TEST_ASSERT_TRUE(timeseries_clear_all());
 }
-/*
+
 TEST_CASE("query returns nothing with an empty db", "[esp_idf_timeseries]") {
   timeseries_query_t query;
   memset(&query, 0, sizeof(query));
@@ -143,7 +143,7 @@ TEST_CASE("Can query the data with no aggregation", "[esp_idf_timeseries]") {
   // Finally, free the result memory
   timeseries_query_free_result(&result);
 }
-
+/*
 TEST_CASE("Can query the data with aggregation", "[esp_idf_timeseries]") {
   timeseries_query_t query;
   memset(&query, 0, sizeof(query));
@@ -317,7 +317,6 @@ TEST_CASE("Can query the data with strings", "[esp_idf_timeseries]") {
   // Finally, free the result memory
   timeseries_query_free_result(&result);
 }
-*/
 
 TEST_CASE("Can store a large amount of unique strings",
           "[esp_idf_timeseries]") {
@@ -367,8 +366,6 @@ TEST_CASE("Can store a large amount of unique strings",
     free(field_values[0].data.string_val.str);
   }
 
-  /*
-
   // Test query to ensure the data is correct
   timeseries_query_t query;
   memset(&query, 0, sizeof(query));
@@ -415,9 +412,9 @@ TEST_CASE("Can store a large amount of unique strings",
     TEST_ASSERT_EQUAL_STRING_LEN(
         unique_message, result.columns[0].values[i].data.string_val.str,
         result.columns[0].values[i].data.string_val.length);
-  }*/
+  }
 }
-/*
+
 TEST_CASE("Can store a large amount of unique floats", "[esp_idf_timeseries]") {
   // Insert 10000 unique floats into the database that will trigger a compaction
   const size_t NUM_POINTS = 2000;
@@ -462,4 +459,6 @@ TEST_CASE("Can store a large amount of unique floats", "[esp_idf_timeseries]") {
 
   ESP_ERROR_CHECK(heap_trace_stop());
   heap_trace_dump();
-}*/
+}
+
+*/

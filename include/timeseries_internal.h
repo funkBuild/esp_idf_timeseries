@@ -68,11 +68,11 @@ typedef enum {
  */
 #pragma pack(push, 1)
 typedef struct {
-  uint32_t magic_number; // e.g. TIMESERIES_MAGIC_NUM = 0x54534442
-  uint8_t page_type;     // METADATA, FIELD_DATA
-  uint8_t page_state;    // FREE, ACTIVE, OBSOLETE
-  uint16_t reserved;     // alignment/future use
-  uint32_t sequence_num; // for compaction ordering
+  uint32_t magic_number;  // e.g. TIMESERIES_MAGIC_NUM = 0x54534442
+  uint8_t page_type;      // METADATA, FIELD_DATA
+  uint8_t page_state;     // FREE, ACTIVE, OBSOLETE
+  uint16_t reserved;      // alignment/future use
+  uint32_t sequence_num;  // for compaction ordering
 
   // If page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA,
   // this indicates level (0=uncompressed, 1+=compressed).
@@ -95,11 +95,11 @@ typedef struct {
  * Typically used for measurement definitions, tags, indexes.
  */
 typedef struct {
-  uint8_t delete_marker; // 0xFF = valid, 0x00 = soft-deleted
-  uint8_t key_type;      // e.g. MEASUREMENT, TAGINDEX, etc.
-  uint16_t key_len;      // key length in bytes
-  uint16_t value_len;    // value length in bytes
-                         // Followed by: key[key_len] + value[value_len]
+  uint8_t delete_marker;  // 0xFF = valid, 0x00 = soft-deleted
+  uint8_t key_type;       // e.g. MEASUREMENT, TAGINDEX, etc.
+  uint16_t key_len;       // key length in bytes
+  uint16_t value_len;     // value length in bytes
+                          // Followed by: key[key_len] + value[value_len]
 } timeseries_entry_header_t;
 
 /**
@@ -159,14 +159,21 @@ typedef struct {
   timeseries_page_header_t header;
 } timeseries_cached_page_t;
 
+// Cache entry structure for measurement name -> ID mapping
+typedef struct {
+  char* name;          // dynamically allocated measurement name
+  uint32_t id;         // measurement ID
+  uint32_t last_used;  // for LRU eviction
+} measurement_cache_entry_t;
+
 typedef struct {
   bool initialized;
   uint32_t next_measurement_id;
   uint32_t sequence_num;
-  const esp_partition_t *partition; // pointer to the 'storage' partition
+  const esp_partition_t* partition;  // pointer to the 'storage' partition
 
   // Page cache
-  timeseries_cached_page_t *page_cache; // dynamic array
+  timeseries_cached_page_t* page_cache;  // dynamic array
   size_t page_cache_count;
   size_t page_cache_capacity;
 
@@ -174,17 +181,23 @@ typedef struct {
   bool last_l0_cache_valid;
   uint32_t last_l0_page_offset;
   uint32_t last_l0_used_offset;
+
+  // Measurement name->ID cache
+  measurement_cache_entry_t* measurement_cache;
+  size_t measurement_cache_count;
+  size_t measurement_cache_capacity;
+  uint32_t cache_access_counter;  // for LRU
 } timeseries_db_t;
 
 typedef struct {
-  uint8_t *data;
+  uint8_t* data;
   size_t size;
   size_t capacity;
 } CompressedBuffer;
 
 typedef struct {
-  CompressedBuffer *cb;
+  CompressedBuffer* cb;
   size_t offset;
 } DecoderContext;
 
-#endif // TIMESERIES_INTERNAL_H
+#endif  // TIMESERIES_INTERNAL_H

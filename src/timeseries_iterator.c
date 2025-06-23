@@ -92,6 +92,48 @@ bool timeseries_page_iterator_next(timeseries_page_iterator_t* iter, timeseries_
   return false;
 }
 
+bool timeseries_metadata_page_iterator_init(timeseries_db_t* db, timeseries_metadata_page_iterator_t* iter) {
+  if (!db || !iter) {
+    return false;
+  }
+  memset(iter, 0, sizeof(*iter));
+
+  if (!timeseries_page_cache_iterator_init(db, &iter->inner)) {
+    return false;
+  }
+  iter->valid = true;
+  return true;
+}
+
+/* -------------------------------------------------------------------------- */
+bool timeseries_metadata_page_iterator_next(timeseries_metadata_page_iterator_t* iter,
+                                            timeseries_page_header_t* out_header, uint32_t* out_offset,
+                                            uint32_t* out_size) {
+  if (!iter || !iter->valid) {
+    return false;
+  }
+
+  timeseries_page_header_t hdr;
+  uint32_t off = 0;
+  uint32_t size = 0;
+
+  while (timeseries_page_cache_iterator_next(&iter->inner, &hdr, &off, &size)) {
+    if (hdr.magic_number == TIMESERIES_MAGIC_NUM && hdr.page_type == TIMESERIES_PAGE_TYPE_METADATA &&
+        hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE) {
+      /* hand results to caller */
+      if (out_header) memcpy(out_header, &hdr, sizeof(hdr));
+      if (out_offset) *out_offset = off;
+      if (out_size) *out_size = size;
+      return true;
+    }
+    /* else: skip to next page */
+  }
+
+  /* exhausted */
+  iter->valid = false;
+  return false;
+}
+
 // -----------------------------------------------------------------------------
 // Metadata (Entity) Iterator
 // -----------------------------------------------------------------------------
@@ -208,6 +250,16 @@ bool timeseries_entity_iterator_read_data(timeseries_entity_iterator_t* ent_iter
     }
   }
   return true;
+}
+
+bool timeseries_entity_iterator_peek_key(timeseries_entity_iterator_t* it, const timeseries_entry_header_t* hdr,
+                                         void* key_buf) {
+  return timeseries_entity_iterator_read_data(it, hdr, key_buf, NULL);
+}
+
+bool timeseries_entity_iterator_read_value(timeseries_entity_iterator_t* it, const timeseries_entry_header_t* hdr,
+                                           void* value_buf) {
+  return timeseries_entity_iterator_read_data(it, hdr, NULL, value_buf);
 }
 
 // -----------------------------------------------------------------------------

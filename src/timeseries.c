@@ -50,6 +50,18 @@ bool timeseries_init(void) {
   s_tsdb.last_l0_used_offset = 0;
   s_tsdb.initialized = true;
 
+  // Get current measurement ID from metadata
+  if (!tsdb_get_next_available_measurement_id(&s_tsdb, &s_tsdb.next_measurement_id)) {
+    ESP_LOGE(TAG, "Failed to get next available measurement ID.");
+    s_tsdb.next_measurement_id = 1;
+  }
+
+  // Init measurement cache
+  if (!tsdb_measurement_cache_init(&s_tsdb, 32)) {
+    ESP_LOGE(TAG, "Failed to initialize measurement cache.");
+    return false;
+  }
+
   ESP_LOGI(TAG, "Timeseries DB initialized successfully.");
   return true;
 }
@@ -137,7 +149,7 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
   }
 
   uint64_t end_time = esp_timer_get_time();
-  ESP_LOGI(TAG, "Inserted %zu points in %zu fields for measurement '%s' in %.3f ms", data->num_points, data->num_fields,
+  ESP_LOGV(TAG, "Inserted %zu points in %zu fields for measurement '%s' in %.3f ms", data->num_points, data->num_fields,
            data->measurement_name, (end_time - start_time) / 1000.0);
 
   return true;

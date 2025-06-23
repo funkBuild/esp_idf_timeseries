@@ -20,27 +20,26 @@
 #include "timeseries_iterator.h"
 #include "timeseries_page_cache.h"
 #include "timeseries_string_list.h"
+#include "timeseries_query.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char* TAG = "TimeseriesMetadata";
 
+#define MEASUREMENT_CACHE_DEFAULT_CAPACITY 32
+#define MEASUREMENT_CACHE_MAX_NAME_LEN 63
+
 // -----------------------------------------------------------------------------
 // Forward-declared static helpers
 // -----------------------------------------------------------------------------
 
 static bool tsdb_create_empty_metadata_page(timeseries_db_t* db, uint32_t page_offset);
-static bool tsdb_insert_measurement_entry(timeseries_db_t* db, uint32_t page_offset, const char* measurement_name,
-                                          uint32_t id);
-static bool tsdb_find_metadata_pages(timeseries_db_t* db,
-                                     uint32_t* out_offsets,  // store offsets not indices
-                                     size_t max_pages, size_t* found_count);
 
 static bool tsdb_soft_delete_entry(timeseries_db_t* db, uint32_t page_offset, uint32_t current_entry_offset);
 
-static bool tsdb_create_new_index_entry(timeseries_db_t* db, uint32_t page_offset, timeseries_keytype_t key_type,
-                                        const char* key_str, const unsigned char* series_ids, size_t series_ids_len);
+static bool tsdb_create_new_index_entry(timeseries_db_t* db, timeseries_keytype_t key_type, const char* key_str,
+                                        const unsigned char* series_ids, size_t series_ids_len);
 
 static bool tsdb_upsert_seriesid_list_entry(timeseries_db_t* db, timeseries_keytype_t target_key_type,
                                             const uint32_t* meta_offsets, size_t meta_count, const char* key_str,
@@ -55,6 +54,200 @@ static bool tsdb_upsert_fieldlist_entry(timeseries_db_t* db, const uint32_t* met
 // -----------------------------------------------------------------------------
 // Public API Implementations
 // -----------------------------------------------------------------------------
+
+bool tsdb_measurement_cache_init(timeseries_db_t* db, size_t capacity) {
+  if (!db) return false;
+
+  if (capacity == 0) {
+    capacity = MEASUREMENT_CACHE_DEFAULT_CAPACITY;
+  }
+
+  db->measurement_cache = calloc(capacity, sizeof(measurement_cache_entry_t));
+  if (!db->measurement_cache) {
+    ESP_LOGE(TAG, "Failed to allocate measurement cache");
+    return false;
+  }
+
+  db->measurement_cache_count = 0;
+  db->measurement_cache_capacity = capacity;
+  db->cache_access_counter = 0;
+
+  ESP_LOGD(TAG, "Initialized measurement cache with capacity %zu", capacity);
+  return true;
+}
+
+void tsdb_measurement_cache_deinit(timeseries_db_t* db) {
+  if (!db || !db->measurement_cache) return;
+
+  // Free all cached measurement names
+  for (size_t i = 0; i < db->measurement_cache_count; i++) {
+    free(db->measurement_cache[i].name);
+  }
+
+  free(db->measurement_cache);
+  db->measurement_cache = NULL;
+  db->measurement_cache_count = 0;
+  db->measurement_cache_capacity = 0;
+  db->cache_access_counter = 0;
+}
+
+bool tsdb_measurement_cache_lookup(timeseries_db_t* db, const char* measurement_name, uint32_t* out_id) {
+  if (!db || !db->measurement_cache || !measurement_name || !out_id) {
+    return false;
+  }
+
+  for (size_t i = 0; i < db->measurement_cache_count; i++) {
+    if (db->measurement_cache[i].name && strcmp(db->measurement_cache[i].name, measurement_name) == 0) {
+      *out_id = db->measurement_cache[i].id;
+      db->measurement_cache[i].last_used = ++db->cache_access_counter;
+      ESP_LOGV(TAG, "Cache hit for measurement '%s' -> ID %" PRIu32, measurement_name, *out_id);
+      return true;
+    }
+  }
+
+  return false;  // Cache miss
+}
+
+// Cache insertion with LRU eviction
+bool tsdb_measurement_cache_insert(timeseries_db_t* db, const char* measurement_name, uint32_t id) {
+  if (!db || !db->measurement_cache || !measurement_name) {
+    return false;
+  }
+
+  size_t name_len = strlen(measurement_name);
+  if (name_len == 0 || name_len > MEASUREMENT_CACHE_MAX_NAME_LEN) {
+    ESP_LOGW(TAG, "Measurement name too long for cache: %zu chars", name_len);
+    return false;
+  }
+
+  // Check if already exists (update case)
+  for (size_t i = 0; i < db->measurement_cache_count; i++) {
+    if (db->measurement_cache[i].name && strcmp(db->measurement_cache[i].name, measurement_name) == 0) {
+      db->measurement_cache[i].id = id;
+      db->measurement_cache[i].last_used = ++db->cache_access_counter;
+      ESP_LOGV(TAG, "Updated cache entry for measurement '%s' -> ID %" PRIu32, measurement_name, id);
+      return true;
+    }
+  }
+
+  size_t insert_index;
+
+  // Find insertion point
+  if (db->measurement_cache_count < db->measurement_cache_capacity) {
+    // Use next available slot
+    insert_index = db->measurement_cache_count++;
+  } else {
+    // Cache is full, evict LRU entry
+    insert_index = 0;
+    uint32_t oldest_access = db->measurement_cache[0].last_used;
+
+    for (size_t i = 1; i < db->measurement_cache_count; i++) {
+      if (db->measurement_cache[i].last_used < oldest_access) {
+        oldest_access = db->measurement_cache[i].last_used;
+        insert_index = i;
+      }
+    }
+
+    // Free the old name
+    free(db->measurement_cache[insert_index].name);
+    ESP_LOGV(TAG, "Evicted cache entry at index %zu", insert_index);
+  }
+
+  // Allocate and copy the name
+  db->measurement_cache[insert_index].name = malloc(name_len + 1);
+  if (!db->measurement_cache[insert_index].name) {
+    ESP_LOGE(TAG, "Failed to allocate memory for cached measurement name");
+    if (insert_index == db->measurement_cache_count - 1) {
+      db->measurement_cache_count--;  // Rollback count increment
+    }
+    return false;
+  }
+
+  strcpy(db->measurement_cache[insert_index].name, measurement_name);
+  db->measurement_cache[insert_index].id = id;
+  db->measurement_cache[insert_index].last_used = ++db->cache_access_counter;
+
+  ESP_LOGV(TAG, "Cached measurement '%s' -> ID %" PRIu32 " at index %zu", measurement_name, id, insert_index);
+  return true;
+}
+
+static bool tsdb_append_entity_to_metadata(timeseries_db_t* db, uint8_t key_type, const void* key_buf, uint16_t key_len,
+                                           const void* val_buf, uint16_t val_len) {
+  if (!db || !key_buf) return false;
+
+  const uint32_t entity_size = sizeof(timeseries_entry_header_t) + key_len + val_len;
+
+  /* Two passes max: 0 = scan existing pages, 1 = after creating a new page */
+  for (int pass = 0; pass < 2; ++pass) {
+    /* ------------------------------------------------ scan pages for space */
+    timeseries_metadata_page_iterator_t page_it;
+    if (!timeseries_metadata_page_iterator_init(db, &page_it)) return false;
+
+    timeseries_page_header_t hdr;
+    uint32_t page_off, page_sz;
+    while (timeseries_metadata_page_iterator_next(&page_it, &hdr, &page_off, &page_sz)) {
+      /* locate free space at end of page */
+      timeseries_entity_iterator_t ent_it;
+      if (!timeseries_entity_iterator_init(db, page_off, page_sz, &ent_it)) {
+        continue; /* skip broken page           */
+      }
+
+      uint32_t free_off = ent_it.offset; /* just after page header     */
+      timeseries_entry_header_t eh;
+      while (timeseries_entity_iterator_next(&ent_it, &eh)) {
+        free_off = ent_it.offset; /* cursor after last entry    */
+      }
+      timeseries_entity_iterator_deinit(&ent_it);
+
+      uint32_t remaining = page_sz - free_off;
+      if (remaining < entity_size) {
+        continue; /* not enough room – next pg  */
+      }
+
+      /* ----------------------------------- we have room → write the entity */
+      uint32_t write_addr = page_off + free_off;
+
+      timeseries_entry_header_t new_hdr = {0};
+      new_hdr.delete_marker = TIMESERIES_DELETE_MARKER_VALID;
+      new_hdr.key_type = key_type;
+      new_hdr.key_len = key_len;
+      new_hdr.value_len = val_len;
+
+      esp_err_t err;
+      err = esp_partition_write(db->partition, write_addr, &new_hdr, sizeof(new_hdr));
+      if (err != ESP_OK) goto write_fail;
+      write_addr += sizeof(new_hdr);
+
+      err = esp_partition_write(db->partition, write_addr, key_buf, key_len);
+      if (err != ESP_OK) goto write_fail;
+      write_addr += key_len;
+
+      if (val_len) {
+        err = esp_partition_write(db->partition, write_addr, val_buf, val_len);
+        if (err != ESP_OK) goto write_fail;
+      }
+
+      return true; /* ✅ success               */
+
+    write_fail:
+      ESP_LOGE(TAG, "Partition write failed (err=0x%x)", err);
+      return false;
+    } /* while pages */
+
+    /* ------------------------------------------------ no space; try to add a page */
+    if (pass == 0) {
+      ESP_LOGI(TAG, "All metadata pages full – creating a new one…");
+      if (!timeseries_metadata_create_page(db)) {
+        ESP_LOGE(TAG, "Failed to create a new metadata page");
+        return false;
+      }
+      /* loop again to insert into the freshly created page */
+    }
+  } /* for pass */
+
+  ESP_LOGE(TAG, "Could not append entity: no space even after new page");
+  return false;
+}
 
 bool timeseries_metadata_create_page(timeseries_db_t* db) {
   if (!db) {
@@ -149,67 +342,78 @@ bool tsdb_find_measurement_id(timeseries_db_t* db, const char* measurement_name,
     return false;
   }
 
-  // We'll scan all active METADATA pages to look for a matching measurement
-  uint32_t meta_offsets[4];
-  size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
-    ESP_LOGW(TAG, "No metadata pages found to search for measurement '%s'.", measurement_name);
+  // Try cache first
+  if (db->measurement_cache && tsdb_measurement_cache_lookup(db, measurement_name, out_id)) {
+    return true;
+  }
+
+  // Cache miss - search on disk
+  const size_t wanted_len = strlen(measurement_name);
+  bool found = false;
+  uint32_t found_id = 0;
+
+  timeseries_metadata_page_iterator_t meta_it;
+  if (!timeseries_metadata_page_iterator_init(db, &meta_it)) {
+    ESP_LOGW(TAG, "Failed to create metadata-page iterator");
     return false;
   }
 
-  // For each active metadata page offset
-  for (size_t i = 0; i < meta_count; i++) {
-    uint32_t page_offset = meta_offsets[i];
-    uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;  // 8 KB
-
-    // Initialize an entity iterator for this page
-    timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-      ESP_LOGW(TAG, "Failed to init entity iterator for meta offset=0x%08" PRIx32, page_offset);
-      continue;
+  timeseries_page_header_t page_hdr;
+  uint32_t page_off, page_sz;
+  while (timeseries_metadata_page_iterator_next(&meta_it, &page_hdr, &page_off, &page_sz)) {
+    timeseries_entity_iterator_t ent_it;
+    if (!timeseries_entity_iterator_init(db, page_off, page_sz, &ent_it)) {
+      ESP_LOGW(TAG, "Failed to init entity iterator @0x%08" PRIx32, page_off);
+      continue; /* skip this page */
     }
 
-    timeseries_entry_header_t e_hdr;
-    while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-      ESP_LOGV(TAG, "Reading entry at offset=0x%08" PRIx32, ent_iter.offset);
-
-      // We only care about measurement entries
-      if (e_hdr.key_type != TIMESERIES_KEYTYPE_MEASUREMENT) {
-        continue;
-      }
-      if (e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
+    timeseries_entry_header_t eh;
+    while (timeseries_entity_iterator_next(&ent_it, &eh)) {
+      if (eh.key_type != TIMESERIES_KEYTYPE_MEASUREMENT || eh.delete_marker != TIMESERIES_DELETE_MARKER_VALID ||
+          eh.key_len != wanted_len || eh.key_len >= 64) /* 64-byte key buffer guard */
+      {
         continue;
       }
 
-      if (e_hdr.key_len == strlen(measurement_name)) {
-        char key_buf[64];
-        if (e_hdr.key_len < sizeof(key_buf)) {
-          // read the key + the value
-          uint32_t val = 0;
-          if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key_buf, &val)) {
-            ESP_LOGW(TAG, "Failed reading measurement entry data.");
-            continue;
-          }
-
-          key_buf[e_hdr.key_len] = '\0';
-
-          ESP_LOGV(TAG, "Read measurement entry: key='%s' val=%" PRIu32, key_buf, val);
-
-          // Compare
-          if (strcmp(key_buf, measurement_name) == 0) {
-            *out_id = val;
-            timeseries_entity_iterator_deinit(&ent_iter);
-            return true;
-          }
-        }
+      /* peek the key only */
+      char key_buf[64];
+      if (!timeseries_entity_iterator_peek_key(&ent_it, &eh, key_buf)) {
+        continue;
       }
+      key_buf[eh.key_len] = '\0';
+
+      if (strcmp(key_buf, measurement_name) != 0) {
+        continue; /* not our measurement */
+      }
+
+      /* key matches – read the 32-bit value (measurement ID) */
+      uint32_t id_val = 0;
+      if (!timeseries_entity_iterator_read_value(&ent_it, &eh, &id_val)) {
+        ESP_LOGW(TAG, "Failed reading measurement id value");
+        continue;
+      }
+
+      found_id = id_val;
+      found = true;
+      break;
     }
 
-    timeseries_entity_iterator_deinit(&ent_iter);
+    timeseries_entity_iterator_deinit(&ent_it);
+    if (found) break;
   }
 
-  // Not found in any metadata page
-  return false;
+  if (found) {
+    *out_id = found_id;
+
+    // Cache the result for future lookups
+    if (db->measurement_cache) {
+      tsdb_measurement_cache_insert(db, measurement_name, found_id);
+    }
+
+    return true;
+  }
+
+  return false; /* not found */
 }
 
 bool tsdb_create_measurement_id(timeseries_db_t* db, const char* measurement_name, uint32_t* out_id) {
@@ -217,22 +421,29 @@ bool tsdb_create_measurement_id(timeseries_db_t* db, const char* measurement_nam
     return false;
   }
 
-  // Grab next ID from db
+  /* Allocate the next ID */
   uint32_t new_id = db->next_measurement_id++;
   *out_id = new_id;
 
-  // We pick the first active metadata page offset to store the measurement
-  uint32_t meta_offsets[4];
-  size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count) || meta_count == 0) {
-    ESP_LOGE(TAG, "No active metadata page to insert measurement '%s'.", measurement_name);
+  /* Prepare key and value buffers */
+  const uint16_t key_len = strlen(measurement_name);
+  if (key_len == 0 || key_len >= 128) { /* sanity guard */
+    ESP_LOGE(TAG, "Measurement name too long");
     return false;
   }
 
-  // Insert the measurement into the first page offset
-  if (!tsdb_insert_measurement_entry(db, meta_offsets[0], measurement_name, new_id)) {
-    ESP_LOGE(TAG, "Failed to insert measurement entry for '%s'!", measurement_name);
+  /* Use the new helper to append the MEASUREMENT entry */
+  bool ok = tsdb_append_entity_to_metadata(db, TIMESERIES_KEYTYPE_MEASUREMENT, measurement_name, key_len, &new_id,
+                                           sizeof(new_id));
+
+  if (!ok) {
+    ESP_LOGE(TAG, "Failed to insert measurement '%s'", measurement_name);
     return false;
+  }
+
+  /* Cache the new measurement */
+  if (db->measurement_cache) {
+    tsdb_measurement_cache_insert(db, measurement_name, new_id);
   }
 
   ESP_LOGV(TAG, "Created measurement '%s' with ID=%" PRIu32, measurement_name, new_id);
@@ -305,50 +516,54 @@ bool tsdb_lookup_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
     return false;
   }
 
-  // find active metadata pages
-  uint32_t meta_offsets[4];
-  size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
-    ESP_LOGE(TAG, "No active metadata pages for series ID lookup");
+  timeseries_metadata_page_iterator_t meta_it;
+  if (!timeseries_metadata_page_iterator_init(db, &meta_it)) {
+    ESP_LOGE(TAG, "Failed to create metadata-page iterator");
     return false;
   }
 
-  // scan each page
-  for (size_t i = 0; i < meta_count; i++) {
-    uint32_t page_offset = meta_offsets[i];
-    uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
-
-    timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-      continue;
+  timeseries_page_header_t page_hdr;
+  uint32_t page_off, page_sz;
+  while (timeseries_metadata_page_iterator_next(&meta_it, &page_hdr, &page_off, &page_sz)) {
+    timeseries_entity_iterator_t ent_it;
+    if (!timeseries_entity_iterator_init(db, page_off, page_sz, &ent_it)) {
+      continue; /* skip page if iterator fails */
     }
 
-    timeseries_entry_header_t e_hdr;
-    while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-      if (e_hdr.key_type != TIMESERIES_KEYTYPE_FIELDINDEX || e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
+    timeseries_entry_header_t eh;
+    while (timeseries_entity_iterator_next(&ent_it, &eh)) {
+      /* We want FIELDINDEX entries of exactly 16-byte key + 1-byte value */
+      if (eh.key_type != TIMESERIES_KEYTYPE_FIELDINDEX || eh.delete_marker != TIMESERIES_DELETE_MARKER_VALID ||
+          eh.key_len != 16 || eh.value_len != 1) {
         continue;
       }
-      // must be 16-byte key, 1-byte value
-      if (e_hdr.key_len == 16 && e_hdr.value_len == 1) {
-        unsigned char key_buf[16];
-        uint8_t stored_type = 0;
 
-        if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key_buf, &stored_type)) {
-          continue;
-        }
-        if (memcmp(key_buf, series_id, 16) == 0) {
-          // found the matching series
-          *out_type = (timeseries_field_type_e)stored_type;
-          timeseries_entity_iterator_deinit(&ent_iter);
-          return true;  // success
-        }
+      /* Peek the 16-byte key */
+      unsigned char key_buf[16];
+      if (!timeseries_entity_iterator_peek_key(&ent_it, &eh, key_buf)) {
+        continue;
       }
+
+      if (memcmp(key_buf, series_id, 16) != 0) {
+        continue; /* not our series            */
+      }
+
+      /* Read the single-byte value (field type) */
+      uint8_t stored_type = 0;
+      if (!timeseries_entity_iterator_read_value(&ent_it, &eh, &stored_type)) {
+        ESP_LOGW(TAG, "Failed reading series-type value");
+        continue;
+      }
+
+      *out_type = (timeseries_field_type_e)stored_type;
+      timeseries_entity_iterator_deinit(&ent_it);
+      return true; /* success                   */
     }
 
-    timeseries_entity_iterator_deinit(&ent_iter);
+    timeseries_entity_iterator_deinit(&ent_it);
   }
 
-  return false;  // not found in any page
+  return false; /* not found                 */
 }
 
 /**
@@ -357,88 +572,33 @@ bool tsdb_lookup_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
  */
 bool tsdb_ensure_series_type_in_metadata(timeseries_db_t* db, const unsigned char series_id[16],
                                          timeseries_field_type_e field_type) {
-  if (!db || !series_id) {
-    return false;
-  }
+  if (!db || !series_id) return false;
 
-  // 1) Check if there's already a stored type for this series ID
-  timeseries_field_type_e existing_type;
-  if (tsdb_lookup_series_type_in_metadata(db, series_id, &existing_type)) {
-    // found existing
-    if (existing_type != field_type) {
-      ESP_LOGE(TAG, "SeriesID conflict: existing type=%d, new=%d", (int)existing_type, (int)field_type);
+  /* 1️⃣  Already present? */
+  timeseries_field_type_e existing;
+  if (tsdb_lookup_series_type_in_metadata(db, series_id, &existing)) {
+    if (existing != field_type) {
+      ESP_LOGE(TAG, "Series-ID conflict: stored=%d, requested=%d", (int)existing, (int)field_type);
       return false;
     }
-    // else it matches => done
-    ESP_LOGV(TAG, "SeriesID already has matching type=%d", (int)field_type);
-    return true;
+    return true; /* nothing to do */
   }
 
-  // 2) Not found => create new entry in first meta page
-  uint32_t meta_offsets[4];
-  size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count) || meta_count == 0) {
-    ESP_LOGE(TAG, "No active metadata page to create new field index");
+  /* 2️⃣  Append brand-new FIELDINDEX entry (auto-page select / create) */
+  uint8_t type_byte = (uint8_t)field_type;
+  if (!tsdb_append_entity_to_metadata(db, TIMESERIES_KEYTYPE_FIELDINDEX, series_id, 16, &type_byte, 1)) {
+    ESP_LOGE(TAG, "Failed to create FIELDINDEX for series %.2X%.2X%.2X%.2X…", series_id[0], series_id[1], series_id[2],
+             series_id[3]);
     return false;
   }
 
-  // pick first meta page
-  uint32_t page_offset = meta_offsets[0];
-  uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
-
-  timeseries_entity_iterator_t ent_iter;
-  if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-    return false;
-  }
-
-  // find end offset
-  uint32_t last_offset = ent_iter.offset;
-  timeseries_entry_header_t e_hdr;
-  while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-    last_offset = ent_iter.offset;
-  }
-
-  timeseries_entity_iterator_deinit(&ent_iter);
-
-  uint32_t entry_offset = page_offset + last_offset;
-
-  // build new header
-  timeseries_entry_header_t new_hdr;
-  memset(&new_hdr, 0, sizeof(new_hdr));
-  new_hdr.delete_marker = TIMESERIES_DELETE_MARKER_VALID;
-  new_hdr.key_type = TIMESERIES_KEYTYPE_FIELDINDEX;
-  new_hdr.key_len = 16;
-  new_hdr.value_len = 1;
-
-  esp_err_t err = esp_partition_write(db->partition, entry_offset, &new_hdr, sizeof(new_hdr));
-  if (err != ESP_OK) {
-    return false;
-  }
-  entry_offset += sizeof(new_hdr);
-
-  // write 16-byte series_id
-  err = esp_partition_write(db->partition, entry_offset, series_id, 16);
-  if (err != ESP_OK) {
-    return false;
-  }
-  entry_offset += 16;
-
-  // write 1 byte type
-  uint8_t stored_type = (uint8_t)field_type;
-  err = esp_partition_write(db->partition, entry_offset, &stored_type, 1);
-  if (err != ESP_OK) {
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Created new fieldindex for series=%.2X%.2X%.2X%.2X..., type=%d", series_id[0], series_id[1],
-           series_id[2], series_id[3], (int)field_type);
-
+  ESP_LOGV(TAG, "Created FIELDINDEX for series %.2X%.2X%.2X%.2X… , type=%d", series_id[0], series_id[1], series_id[2],
+           series_id[3], (int)field_type);
   return true;
 }
 
 bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, const char** tag_keys,
                                 const char** tag_values, size_t num_tags, const unsigned char series_id[16]) {
-  // If you call tsdb_upsert_tagindex_entry() here, it must be declared first!
   if (!db || !series_id) {
     return false;
   }
@@ -446,28 +606,62 @@ bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, co
     return true;
   }
 
-  // find metadata pages
-  uint32_t meta_offsets[4];
-  size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
-    ESP_LOGE(TAG, "No active metadata pages for tag indexing");
+  /* ------------------------------------------------------------------ */
+  /* 1. Collect *all* active-metadata page offsets                       */
+  /* ------------------------------------------------------------------ */
+  uint32_t* page_offsets = NULL;
+  size_t count = 0;
+  size_t cap = 0;
+
+  timeseries_metadata_page_iterator_t meta_it;
+  if (!timeseries_metadata_page_iterator_init(db, &meta_it)) {
+    ESP_LOGE(TAG, "Failed to create metadata-page iterator");
     return false;
   }
 
-  // For each tag, build the key and upsert
-  for (size_t i = 0; i < num_tags; i++) {
+  timeseries_page_header_t hdr;
+  uint32_t off, sz;
+  while (timeseries_metadata_page_iterator_next(&meta_it, &hdr, &off, &sz)) {
+    if (count == cap) { /* grow dynamic array           */
+      size_t new_cap = (cap == 0) ? 4 : cap * 2;
+      uint32_t* nb = realloc(page_offsets, new_cap * sizeof(uint32_t));
+      if (!nb) {
+        free(page_offsets);
+        ESP_LOGE(TAG, "OOM while collecting metadata pages");
+        return false;
+      }
+      page_offsets = nb;
+      cap = new_cap;
+    }
+    page_offsets[count++] = off;
+  }
+
+  if (count == 0) {
+    ESP_LOGE(TAG, "No active metadata pages for tag indexing");
+    free(page_offsets);
+    return false;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 2. Upsert one TagIndex entry per tag key/value                      */
+  /* ------------------------------------------------------------------ */
+  for (size_t i = 0; i < num_tags; ++i) {
     char key_buf[128];
     int n = snprintf(key_buf, sizeof(key_buf), "%" PRIu32 ":%s:%s", measurement_id, tag_keys[i], tag_values[i]);
     if (n < 0 || (size_t)n >= sizeof(key_buf)) {
+      ESP_LOGE(TAG, "Tag key buffer overflow for '%s:%s'", tag_keys[i], tag_values[i]);
+      free(page_offsets);
       return false;
     }
 
-    if (!tsdb_upsert_tagindex_entry(db, meta_offsets, meta_count, key_buf, series_id)) {
-      ESP_LOGE(TAG, "Failed to upsert tag '%s' => series ID", key_buf);
+    if (!tsdb_upsert_tagindex_entry(db, page_offsets, count, key_buf, series_id)) {
+      ESP_LOGE(TAG, "Failed to upsert tag '%s'", key_buf);
+      free(page_offsets);
       return false;
     }
   }
 
+  free(page_offsets);
   return true;
 }
 
@@ -511,100 +705,6 @@ static bool tsdb_create_empty_metadata_page(timeseries_db_t* db, uint32_t page_o
   return true;
 }
 
-static bool tsdb_insert_measurement_entry(timeseries_db_t* db, uint32_t page_offset, const char* measurement_name,
-                                          uint32_t id) {
-  if (!db || !measurement_name) {
-    return false;
-  }
-
-  uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
-
-  // find the end offset of this page
-  timeseries_entity_iterator_t ent_iter;
-  if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-    return false;
-  }
-
-  uint32_t last_offset = ent_iter.offset;
-  timeseries_entry_header_t e_hdr;
-  while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-    last_offset = ent_iter.offset;
-  }
-
-  timeseries_entity_iterator_deinit(&ent_iter);
-
-  uint32_t entry_offset = page_offset + last_offset;
-
-  // build header
-  timeseries_entry_header_t new_hdr;
-  memset(&new_hdr, 0, sizeof(new_hdr));
-  new_hdr.delete_marker = TIMESERIES_DELETE_MARKER_VALID;
-  new_hdr.key_type = TIMESERIES_KEYTYPE_MEASUREMENT;
-  new_hdr.key_len = (uint16_t)strlen(measurement_name);
-  new_hdr.value_len = sizeof(uint32_t);
-
-  esp_err_t err = esp_partition_write(db->partition, entry_offset, &new_hdr, sizeof(new_hdr));
-  if (err != ESP_OK) {
-    return false;
-  }
-
-  entry_offset += sizeof(new_hdr);
-
-  // write the key
-  err = esp_partition_write(db->partition, entry_offset, measurement_name, new_hdr.key_len);
-  if (err != ESP_OK) {
-    return false;
-  }
-  entry_offset += new_hdr.key_len;
-
-  // write the ID
-  err = esp_partition_write(db->partition, entry_offset, &id, sizeof(id));
-  if (err != ESP_OK) {
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Inserted measurement='%s' ID=%" PRIu32 " into metadata page @ offset=0x%08" PRIx32, measurement_name,
-           id, page_offset);
-  return true;
-}
-
-/**
- * @brief Finds all offsets in the partition that are active METADATA pages.
- *
- * The new page iterator returns (header, offset, size). We check if
- * page_type==METADATA && state==ACTIVE, then store `offset`.
- */
-static bool tsdb_find_metadata_pages(timeseries_db_t* db, uint32_t* out_offsets, size_t max_pages,
-                                     size_t* found_count) {
-  if (!db || !out_offsets || !found_count) {
-    return false;
-  }
-  *found_count = 0;
-
-  timeseries_page_cache_iterator_t page_iter;
-  if (!timeseries_page_cache_iterator_init(db, &page_iter)) {
-    return false;
-  }
-
-  timeseries_page_header_t hdr;
-  uint32_t page_offset = 0;
-  uint32_t page_size = 0;
-
-  while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &page_offset, &page_size)) {
-    if (hdr.magic_number == TIMESERIES_MAGIC_NUM && hdr.page_type == TIMESERIES_PAGE_TYPE_METADATA &&
-        hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE) {
-      if (*found_count < max_pages) {
-        out_offsets[*found_count] = page_offset;
-        (*found_count)++;
-      } else {
-        break;
-      }
-    }
-  }
-
-  return (*found_count > 0);
-}
-
 static bool tsdb_soft_delete_entry(timeseries_db_t* db, uint32_t page_offset, uint32_t current_entry_offset) {
   if (!db) {
     return false;
@@ -623,61 +723,12 @@ static bool tsdb_soft_delete_entry(timeseries_db_t* db, uint32_t page_offset, ui
   return true;
 }
 
-static bool tsdb_create_new_index_entry(timeseries_db_t* db, uint32_t page_offset, timeseries_keytype_t key_type,
-                                        const char* key_str, const unsigned char* series_ids, size_t series_ids_len) {
-  if (!db || !key_str || !series_ids) {
-    return false;
-  }
+static bool tsdb_create_new_index_entry(timeseries_db_t* db, timeseries_keytype_t key_type, const char* key_str,
+                                        const unsigned char* series_ids, size_t series_ids_len) {
+  if (!db || !key_str || !series_ids) return false;
 
-  // Initialize an entity iterator to find the end of the page
-  uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
-  timeseries_entity_iterator_t ent_iter;
-  if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-    return false;
-  }
-
-  // Find last offset in that page
-  uint32_t last_offset = ent_iter.offset;
-  timeseries_entry_header_t e_hdr;
-  while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-    last_offset = ent_iter.offset;
-  }
-
-  timeseries_entity_iterator_deinit(&ent_iter);
-
-  uint32_t entry_offset = page_offset + last_offset;
-
-  // Build header
-  timeseries_entry_header_t new_hdr;
-  memset(&new_hdr, 0, sizeof(new_hdr));
-  new_hdr.delete_marker = TIMESERIES_DELETE_MARKER_VALID;
-  new_hdr.key_type = key_type;
-  new_hdr.key_len = (uint16_t)strlen(key_str);
-  new_hdr.value_len = (uint16_t)series_ids_len;
-
-  // Write header
-  esp_err_t err = esp_partition_write(db->partition, entry_offset, &new_hdr, sizeof(new_hdr));
-  if (err != ESP_OK) {
-    return false;
-  }
-  entry_offset += sizeof(new_hdr);
-
-  // Write the key
-  err = esp_partition_write(db->partition, entry_offset, key_str, new_hdr.key_len);
-  if (err != ESP_OK) {
-    return false;
-  }
-  entry_offset += new_hdr.key_len;
-
-  // Write the series IDs
-  err = esp_partition_write(db->partition, entry_offset, series_ids, series_ids_len);
-  if (err != ESP_OK) {
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Created new index entry (type=%u) for '%s', value_len=%u", (unsigned)key_type, key_str,
-           (unsigned)new_hdr.value_len);
-  return true;
+  return tsdb_append_entity_to_metadata(db, (uint8_t)key_type, key_str, (uint16_t)strlen(key_str), series_ids,
+                                        (uint16_t)series_ids_len);
 }
 
 /**
@@ -699,133 +750,205 @@ bool tsdb_index_field_for_series(timeseries_db_t* db, uint32_t measurement_id, c
     return false;
   }
 
-  // Build the key string "measurementId:fieldName"
+  /* Build the key "<measurementId>:<fieldName>" */
   char key_buf[128];
   int n = snprintf(key_buf, sizeof(key_buf), "%" PRIu32 ":%s", measurement_id, field_name);
   if (n < 0 || (size_t)n >= sizeof(key_buf)) {
-    ESP_LOGE(TAG, "tsdb_index_field_for_series: key_buf overflow");
+    ESP_LOGE(TAG, "key_buf overflow (field '%s')", field_name);
     return false;
   }
 
-  // Find all active metadata pages
-  uint32_t meta_offsets[4];
-  size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count) || meta_count == 0) {
+  /* ------------------------------------------------------------ */
+  /* Gather *all* active-metadata page offsets                     */
+  /* ------------------------------------------------------------ */
+  uint32_t* offsets = NULL;
+  size_t count = 0;
+  size_t cap = 0;
+
+  timeseries_metadata_page_iterator_t meta_it;
+  if (!timeseries_metadata_page_iterator_init(db, &meta_it)) {
+    return false;
+  }
+
+  timeseries_page_header_t hdr;
+  uint32_t off, size;
+  while (timeseries_metadata_page_iterator_next(&meta_it, &hdr, &off, &size)) {
+    if (count == cap) { /* grow array */
+      size_t new_cap = (cap == 0) ? 4 : cap * 2;
+      uint32_t* nb = realloc(offsets, new_cap * sizeof(uint32_t));
+      if (!nb) { /* OOM → abort */
+        free(offsets);
+        return false;
+      }
+      offsets = nb;
+      cap = new_cap;
+    }
+    offsets[count++] = off;
+  }
+
+  if (count == 0) {
     ESP_LOGE(TAG, "No active metadata page found for field index");
+    free(offsets);
     return false;
   }
 
-  // Upsert the key => append the seriesId if it doesn't exist.
-  return tsdb_upsert_fieldlist_entry(db, meta_offsets, meta_count, key_buf, series_id);
+  /* ------------------------------------------------------------ */
+  /* Upsert field->seriesId mapping                                */
+  /* (tsdb_upsert_fieldlist_entry keeps the old signature)         */
+  /* ------------------------------------------------------------ */
+  bool ok = tsdb_upsert_fieldlist_entry(db, offsets, count, key_buf, series_id);
+  free(offsets);
+  return ok;
 }
 
-bool tsdb_find_series_ids_for_tag(timeseries_db_t* db, uint32_t measurement_id, const char* tag_key,
-                                  const char* tag_value, timeseries_series_id_list_t* out_series_list) {
-  if (!db || !tag_key || !tag_value || !out_series_list) {
+bool tsdb_find_series_ids_for_multiple_tags(timeseries_db_t* db, uint32_t measurement_id, size_t num_tags,
+                                            const char** tag_keys, const char** tag_values,
+                                            timeseries_series_id_list_t* out_series_list) {
+  if (!db || !tag_keys || !tag_values || !out_series_list || num_tags == 0) {
     return false;
   }
 
-  // 1) Build the key that identifies the tag index entry, e.g.
-  // "1234:myTag:someValue"
-  char key_buf[128];
-  int n = snprintf(key_buf, sizeof(key_buf), "%" PRIu32 ":%s:%s", measurement_id, tag_key, tag_value);
-  if (n < 0 || (size_t)n >= sizeof(key_buf)) {
-    ESP_LOGE(TAG, "tsdb_find_series_ids_for_tag: key_buf overflow");
+  /* Build keys for all tags we're looking for */
+  typedef struct {
+    char key[128];
+    size_t key_len;
+    timeseries_series_id_list_t series_ids;
+    bool found;
+  } tag_search_t;
+
+  tag_search_t* tag_searches = calloc(num_tags, sizeof(tag_search_t));
+  if (!tag_searches) {
     return false;
   }
 
-  // 2) Find active METADATA pages
-  uint32_t meta_offsets[4];
-  size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count) || meta_count == 0) {
-    // No metadata pages => no result
-    ESP_LOGD(TAG, "No active metadata pages for tag '%s'.", key_buf);
-    return false;
+  /* Initialize search structures for each tag */
+  for (size_t i = 0; i < num_tags; ++i) {
+    int n = snprintf(tag_searches[i].key, sizeof(tag_searches[i].key), "%" PRIu32 ":%s:%s", measurement_id, tag_keys[i],
+                     tag_values[i]);
+    if (n < 0 || (size_t)n >= sizeof(tag_searches[i].key)) {
+      ESP_LOGE(TAG, "key_buf overflow for tag '%s:%s'", tag_keys[i], tag_values[i]);
+      goto cleanup;
+    }
+    tag_searches[i].key_len = strlen(tag_searches[i].key);
+    tsdb_series_id_list_init(&tag_searches[i].series_ids);
+    tag_searches[i].found = false;
   }
 
-  // 3) Scan each metadata page for an entry with:
-  //    - key_type == TIMESERIES_KEYTYPE_TAGINDEX
-  //    - delete_marker == TIMESERIES_DELETE_MARKER_VALID
-  //    - matching key == key_buf
-  bool found_any = false;
+  /* Scratch buffer for value payloads */
+  uint8_t* scratch = NULL;
+  size_t scratch_cap = 0;
 
-  for (size_t p = 0; p < meta_count; p++) {
-    uint32_t page_offset = meta_offsets[p];
-    uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;  // e.g. 8KB
+  /* Walk all active metadata pages ONCE */
+  timeseries_metadata_page_iterator_t meta_it;
+  if (!timeseries_metadata_page_iterator_init(db, &meta_it)) {
+    goto cleanup;
+  }
 
-    timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+  timeseries_page_header_t page_hdr;
+  uint32_t page_off, page_sz;
+  while (timeseries_metadata_page_iterator_next(&meta_it, &page_hdr, &page_off, &page_sz)) {
+    timeseries_entity_iterator_t ent_it;
+    if (!timeseries_entity_iterator_init(db, page_off, page_sz, &ent_it)) {
       continue;
     }
 
     timeseries_entry_header_t e_hdr;
-    while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-      // Check if we have a valid TagIndex entry
-      if (e_hdr.key_type != TIMESERIES_KEYTYPE_TAGINDEX || e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
+    while (timeseries_entity_iterator_next(&ent_it, &e_hdr)) {
+      /* Filter for TagIndex entries */
+      if (e_hdr.key_type != TIMESERIES_KEYTYPE_TAGINDEX || e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID ||
+          e_hdr.value_len % 16u) {
         continue;
       }
 
-      // The key_len should match length of our "measurementId:tagKey:tagValue"
-      size_t expected_len = strlen(key_buf);
-      if (e_hdr.key_len != expected_len) {
-        continue;
-      }
-
-      // The value_len should be a multiple of 16 (each series ID is 16 bytes)
-      if (e_hdr.value_len % 16 != 0) {
-        ESP_LOGW(TAG, "Unexpected tagindex value_len=%" PRIu16 " (not multiple of 16).", e_hdr.value_len);
-        continue;
-      }
-
-      // Read the actual key string + the array of series IDs
-      char stored_key[128];
-      if (expected_len >= sizeof(stored_key)) {
-        // Shouldn't happen if we used the same buffer size, but just in case
-        ESP_LOGW(TAG, "tagindex key too large to read");
-        continue;
-      }
-
-      unsigned char* series_ids = malloc(e_hdr.value_len);
-      if (!series_ids) {
-        ESP_LOGE(TAG, "Out of memory reading tagindex series IDs");
-        continue;
-      }
-
-      memset(stored_key, 0, sizeof(stored_key));
-      if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, stored_key, series_ids)) {
-        ESP_LOGW(TAG, "Failed reading tagindex entry data");
-        free(series_ids);
-        continue;
-      }
-
-      stored_key[expected_len] = '\0';
-
-      // Compare the stored key to our key_buf
-      if (strcmp(stored_key, key_buf) == 0) {
-        found_any = true;
-        size_t num_ids = e_hdr.value_len / 16;
-
-        // Append these series IDs to out_series_list
-        for (size_t i = 0; i < num_ids; i++) {
-          if (!tsdb_series_id_list_append(out_series_list, series_ids + (i * 16))) {
-            ESP_LOGE(TAG, "Failed appending a series ID (OOM?)");
-            free(series_ids);
-            timeseries_entity_iterator_deinit(&ent_iter);
-            return false;  // stop on error
-          }
+      /* Check if this entry matches any of our tags */
+      int matching_tag = -1;
+      for (size_t i = 0; i < num_tags; ++i) {
+        if (e_hdr.key_len == tag_searches[i].key_len) {
+          matching_tag = i;
+          break;
         }
       }
 
-      free(series_ids);
-    }
+      if (matching_tag == -1) {
+        continue; /* Key length doesn't match any tag */
+      }
 
-    timeseries_entity_iterator_deinit(&ent_iter);
+      /* Read key and value */
+      char stored_key[128];
+      if (e_hdr.key_len >= sizeof(stored_key)) continue;
+
+      if (e_hdr.value_len > scratch_cap) {
+        uint8_t* nb = realloc(scratch, e_hdr.value_len);
+        if (!nb) {
+          free(scratch);
+          scratch = NULL;
+          timeseries_entity_iterator_deinit(&ent_it);
+          goto cleanup;
+        }
+        scratch = nb;
+        scratch_cap = e_hdr.value_len;
+      }
+
+      if (!timeseries_entity_iterator_read_data(&ent_it, &e_hdr, stored_key, scratch)) {
+        continue;
+      }
+      stored_key[e_hdr.key_len] = '\0';
+
+      /* Check all tags with matching length */
+      for (size_t i = 0; i < num_tags; ++i) {
+        if (e_hdr.key_len == tag_searches[i].key_len && strcmp(stored_key, tag_searches[i].key) == 0) {
+          /* Found a match! Append series IDs */
+          size_t num_ids = e_hdr.value_len / 16u;
+          for (size_t j = 0; j < num_ids; ++j) {
+            if (!tsdb_series_id_list_append(&tag_searches[i].series_ids, scratch + j * 16u)) {
+              ESP_LOGE(TAG, "OOM while appending series-id");
+              free(scratch);
+              timeseries_entity_iterator_deinit(&ent_it);
+              goto cleanup;
+            }
+          }
+          tag_searches[i].found = true;
+          break; /* No need to check other tags */
+        }
+      }
+    }
+    timeseries_entity_iterator_deinit(&ent_it);
   }
 
-  // Return true if we found at least one entry
-  // (If you prefer returning 'true' as long as no errors occurred, do so,
-  //  but many designs interpret "true" as "found something.")
-  return found_any;
+  free(scratch);
+  scratch = NULL;
+
+  /* Now perform intersection of all found series IDs */
+  bool all_tags_found = true;
+  for (size_t i = 0; i < num_tags; ++i) {
+    if (!tag_searches[i].found) {
+      all_tags_found = false;
+      break;
+    }
+  }
+
+  if (!all_tags_found) {
+    /* At least one tag had no matches, so intersection is empty */
+    goto cleanup;
+  }
+
+  /* Start with the first tag's results */
+  tsdb_series_id_list_copy(out_series_list, &tag_searches[0].series_ids);
+
+  /* Intersect with remaining tags */
+  for (size_t i = 1; i < num_tags; ++i) {
+    intersect_series_id_lists(out_series_list, &tag_searches[i].series_ids);
+  }
+
+cleanup:
+  if (tag_searches) {
+    for (size_t i = 0; i < num_tags; ++i) {
+      tsdb_series_id_list_free(&tag_searches[i].series_ids);
+    }
+    free(tag_searches);
+  }
+
+  return true;
 }
 
 /**
@@ -908,7 +1031,7 @@ static bool tsdb_upsert_seriesid_list_entry(timeseries_db_t* db, timeseries_keyt
             memcpy(new_ids + series_count * 16, series_id, 16);
 
             // Create new entry with new_size
-            if (!tsdb_create_new_index_entry(db, page_offset, target_key_type, key_str, new_ids, new_size)) {
+            if (!tsdb_create_new_index_entry(db, target_key_type, key_str, new_ids, new_size)) {
               free(new_ids);
               free(all_series_ids);
               timeseries_entity_iterator_deinit(&ent_iter);
@@ -943,7 +1066,7 @@ static bool tsdb_upsert_seriesid_list_entry(timeseries_db_t* db, timeseries_keyt
   // If we never found an existing entry, create a brand-new one in the first
   // page
   if (!found_existing && meta_count > 0) {
-    if (!tsdb_create_new_index_entry(db, meta_offsets[0], target_key_type, key_str, series_id, 16)) {
+    if (!tsdb_create_new_index_entry(db, target_key_type, key_str, series_id, 16)) {
       return false;
     }
     ESP_LOGD(TAG, "Created new index entry (type=%u) for '%s' w/ single series_id", (unsigned)target_key_type, key_str);
@@ -964,183 +1087,157 @@ static bool tsdb_upsert_fieldlist_entry(timeseries_db_t* db, const uint32_t* met
 }
 
 /**
- * @brief Look up all series IDs matching a given (measurement_id, field_name).
+ * Collect series-id lists for *many* fields in a single metadata pass.
  *
- * @param db                Pointer to the database context
- * @param measurement_id    Numeric measurement ID
- * @param field_name        The field name to match
- * @param out_series_list   A timeseries_series_id_list_t object to which
- *                          matching series IDs will be appended
- * @return true if one or more series IDs were found, false otherwise
+ * @param db               Database handle
+ * @param measurement_id   Numeric measurement id
+ * @param wanted_fields    List of field names we are interested in
+ * @param out_arrays       Parallel array, one element per `wanted_fields`
+ *                         PRE-INITIALISED with tsdb_series_id_list_init().
+ * @return true            At least one match found for any field
  */
-bool tsdb_find_series_ids_for_field(timeseries_db_t* db, uint32_t measurement_id, const char* field_name,
-                                    timeseries_series_id_list_t* out_series_list) {
-  if (!db || !field_name || !out_series_list) {
+bool tsdb_find_series_ids_for_fields(timeseries_db_t* db, uint32_t measurement_id,
+                                     const timeseries_string_list_t* wanted_fields,
+                                     timeseries_series_id_list_t* out_arrays) {
+  if (!db || !wanted_fields || !out_arrays || wanted_fields->count == 0) {
     return false;
   }
 
-  // 1) Build the key that identifies the field list entry, e.g.
-  // "1234:fieldName"
-  char key_buf[128];
-  int n = snprintf(key_buf, sizeof(key_buf), "%" PRIu32 ":%s", measurement_id, field_name);
-  if (n < 0 || (size_t)n >= sizeof(key_buf)) {
-    ESP_LOGE(TAG, "tsdb_find_series_ids_for_field: key_buf overflow");
-    return false;
-  }
-
-  // 2) Find active METADATA pages
-  uint32_t meta_offsets[4];
-  size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count) || meta_count == 0) {
-    // No metadata pages => no result
-    ESP_LOGD(TAG, "No active metadata pages for field '%s'.", key_buf);
-    return false;
-  }
-
-  // 3) Scan each metadata page for an entry with:
-  //    - key_type == TIMESERIES_KEYTYPE_FIELDLISTINDEX
-  //    - delete_marker == TIMESERIES_DELETE_MARKER_VALID
-  //    - matching key == key_buf
-  const size_t expected_len = (size_t)n;
-  bool found_any = false;
-  unsigned char* scratch_ids = NULL;
+  /* ------------------------------------------------------------------ */
+  /* Scratch buffer for value blobs (16-byte series-ids)                 */
+  /* ------------------------------------------------------------------ */
+  uint8_t* scratch = NULL;
   size_t scratch_cap = 0;
+  bool found_any = false;
 
-  for (size_t p = 0; p < meta_count; p++) {
-    const uint32_t page_offset = meta_offsets[p];
-    const uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;  // e.g. 8KB
-
-    timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-      ESP_LOGW(TAG, "Failed to initialize entity iterator for page offset=0x%08" PRIx32, page_offset);
-      continue;
-    }
-
-    timeseries_entry_header_t e_hdr;
-    while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-      // Check if we have a valid FieldList entry
-      if (e_hdr.key_type != TIMESERIES_KEYTYPE_FIELDLISTINDEX ||
-          e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
-        continue;
-      }
-
-      if (e_hdr.key_len != expected_len) {
-        continue;
-      }
-
-      // The value_len should be a multiple of 16 (each series ID is 16 bytes)
-      if (e_hdr.value_len % 16 != 0) {
-        ESP_LOGW(TAG, "Unexpected fieldlist value_len=%" PRIu16 " (not multiple of 16).", e_hdr.value_len);
-        continue;
-      }
-
-      /* grow scratch buffer if this entry is larger than previous ones */
-      if (e_hdr.value_len > scratch_cap) {
-        unsigned char* nb = realloc(scratch_ids, e_hdr.value_len);
-        if (!nb) {
-          ESP_LOGE(TAG, "OOM enlarging scratch buffer");
-          continue;
-        }
-        scratch_ids = nb;
-        scratch_cap = e_hdr.value_len;
-      }
-
-      char stored_key[128];
-      memset(stored_key, 0, expected_len + 1);
-
-      if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, stored_key, scratch_ids)) {
-        ESP_LOGW(TAG, "Failed reading fieldlist entry data");
-        continue;
-      }
-
-      /* fixed-length compare avoids second strlen() */
-      if (memcmp(stored_key, key_buf, expected_len) == 0) {
-        found_any = true;
-        size_t num_ids = e_hdr.value_len / 16;
-
-        // Append these series IDs to out_series_list
-        for (size_t i = 0; i < num_ids; i++) {
-          if (!tsdb_series_id_list_append(out_series_list, scratch_ids + (i * 16))) {
-            ESP_LOGE(TAG, "Failed appending a series ID (OOM?)");
-            free(scratch_ids);
-            timeseries_entity_iterator_deinit(&ent_iter);
-            return false;  // stop on error
-          }
-        }
-      }
-    }
-
-    timeseries_entity_iterator_deinit(&ent_iter);
+  /* ------------------------------------------------------------------ */
+  /* Walk every ACTIVE-METADATA page once                               */
+  /* ------------------------------------------------------------------ */
+  timeseries_metadata_page_iterator_t meta_it;
+  if (!timeseries_metadata_page_iterator_init(db, &meta_it)) {
+    return false;
   }
 
-  free(scratch_ids);
+  timeseries_page_header_t page_hdr;
+  uint32_t page_off, page_sz;
+  while (timeseries_metadata_page_iterator_next(&meta_it, &page_hdr, &page_off, &page_sz)) {
+    timeseries_entity_iterator_t ent_it;
+    if (!timeseries_entity_iterator_init(db, page_off, page_sz, &ent_it)) {
+      continue; /* skip page on failure      */
+    }
 
-  // Return true if we found at least one entry
+    timeseries_entry_header_t eh;
+    while (timeseries_entity_iterator_next(&ent_it, &eh)) {
+      if (eh.key_type != TIMESERIES_KEYTYPE_FIELDLISTINDEX || eh.delete_marker != TIMESERIES_DELETE_MARKER_VALID ||
+          eh.value_len % 16u) {
+        continue; /* not a valid fieldlist     */
+      }
+
+      /* Guard against over-long keys                                     */
+      if (eh.key_len >= sizeof(uint32_t) * 3 + 1 + 96) {
+        continue;
+      }
+
+      char key_buf[128] = {0};
+      if (!timeseries_entity_iterator_peek_key(&ent_it, &eh, key_buf)) {
+        continue;
+      }
+
+      /* Parse "<meas_id>:<field_name>"                                   */
+      char* colon = strchr(key_buf, ':');
+      if (!colon) continue;
+
+      *colon = '\0';
+      uint32_t mid = (uint32_t)strtoul(key_buf, NULL, 10);
+      if (mid != measurement_id) continue; /* other measurement        */
+
+      const char* field_name = colon + 1;
+
+      /* Is it a requested field?                                         */
+      size_t idx = SIZE_MAX;
+      for (size_t i = 0; i < wanted_fields->count; ++i) {
+        if (strcmp(wanted_fields->items[i], field_name) == 0) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx == SIZE_MAX) continue; /* not wanted               */
+
+      /* Read series-id list (value)                                      */
+      if (eh.value_len > scratch_cap) {
+        uint8_t* nb = realloc(scratch, eh.value_len);
+        if (!nb) {
+          scratch = NULL;
+          break;
+        } /* OOM → abort gracefully   */
+        scratch = nb;
+        scratch_cap = eh.value_len;
+      }
+      if (!timeseries_entity_iterator_read_value(&ent_it, &eh, scratch)) {
+        continue;
+      }
+
+      size_t n_ids = eh.value_len / 16u;
+      for (size_t i = 0; i < n_ids; ++i) {
+        tsdb_series_id_list_append(&out_arrays[idx], scratch + i * 16u);
+      }
+      found_any = true;
+    }
+    timeseries_entity_iterator_deinit(&ent_it);
+  }
+
+  free(scratch);
   return found_any;
 }
 
-/**
- * @brief Retrieves all measurement names from the metadata pages (ignoring
- * duplicates).
- *
- * @param[in]  db              Pointer to the database context
- * @param[out] out_measurements A string list where measurement names are
- * appended
- * @return true if at least one measurement is found, false if none or error
- */
 bool tsdb_list_all_measurements(timeseries_db_t* db, timeseries_string_list_t* out_measurements) {
   if (!db || !out_measurements) {
     return false;
   }
 
-  // 1) Find active METADATA pages
-  uint32_t meta_offsets[4];
-  size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count) || meta_count == 0) {
-    ESP_LOGD(TAG, "No active metadata pages => no measurements");
+  /* -------------------------------------------------------------------- */
+  /* 1. Iterate all ACTIVE-METADATA pages                                 */
+  /* -------------------------------------------------------------------- */
+  timeseries_metadata_page_iterator_t meta_it;
+  if (!timeseries_metadata_page_iterator_init(db, &meta_it)) {
+    ESP_LOGW(TAG, "Failed to create metadata-page iterator");
     return false;
   }
 
   bool found_any = false;
 
-  // 2) Scan each page for measurement entries
-  for (size_t p = 0; p < meta_count; p++) {
-    uint32_t page_offset = meta_offsets[p];
-    uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
-
-    timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-      continue;
+  timeseries_page_header_t page_hdr;
+  uint32_t page_off, page_size;
+  while (timeseries_metadata_page_iterator_next(&meta_it, &page_hdr, &page_off, &page_size)) {
+    /* ------------------------------------------------------------------ */
+    /* 2. Scan individual entities in that page                           */
+    /* ------------------------------------------------------------------ */
+    timeseries_entity_iterator_t ent_it;
+    if (!timeseries_entity_iterator_init(db, page_off, page_size, &ent_it)) {
+      continue; /* skip page if iterator fails       */
     }
 
     timeseries_entry_header_t e_hdr;
-    while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-      if (e_hdr.key_type != TIMESERIES_KEYTYPE_MEASUREMENT || e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
+    while (timeseries_entity_iterator_next(&ent_it, &e_hdr)) {
+      if (e_hdr.key_type != TIMESERIES_KEYTYPE_MEASUREMENT || e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID ||
+          e_hdr.key_len == 0 || e_hdr.key_len >= 256) {
+        continue; /* not a valid measurement entry     */
+      }
+
+      char name_buf[256] = {0};
+      uint32_t measurement_id; /* value part (ignored here)         */
+
+      if (!timeseries_entity_iterator_read_data(&ent_it, &e_hdr, name_buf, &measurement_id)) {
+        ESP_LOGW(TAG, "Failed reading measurement entry @0x%08" PRIx32, page_off + ent_it.current_entry_offset);
         continue;
       }
+      name_buf[e_hdr.key_len] = '\0';
 
-      // The measurement name is e_hdr.key_len long
-      // We'll read that plus the ID, but we only need the name for listing.
-      if (e_hdr.key_len > 0 && e_hdr.key_len < 256) {
-        char name_buf[256];
-        uint32_t measurement_id;
-        memset(name_buf, 0, sizeof(name_buf));
-
-        if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, name_buf, &measurement_id)) {
-          ESP_LOGW(TAG, "Failed reading measurement entry data.");
-          continue;
-        }
-        // name_buf is now the measurement name
-        name_buf[e_hdr.key_len] = '\0';
-
-        // Append unique to the output list
-        if (tsdb_string_list_append_unique(out_measurements, name_buf)) {
-          found_any = true;
-        }
+      if (tsdb_string_list_append_unique(out_measurements, name_buf)) {
+        found_any = true;
       }
     }
-
-    timeseries_entity_iterator_deinit(&ent_iter);
+    timeseries_entity_iterator_deinit(&ent_it);
   }
 
   return found_any;
@@ -1163,88 +1260,58 @@ bool tsdb_list_fields_for_measurement(timeseries_db_t* db, uint32_t measurement_
     return false;
   }
 
-  // 1) Find active METADATA pages
-  uint32_t meta_offsets[4];
-  size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count) || meta_count == 0) {
-    ESP_LOGD(TAG, "No active metadata pages => no fields");
+  /* ------------------------------------------------------------------ */
+  /* 1. Iterate every ACTIVE-METADATA page                              */
+  /* ------------------------------------------------------------------ */
+  timeseries_metadata_page_iterator_t meta_it;
+  if (!timeseries_metadata_page_iterator_init(db, &meta_it)) {
+    ESP_LOGW(TAG, "Failed to create metadata-page iterator");
     return false;
   }
 
   bool found_any = false;
 
-  // 2) Scan each metadata page for FIELDLISTINDEX entries
-  for (size_t p = 0; p < meta_count; p++) {
-    uint32_t page_offset = meta_offsets[p];
-    uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
-
-    timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-      continue;
+  timeseries_page_header_t page_hdr;
+  uint32_t page_off, page_sz;
+  while (timeseries_metadata_page_iterator_next(&meta_it, &page_hdr, &page_off, &page_sz)) {
+    /* -------------------------------------------------------------- */
+    /* 2. Walk every entity in that page                              */
+    /* -------------------------------------------------------------- */
+    timeseries_entity_iterator_t ent_it;
+    if (!timeseries_entity_iterator_init(db, page_off, page_sz, &ent_it)) {
+      continue; /* skip page if iterator fails */
     }
 
     timeseries_entry_header_t e_hdr;
-    while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-      // We want FIELDLISTINDEX entries
+    while (timeseries_entity_iterator_next(&ent_it, &e_hdr)) {
       if (e_hdr.key_type != TIMESERIES_KEYTYPE_FIELDLISTINDEX ||
-          e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
+          e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID || e_hdr.key_len == 0 || e_hdr.key_len >= 128) {
+        continue; /* not a valid fieldlist key   */
+      }
+
+      /* read **only** the key (<meas>:<field>)                         */
+      char key_buf[128];
+      if (!timeseries_entity_iterator_peek_key(&ent_it, &e_hdr, key_buf)) {
+        ESP_LOGW(TAG, "Failed peeking key @0x%08" PRIx32, page_off + ent_it.current_entry_offset);
         continue;
       }
+      key_buf[e_hdr.key_len] = '\0';
 
-      // The key looks like "<meas_id>:<field_name>"
-      // We'll read it + the list of series IDs (which we don't need for this
-      // listing).
-      if (e_hdr.key_len > 0 && e_hdr.key_len < 128) {
-        char key_buf[128];
-        memset(key_buf, 0, sizeof(key_buf));
+      /* split at first ':'                                             */
+      char* colon = strchr(key_buf, ':');
+      if (!colon) continue; /* malformed key              */
 
-        // The value is a bunch of 16-byte IDs, but we just skip reading them
-        // (We can pass a dummy buffer or read them into a throwaway pointer.)
-        unsigned char* dummy_series = NULL;
-        if (e_hdr.value_len > 0) {
-          dummy_series = malloc(e_hdr.value_len);
-        }
+      *colon = '\0';
+      uint32_t mid = (uint32_t)strtoul(key_buf, NULL, 10);
+      if (mid != measurement_id) continue; /* other measurement          */
 
-        if (!dummy_series) {
-          // If out of memory, we can either break or continue
-          // We'll do a minimal approach
-          dummy_series = NULL;  // no read
-        }
+      const char* field_name = colon + 1; /* portion after ':'          */
 
-        bool read_ok =
-            timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key_buf, dummy_series ? dummy_series : NULL);
-
-        if (dummy_series) {
-          free(dummy_series);
-        }
-        if (!read_ok) {
-          ESP_LOGW(TAG, "Failed reading fieldlist entry data");
-          continue;
-        }
-        key_buf[e_hdr.key_len] = '\0';
-
-        // Now parse out the "meas_id" prefix
-        // We'll look for the first ':'
-        char* colon_ptr = strchr(key_buf, ':');
-        if (!colon_ptr) {
-          // Malformed key?
-          continue;
-        }
-        *colon_ptr = '\0';                       // split them
-        const char* field_part = colon_ptr + 1;  // the portion after ':'
-
-        // Check if the <meas_id> prefix matches our measurement_id
-        uint32_t listed_meas_id = (uint32_t)strtoul(key_buf, NULL, 10);
-        if (listed_meas_id == measurement_id) {
-          // Add field_part to out_fields
-          if (tsdb_string_list_append_unique(out_fields, field_part)) {
-            found_any = true;
-          }
-        }
+      if (tsdb_string_list_append_unique(out_fields, field_name)) {
+        found_any = true;
       }
     }
-
-    timeseries_entity_iterator_deinit(&ent_iter);
+    timeseries_entity_iterator_deinit(&ent_it);
   }
 
   return found_any;
@@ -1256,109 +1323,149 @@ bool tsdb_find_all_series_ids_for_measurement(timeseries_db_t* db, uint32_t meas
     return false;
   }
 
-  // 1) Find all active METADATA pages
-  uint32_t meta_offsets[4];
-  size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count) || meta_count == 0) {
-    ESP_LOGD(TAG, "No active metadata pages => no series to find.");
+  uint8_t* scratch = NULL;
+  size_t scratch_cap = 0;
+  bool found_any = false;
+
+  timeseries_metadata_page_iterator_t meta_it;
+  if (!timeseries_metadata_page_iterator_init(db, &meta_it)) {
     return false;
   }
 
-  bool found_any = false;
-
-  // 2) Scan each metadata page for FIELDLISTINDEX entries
-  for (size_t p = 0; p < meta_count; p++) {
-    uint32_t page_offset = meta_offsets[p];
-    uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
-
-    timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-      continue;
+  timeseries_page_header_t page_hdr;
+  uint32_t page_off, page_sz;
+  while (timeseries_metadata_page_iterator_next(&meta_it, &page_hdr, &page_off, &page_sz)) {
+    timeseries_entity_iterator_t ent_it;
+    if (!timeseries_entity_iterator_init(db, page_off, page_sz, &ent_it)) {
+      continue; /* skip page on failure   */
     }
 
-    timeseries_entry_header_t e_hdr;
-    while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-      // We only want valid FIELDLISTINDEX entries
-      if (e_hdr.key_type != TIMESERIES_KEYTYPE_FIELDLISTINDEX ||
-          e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
+    timeseries_entry_header_t eh;
+    while (timeseries_entity_iterator_next(&ent_it, &eh)) {
+      /* --- fast header tests ------------------------------------ */
+      if (eh.key_type != TIMESERIES_KEYTYPE_FIELDLISTINDEX || eh.delete_marker != TIMESERIES_DELETE_MARKER_VALID ||
+          eh.value_len % 16u /* ids must be 16-byte aligned */
+      ) {
         continue;
       }
-
-      // The key should look like "1234:someField"
-      // Check that it fits in our buffer (just like we do for fields/tags)
-      if (e_hdr.key_len == 0 || e_hdr.key_len >= 128) {
-        continue;  // skip invalid or overly large keys
+      if (eh.key_len == 0 || eh.key_len >= 128) {
+        continue; /* malformed key        */
       }
 
-      // Value must be multiple of 16 (each series ID = 16 bytes)
-      if (e_hdr.value_len % 16 != 0) {
-        ESP_LOGW(TAG, "Unexpected fieldlist value_len=%" PRIu16 " (not multiple of 16).", e_hdr.value_len);
-        continue;
-      }
-
+      /* --- peek key "<meas>:<field>" ---------------------------- */
       char key_buf[128];
-      memset(key_buf, 0, sizeof(key_buf));
-      unsigned char* series_ids = malloc(e_hdr.value_len);
-      if (!series_ids) {
-        ESP_LOGE(TAG, "Out of memory reading fieldlist series IDs");
+      if (!timeseries_entity_iterator_peek_key(&ent_it, &eh, key_buf)) {
         continue;
       }
+      key_buf[eh.key_len] = '\0';
 
-      // Read the key and the array of series IDs
-      if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key_buf, series_ids)) {
-        ESP_LOGW(TAG, "Failed reading fieldlist entry data");
-        free(series_ids);
-        continue;
+      char* colon = strchr(key_buf, ':');
+      if (!colon) continue; /* no colon – bad key   */
+
+      *colon = '\0';
+      uint32_t mid = (uint32_t)strtoul(key_buf, NULL, 10);
+      if (mid != measurement_id) continue; /* other measurement    */
+
+      /* --- read series-id array -------------------------------- */
+      if (eh.value_len > scratch_cap) {
+        uint8_t* nb = realloc(scratch, eh.value_len);
+        if (!nb) {
+          scratch = NULL;
+          break;
+        } /* OOM → abort loop     */
+        scratch = nb;
+        scratch_cap = eh.value_len;
+      }
+      if (!timeseries_entity_iterator_read_value(&ent_it, &eh, scratch)) {
+        continue; /* read failed          */
       }
 
-      // Null-terminate the key
-      key_buf[e_hdr.key_len] = '\0';
+      /* --- append unique ids ----------------------------------- */
+      size_t num_ids = eh.value_len / 16u;
+      for (size_t i = 0; i < num_ids; ++i) {
+        unsigned char* sid = scratch + i * 16u;
 
-      // key_buf has the form "<meas_id>:<field_name>"
-      // Let's parse out the meas_id portion before the first colon.
-      char* colon_ptr = strchr(key_buf, ':');
-      if (!colon_ptr) {
-        free(series_ids);
-        continue;  // malformed key
-      }
-
-      *colon_ptr = '\0';  // split into two strings
-      // const char* field_part = colon_ptr + 1;  // not used for this function
-
-      // Convert the prefix to an integer
-      uint32_t listed_meas_id = (uint32_t)strtoul(key_buf, NULL, 10);
-
-      // If the meas_id matches, we want to merge all series IDs
-      if (listed_meas_id == measurement_id) {
-        found_any = true;
-        size_t num_ids = e_hdr.value_len / 16;
-        for (size_t i = 0; i < num_ids; i++) {
-          unsigned char* sid = series_ids + (i * 16);
-
-          // Optional: check for duplicates so we only add unique
-          // series IDs once:
-          bool is_duplicate = false;
-          for (size_t j = 0; j < out_series_list->count; j++) {
-            if (memcmp(out_series_list->ids[j].bytes, sid, 16) == 0) {
-              is_duplicate = true;
-              break;
-            }
-          }
-          if (!is_duplicate) {
-            if (!tsdb_series_id_list_append(out_series_list, sid)) {
-              ESP_LOGE(TAG, "Failed appending a series ID (OOM?)");
-              free(series_ids);
-              return false;
-            }
+        /* deduplicate inline (linear search – pages are small)    */
+        bool dup = false;
+        for (size_t j = 0; j < out_series_list->count; ++j) {
+          if (memcmp(out_series_list->ids[j].bytes, sid, 16) == 0) {
+            dup = true;
+            break;
           }
         }
+        if (!dup) {
+          if (!tsdb_series_id_list_append(out_series_list, sid)) {
+            ESP_LOGE(TAG, "OOM while appending series-id");
+            free(scratch);
+            timeseries_entity_iterator_deinit(&ent_it);
+            return false;
+          }
+          found_any = true;
+        }
+      }
+    } /* entity loop */
+
+    timeseries_entity_iterator_deinit(&ent_it);
+  } /* page loop */
+
+  free(scratch);
+  return found_any;
+}
+
+/**
+ * @brief Determine the next unused measurement-ID.
+ *
+ * Walks every ACTIVE METADATA page, inspects each MEASUREMENT entry,
+ * and returns (max_id + 1).  IDs start at 1, so if no entry exists yet
+ * the function returns 1.
+ *
+ * @param[in]  db       Database context
+ * @param[out] out_id   Next available measurement-ID
+ * @return true on success, false on iterator/IO error
+ */
+bool tsdb_get_next_available_measurement_id(timeseries_db_t* db, uint32_t* out_id) {
+  if (!db || !out_id) {
+    return false;
+  }
+
+  uint32_t max_id = 0;
+
+  /* --- iterate every ACTIVE-METADATA page ------------------------- */
+  timeseries_metadata_page_iterator_t meta_it;
+  if (!timeseries_metadata_page_iterator_init(db, &meta_it)) {
+    return false;
+  }
+
+  timeseries_page_header_t page_hdr;
+  uint32_t page_off, page_sz;
+
+  while (timeseries_metadata_page_iterator_next(&meta_it, &page_hdr, &page_off, &page_sz)) {
+    /* --- iterate every entity in the page ----------------------- */
+    timeseries_entity_iterator_t ent_it;
+    if (!timeseries_entity_iterator_init(db, page_off, page_sz, &ent_it)) {
+      continue; /* skip broken page           */
+    }
+
+    timeseries_entry_header_t eh;
+    while (timeseries_entity_iterator_next(&ent_it, &eh)) {
+      if (eh.key_type != TIMESERIES_KEYTYPE_MEASUREMENT || eh.delete_marker != TIMESERIES_DELETE_MARKER_VALID ||
+          eh.value_len != sizeof(uint32_t)) {
+        continue; /* not a valid measurement    */
       }
 
-      free(series_ids);
-    }  // while next entry
+      uint32_t id_val = 0;
+      if (!timeseries_entity_iterator_read_value(&ent_it, &eh, &id_val)) {
+        continue; /* read failed – ignore entry */
+      }
 
-    timeseries_entity_iterator_deinit(&ent_iter);
-  }  // for meta_count
+      if (id_val > max_id) {
+        max_id = id_val;
+      }
+    }
 
-  return found_any;
+    timeseries_entity_iterator_deinit(&ent_it);
+  }
+
+  *out_id = max_id + 1u; /* 1-based sequence           */
+  return true;
 }

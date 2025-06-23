@@ -5,6 +5,32 @@
 
 #include "esp_log.h"
 
+static const char* TAG = "timeseries_multi_iter";
+
+static bool field_value_deep_copy(timeseries_field_value_t* dst, const timeseries_field_value_t* src) {
+  dst->type = src->type;
+  if (src->type == TIMESERIES_FIELD_TYPE_STRING) {
+    size_t len = src->data.string_val.length;
+    if (!src->data.string_val.str || len == 0) {
+      dst->data.string_val.str = NULL;
+      dst->data.string_val.length = 0;
+      return true;
+    }
+    char* copy = (char*)malloc(len + 1);
+    if (!copy) {
+      ESP_LOGE(TAG, "OOM duplicating string value");
+      return false;
+    }
+    memcpy(copy, src->data.string_val.str, len);
+    copy[len] = '\0';
+    dst->data.string_val.str = copy;
+    dst->data.string_val.length = len;
+  } else {
+    dst->data = src->data; /* plain scalar, shallow copy OK */
+  }
+  return true;
+}
+
 static void heap_swap(size_t* heap, size_t i, size_t j) {
   size_t tmp = heap[i];
   heap[i] = heap[j];
@@ -145,95 +171,59 @@ bool timeseries_multi_points_iterator_init(timeseries_points_iterator_t** sub_it
  */
 bool timeseries_multi_points_iterator_next(timeseries_multi_points_iterator_t* multi_iter, uint64_t* out_ts,
                                            timeseries_field_value_t* out_val) {
-  if (!multi_iter || !multi_iter->valid) {
-    return false;
-  }
+  if (!multi_iter || !multi_iter->valid || multi_iter->heap_size == 0) return false;
 
-  if (multi_iter->heap_size == 0) {
-    // No more data from any sub-iterator
-    multi_iter->valid = false;
-    return false;
-  }
+  /* ---------------- step 1: pick the earliest timestamp ------------- */
+  size_t best_sub = multi_iter->heap[0];
+  uint64_t smallest_ts = multi_iter->subs[best_sub].current_ts;
+  uint32_t best_seq = multi_iter->subs[best_sub].page_seq;
 
-  // 1) Look at the top of the min-heap => smallest timestamp
-  size_t top_index = multi_iter->heap[0];
-  uint64_t smallest_ts = multi_iter->subs[top_index].current_ts;
+  /* collect all subs with the same ts into popped[]                    */
+  size_t popped_cap = multi_iter->heap_size;
+  size_t* popped = (size_t*)malloc(popped_cap * sizeof(size_t));
+  if (!popped) return false;
 
-  // We'll gather all sub-iterators that have this same timestamp
-  // so we can pick the newest (max page_seq)
-  uint32_t best_seq = multi_iter->subs[top_index].page_seq;
-  size_t best_sub = top_index;
-
-  // We'll pop from the heap each sub-iterator that has the same timestamp
-  // keep them in a temporary list
-  size_t same_ts_pop_count = 0;
-  size_t* popped = (size_t*)malloc(sizeof(size_t) * multi_iter->heap_size);
-  if (!popped) {
-    // Not enough memory for pop buffer => fail or just handle them one by one
-    return false;
-  }
-
-  // Repeatedly pop while the top has same_ts
-  while (multi_iter->heap_size > 0) {
+  size_t same_cnt = 0;
+  while (multi_iter->heap_size && multi_iter->subs[multi_iter->heap[0]].current_ts == smallest_ts) {
     size_t idx = multi_iter->heap[0];
-    uint64_t ts_cur = multi_iter->subs[idx].current_ts;
-    if (ts_cur != smallest_ts) {
-      // We are done collecting same-timestamp items
-      break;
-    }
+    /* pop */
+    multi_iter->heap[0] = multi_iter->heap[--multi_iter->heap_size];
+    if (multi_iter->heap_size) heap_sift_down(multi_iter, 0);
 
-    // pop from heap
-    multi_iter->heap[0] = multi_iter->heap[multi_iter->heap_size - 1];
-    multi_iter->heap_size--;
-    if (multi_iter->heap_size > 0) {
-      heap_sift_down(multi_iter, 0);
-    }
-
-    popped[same_ts_pop_count++] = idx;
-
-    // check if it has higher page_seq
+    popped[same_cnt++] = idx;
     if (multi_iter->subs[idx].page_seq > best_seq) {
       best_seq = multi_iter->subs[idx].page_seq;
       best_sub = idx;
     }
   }
 
-  // Now 'popped[0..same_ts_pop_count-1]' are the sub-iterators
-  // that all had 'smallest_ts'. Among them we keep the one with `best_seq`,
-  // discard the others.
-
-  // 2) The "winning" sub-iterator is best_sub
-  if (out_ts) {
-    *out_ts = smallest_ts;
-  }
+  /* ---------------- step 2: output the chosen point ----------------- */
+  if (out_ts) *out_ts = smallest_ts;
   if (out_val) {
-    *out_val = multi_iter->subs[best_sub].current_val;
-  }
-
-  // 3) For each popped sub-iterator:
-  //    - if it's the “winner,” we read its next point
-  //    - if it's not the winner, we just discard that point
-  //      (and read next from the sub-iterator anyway, because we consumed it)
-  for (size_t i = 0; i < same_ts_pop_count; i++) {
-    size_t sid = popped[i];
-
-    // Attempt to read the next point from that sub-iterator
-    if (multi_iter->subs[sid].valid) {
-      // We'll do an unconditional advance, because we consumed the point
-      // (even if it lost, it’s been “consumed” from the perspective of dedup).
-      if (!multi_iter_advance_sub(multi_iter, sid)) {
-        // sub-iterator is exhausted => no re-insertion into heap
-        continue;
-      }
-      // If we successfully read the next point, push it back into heap
-      if (multi_iter->subs[sid].valid) {
-        multi_iter->heap[multi_iter->heap_size++] = sid;
-        heap_sift_up(multi_iter, multi_iter->heap_size - 1);
-      }
+    if (!field_value_deep_copy(out_val, &multi_iter->subs[best_sub].current_val)) {
+      free(popped);
+      return false; /* OOM */
     }
   }
-  free(popped);
 
+  /* ---------------- step 3: advance sub-iterators ------------------- */
+  for (size_t i = 0; i < same_cnt; ++i) {
+    size_t sid = popped[i];
+    /* skip the winner for now – we advance it *after* freeing buffer */
+    if (sid == best_sub) continue;
+
+    if (multi_iter->subs[sid].valid && multi_iter_advance_sub(multi_iter, sid)) {
+      multi_iter->heap[multi_iter->heap_size++] = sid;
+      heap_sift_up(multi_iter, multi_iter->heap_size - 1);
+    }
+  }
+  /* finally advance the winner – safe because caller already owns its copy */
+  if (multi_iter->subs[best_sub].valid && multi_iter_advance_sub(multi_iter, best_sub)) {
+    multi_iter->heap[multi_iter->heap_size++] = best_sub;
+    heap_sift_up(multi_iter, multi_iter->heap_size - 1);
+  }
+
+  free(popped);
   return true;
 }
 

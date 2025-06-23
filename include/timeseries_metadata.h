@@ -4,7 +4,7 @@
 #define TIMESERIES_METADATA_H
 
 #include "timeseries.h"
-#include "timeseries_id_list.h" // Needed for timeseries_series_id_list_t
+#include "timeseries_id_list.h"  // Needed for timeseries_series_id_list_t
 #include "timeseries_internal.h"
 #include "timeseries_string_list.h"
 
@@ -19,7 +19,7 @@ extern "C" {
  * @param db    Pointer to the timeseries database context
  * @return true if successful, false otherwise
  */
-bool tsdb_load_pages_into_memory(timeseries_db_t *db);
+bool tsdb_load_pages_into_memory(timeseries_db_t* db);
 
 /**
  * @brief Look for an existing measurement ID for the given measurement name.
@@ -29,8 +29,7 @@ bool tsdb_load_pages_into_memory(timeseries_db_t *db);
  * @param out_id            Pointer to store the found measurement ID
  * @return true if found, false otherwise
  */
-bool tsdb_find_measurement_id(timeseries_db_t *db, const char *measurement_name,
-                              uint32_t *out_id);
+bool tsdb_find_measurement_id(timeseries_db_t* db, const char* measurement_name, uint32_t* out_id);
 
 /**
  * @brief Create a new measurement ID for the given measurement name and
@@ -41,8 +40,7 @@ bool tsdb_find_measurement_id(timeseries_db_t *db, const char *measurement_name,
  * @param out_id            Pointer to store the newly created measurement ID
  * @return true if creation succeeded, false otherwise
  */
-bool tsdb_create_measurement_id(timeseries_db_t *db,
-                                const char *measurement_name, uint32_t *out_id);
+bool tsdb_create_measurement_id(timeseries_db_t* db, const char* measurement_name, uint32_t* out_id);
 
 /**
  * @brief Insert a single field (with tags) into the time-series database.
@@ -63,12 +61,9 @@ bool tsdb_create_measurement_id(timeseries_db_t *db,
  * @param timestamp_ms      The timestamp in milliseconds
  * @return true if successfully inserted, false otherwise
  */
-bool tsdb_insert_single_field(timeseries_db_t *db, uint32_t measurement_id,
-                              const char *measurement_name,
-                              const char *field_name,
-                              const timeseries_field_value_t *field_val,
-                              const char **tag_keys, const char **tag_values,
-                              size_t num_tags, uint64_t timestamp_ms);
+bool tsdb_insert_single_field(timeseries_db_t* db, uint32_t measurement_id, const char* measurement_name,
+                              const char* field_name, const timeseries_field_value_t* field_val, const char** tag_keys,
+                              const char** tag_values, size_t num_tags, uint64_t timestamp_ms);
 
 /**
  * @brief Look up the existing field type for a given 16-byte series ID.
@@ -78,9 +73,8 @@ bool tsdb_insert_single_field(timeseries_db_t *db, uint32_t measurement_id,
  * @param out_type  Pointer to store the field type
  * @return true if found, false otherwise
  */
-bool tsdb_lookup_series_type_in_metadata(timeseries_db_t *db,
-                                         const unsigned char series_id[16],
-                                         timeseries_field_type_e *out_type);
+bool tsdb_lookup_series_type_in_metadata(timeseries_db_t* db, const unsigned char series_id[16],
+                                         timeseries_field_type_e* out_type);
 
 /**
  * @brief Ensure the metadata has an entry for this series_id and field type.
@@ -92,8 +86,7 @@ bool tsdb_lookup_series_type_in_metadata(timeseries_db_t *db,
  * @param field_type Type of the field (e.g., float, int)
  * @return true on success or if it already matches, false on error/conflict
  */
-bool tsdb_ensure_series_type_in_metadata(timeseries_db_t *db,
-                                         const unsigned char series_id[16],
+bool tsdb_ensure_series_type_in_metadata(timeseries_db_t* db, const unsigned char series_id[16],
                                          timeseries_field_type_e field_type);
 
 /**
@@ -108,10 +101,8 @@ bool tsdb_ensure_series_type_in_metadata(timeseries_db_t *db,
  * @param series_id      16-byte series identifier
  * @return true if successfully indexed, false otherwise
  */
-bool tsdb_index_tags_for_series(timeseries_db_t *db, uint32_t measurement_id,
-                                const char **tag_keys, const char **tag_values,
-                                size_t num_tags,
-                                const unsigned char series_id[16]);
+bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, const char** tag_keys,
+                                const char** tag_values, size_t num_tags, const unsigned char series_id[16]);
 
 /**
  * @brief Record that a given series ID belongs to (measurement_id, field_name).
@@ -124,8 +115,7 @@ bool tsdb_index_tags_for_series(timeseries_db_t *db, uint32_t measurement_id,
  * @param series_id      16-byte series identifier
  * @return true if successfully updated, false otherwise
  */
-bool tsdb_index_field_for_series(timeseries_db_t *db, uint32_t measurement_id,
-                                 const char *field_name,
+bool tsdb_index_field_for_series(timeseries_db_t* db, uint32_t measurement_id, const char* field_name,
                                  const unsigned char series_id[16]);
 
 /**
@@ -140,13 +130,12 @@ bool tsdb_index_field_for_series(timeseries_db_t *db, uint32_t measurement_id,
  *                          matching series IDs will be appended
  * @return true if one or more series IDs were found, false otherwise
  */
-bool tsdb_find_series_ids_for_tag(timeseries_db_t *db, uint32_t measurement_id,
-                                  const char *tag_key, const char *tag_value,
-                                  timeseries_series_id_list_t *out_series_list);
+bool tsdb_find_series_ids_for_tag(timeseries_db_t* db, uint32_t measurement_id, const char* tag_key,
+                                  const char* tag_value, timeseries_series_id_list_t* out_series_list);
 
-bool tsdb_find_series_ids_for_field(
-    timeseries_db_t *db, uint32_t measurement_id, const char *field_name,
-    timeseries_series_id_list_t *out_series_list);
+bool tsdb_find_series_ids_for_fields(timeseries_db_t* db, uint32_t measurement_id,
+                                     const timeseries_string_list_t* wanted_fields,
+                                     timeseries_series_id_list_t* out_arrays);
 
 /**
  * @brief Retrieve all known measurement names (no duplicates).
@@ -155,8 +144,7 @@ bool tsdb_find_series_ids_for_field(
  * @param out_measurements A string list to which measurement names are appended
  * @return true if at least one measurement was found, false otherwise
  */
-bool tsdb_list_all_measurements(timeseries_db_t *db,
-                                timeseries_string_list_t *out_measurements);
+bool tsdb_list_all_measurements(timeseries_db_t* db, timeseries_string_list_t* out_measurements);
 
 /**
  * @brief Retrieve all distinct field names for a given measurement ID.
@@ -166,18 +154,24 @@ bool tsdb_list_all_measurements(timeseries_db_t *db,
  * @param out_fields      A string list to which field names are appended
  * @return true if at least one field name was found, false otherwise
  */
-bool tsdb_list_fields_for_measurement(timeseries_db_t *db,
-                                      uint32_t measurement_id,
-                                      timeseries_string_list_t *out_fields);
+bool tsdb_list_fields_for_measurement(timeseries_db_t* db, uint32_t measurement_id,
+                                      timeseries_string_list_t* out_fields);
 
-bool timeseries_metadata_create_page(timeseries_db_t *db);
+bool timeseries_metadata_create_page(timeseries_db_t* db);
 
-bool tsdb_find_all_series_ids_for_measurement(
-    timeseries_db_t *db, uint32_t measurement_id,
-    timeseries_series_id_list_t *out_series_list);
+bool tsdb_find_all_series_ids_for_measurement(timeseries_db_t* db, uint32_t measurement_id,
+                                              timeseries_series_id_list_t* out_series_list);
+
+bool tsdb_get_next_available_measurement_id(timeseries_db_t* db, uint32_t* out_id);
+
+bool tsdb_measurement_cache_init(timeseries_db_t* db, size_t capacity);
+
+bool tsdb_find_series_ids_for_multiple_tags(timeseries_db_t* db, uint32_t measurement_id, size_t num_tags,
+                                            const char** tag_keys, const char** tag_values,
+                                            timeseries_series_id_list_t* out_series_list);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // TIMESERIES_METADATA_H
+#endif  // TIMESERIES_METADATA_H

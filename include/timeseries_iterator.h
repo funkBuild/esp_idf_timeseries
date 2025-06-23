@@ -49,6 +49,11 @@ bool timeseries_entity_iterator_next(timeseries_entity_iterator_t* ent_iter, tim
 
 bool timeseries_entity_iterator_read_data(timeseries_entity_iterator_t* ent_iter,
                                           const timeseries_entry_header_t* header, void* key_buf, void* value_buf);
+bool timeseries_entity_iterator_peek_key(timeseries_entity_iterator_t* it, const timeseries_entry_header_t* hdr,
+                                         void* key_buf);
+
+bool timeseries_entity_iterator_read_value(timeseries_entity_iterator_t* it, const timeseries_entry_header_t* hdr,
+                                           void* value_buf);
 
 // -----------------------------------------------------------------------------
 // Field Data Iterator (using timeseries_field_data_header_t)
@@ -90,6 +95,11 @@ typedef struct {
   size_t index;
   bool valid;
 } timeseries_page_cache_iterator_t;
+
+typedef struct {
+  timeseries_page_cache_iterator_t inner;
+  bool valid;
+} timeseries_metadata_page_iterator_t;
 
 /**
  * @brief Initialize an iterator over a field data page.
@@ -153,6 +163,12 @@ bool timeseries_page_cache_iterator_init(timeseries_db_t* db, timeseries_page_ca
 
 bool timeseries_page_cache_iterator_next(timeseries_page_cache_iterator_t* iter, timeseries_page_header_t* out_header,
                                          uint32_t* out_offset, uint32_t* out_size);
+
+bool timeseries_metadata_page_iterator_init(timeseries_db_t* db, timeseries_metadata_page_iterator_t* iter);
+
+bool timeseries_metadata_page_iterator_next(timeseries_metadata_page_iterator_t* iter,
+                                            timeseries_page_header_t* out_header, uint32_t* out_offset,
+                                            uint32_t* out_size);
 
 #ifdef __cplusplus
 }

@@ -56,10 +56,10 @@ bool timeseries_init(void) {
     s_tsdb.next_measurement_id = 1;
   }
 
-  // Init measurement cache
-  if (!tsdb_measurement_cache_init(&s_tsdb, 32)) {
-    ESP_LOGE(TAG, "Failed to initialize measurement cache.");
-    return false;
+  // Initialize metadata cache
+  s_tsdb.meta_cache = ts_cache_create(1024, 256 * 1024, 300000);
+  if (!s_tsdb.meta_cache) {
+    ESP_LOGW(TAG, "Failed to initialize metadata cache, continuing without it");
   }
 
   ESP_LOGI(TAG, "Timeseries DB initialized successfully.");
@@ -267,4 +267,88 @@ bool timeseries_clear_all() {
   timeseries_metadata_create_page(&s_tsdb);
 
   return true;
+}
+
+bool timeseries_get_measurements(char*** measurements, size_t* num_measurements) {
+  if (!s_tsdb.initialized) {
+    ESP_LOGE(TAG, "Timeseries DB not initialized yet.");
+    return false;
+  }
+  if (!measurements || !num_measurements) {
+    ESP_LOGE(TAG, "Invalid output parameters for measurements.");
+    return false;
+  }
+
+  /* always initialise outputs */
+  *measurements = NULL;
+  *num_measurements = 0;
+
+  timeseries_string_list_t list;
+  tsdb_string_list_init(&list);
+
+  /* populate list.items  (heap-allocated by TSDB) */
+  if (!tsdb_list_all_measurements(&s_tsdb, &list)) {
+    ESP_LOGE(TAG, "Failed to retrieve measurements from metadata.");
+    return false;
+  }
+
+  /* transfer ownership of the heap buffer to the caller */
+  *measurements = list.items;
+  *num_measurements = list.count;
+  return true;
+}
+
+bool timeseries_get_fields_for_measurement(const char* measurement_name, char*** fields, size_t* num_fields) {
+  if (!s_tsdb.initialized) {
+    ESP_LOGE(TAG, "Timeseries DB not initialized yet.");
+    return false;
+  }
+  if (!measurement_name || !fields || !num_fields) {
+    ESP_LOGE(TAG, "Invalid parameters for getting fields.");
+    return false;
+  }
+
+  // Find measurement ID
+  uint32_t measurement_id = 0;
+  if (!tsdb_find_measurement_id(&s_tsdb, measurement_name, &measurement_id)) {
+    ESP_LOGE(TAG, "Measurement '%s' not found.", measurement_name);
+    return false;
+  }
+
+  /* always initialise outputs */
+  *fields = NULL;
+  *num_fields = 0;
+
+  timeseries_string_list_t list;
+  tsdb_string_list_init(&list);
+
+  /* populate list.items (heap-allocated by TSDB) */
+  if (!tsdb_list_fields_for_measurement(&s_tsdb, measurement_id, &list)) {
+    ESP_LOGE(TAG, "Failed to retrieve fields for measurement '%s'.", measurement_name);
+    return false;
+  }
+
+  /* transfer ownership of the heap buffer to the caller */
+  *fields = list.items;
+  *num_fields = list.count;
+  return true;
+}
+
+bool timeseries_get_tags_for_measurement(const char* measurement_name, tsdb_tag_pair_t** tags, size_t* num_tags) {
+  if (!s_tsdb.initialized) {
+    ESP_LOGE(TAG, "Timeseries DB not initialized yet.");
+    return false;
+  }
+  if (!measurement_name || !tags || !num_tags) {
+    ESP_LOGE(TAG, "Invalid parameters for getting tags.");
+    return false;
+  }
+
+  uint32_t measurement_id = 0;
+  if (!tsdb_find_measurement_id(&s_tsdb, measurement_name, &measurement_id)) {
+    ESP_LOGE(TAG, "Measurement '%s' not found.", measurement_name);
+    return false;
+  }
+
+  return timeseries_metadata_get_tags_for_measurement(&s_tsdb, measurement_id, tags, num_tags);
 }

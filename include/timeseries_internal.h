@@ -2,6 +2,8 @@
 #define TIMESERIES_INTERNAL_H
 
 #include "esp_partition.h"
+#include "timeseries_cache_base.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -187,6 +189,9 @@ typedef struct {
   size_t measurement_cache_count;
   size_t measurement_cache_capacity;
   uint32_t cache_access_counter;  // for LRU
+
+  /* Metadata cache instance */
+  ts_cache_t* meta_cache;
 } timeseries_db_t;
 
 typedef struct {

@@ -1,15 +1,20 @@
 #include "esp_log.h"
-#include "timeseries.h"
 #include "unity.h"
 #include <string.h>
 #include "float.h"
 
+#include "timeseries.h"
+#include "timeseries_query_parser.h"
+
 #include "esp_heap_trace.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
 
 #define NUM_RECORDS 100
 static heap_trace_record_t trace_record[NUM_RECORDS];  // This buffer must be in internal RAM
+
+static const char* TAG = "timeseries_test";
 
 // Final test case to tear down
 TEST_CASE("initializes the timeseries db", "[esp_idf_timeseries]") {
@@ -1218,3 +1223,307 @@ TEST_CASE("Can store a large amount of unique floats", "[esp_idf_timeseries]") {
   }
 }
 */
+
+TEST_CASE("Can cache metadata to improve query performance", "[esp_idf_timeseries]") {
+  const char* measurement_name = "perf_test";
+  const char* tags_keys[] = {"suburb", "city"};
+  const char* tags_values[] = {"beldon", "perth"};
+  size_t num_tags = 2;
+
+  const char* field_names[] = {"temperature", "valid", "status"};
+  size_t num_fields = 3;
+
+  // ---------------------------------------------------------
+  // First batch of data (10 points) inserted just once
+  // ---------------------------------------------------------
+
+  const size_t NUM_POINTS_1 = 10;
+  uint64_t timestamps[NUM_POINTS_1];
+  // We need 'num_fields * NUM_POINTS_1' field values, in row-major form:
+  // field_values[ field_index * num_points + point_index ]
+  timeseries_field_value_t field_values[num_fields * NUM_POINTS_1];
+
+  // Fill the arrays for i in [0..9]
+  for (size_t i = 0; i < NUM_POINTS_1; i++) {
+    timestamps[i] = 1000 * i;
+
+    size_t idx_temp = 0 * NUM_POINTS_1 + i;
+    field_values[idx_temp].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    field_values[idx_temp].data.float_val = 1.23f * (float)i;
+
+    size_t idx_status = 1 * NUM_POINTS_1 + i;
+    field_values[idx_status].type = TIMESERIES_FIELD_TYPE_BOOL;
+    field_values[idx_status].data.bool_val = ((int)i % 2 == 0);
+
+    size_t idx_device = 2 * NUM_POINTS_1 + i;
+    field_values[idx_device].type = TIMESERIES_FIELD_TYPE_INT;
+    field_values[idx_device].data.int_val = (int)i * 4;
+  }
+
+  // Prepare the insert descriptor
+  timeseries_insert_data_t insert_data1 = {
+      .measurement_name = measurement_name,
+      .tag_keys = tags_keys,
+      .tag_values = tags_values,
+      .num_tags = num_tags,
+
+      .field_names = field_names,
+      .field_values = field_values,
+      .num_fields = num_fields,
+
+      .timestamps_ms = timestamps,
+      .num_points = NUM_POINTS_1,
+  };
+
+  TEST_ASSERT_TRUE(timeseries_insert(&insert_data1));
+
+  // Initial uncached query
+
+  int64_t start_time, end_time;
+
+  {
+    timeseries_query_t query;
+    memset(&query, 0, sizeof(query));
+
+    // 2) Set the measurement name
+    query.measurement_name = measurement_name;
+    query.tag_keys = NULL;
+    query.tag_values = NULL;
+    query.num_tags = 0;
+    query.num_fields = 0;
+    query.limit = 250;
+    query.start_ms = 0;
+    query.end_ms = 2737381864000ULL;
+    query.rollup_interval = 0;
+
+    // Prepare the result structure
+    timeseries_query_result_t result;
+    memset(&result, 0, sizeof(result));
+
+    // Execute the query
+    start_time = esp_timer_get_time();
+    bool success = timeseries_query(&query, &result);
+    end_time = esp_timer_get_time();
+
+    TEST_ASSERT_TRUE(success);
+    TEST_ASSERT_TRUE(result.num_points == 10);
+    TEST_ASSERT_TRUE(result.num_columns == 3);
+
+    // Ensure the data is correct
+    for (size_t i = 0; i < 10; i++) {
+      TEST_ASSERT_TRUE(result.timestamps[i] == 1000 * i);
+      TEST_ASSERT_TRUE(result.columns[0].values[i].data.float_val == 1.23f * i);
+      TEST_ASSERT_TRUE(result.columns[1].values[i].data.bool_val == ((int)i % 2 == 0));
+      TEST_ASSERT_TRUE(result.columns[2].values[i].data.int_val == (int)i * 4);
+    }
+
+    // Finally, free the result memory
+    timeseries_query_free_result(&result);
+  }
+
+  int64_t uncached_duration = end_time - start_time;
+
+  ESP_LOGI(TAG, "Uncached query duration: %" PRId64 " us", uncached_duration);
+
+  // Repeat the query to test cache performance
+  int64_t start_time2, end_time2;
+  {
+    timeseries_query_t query;
+    memset(&query, 0, sizeof(query));
+    query.measurement_name = measurement_name;
+    query.tag_keys = NULL;
+    query.tag_values = NULL;
+    query.num_tags = 0;
+    query.num_fields = 0;
+    query.limit = 250;
+    query.start_ms = 0;
+    query.end_ms = 2737381864000ULL;
+    query.rollup_interval = 0;
+
+    timeseries_query_result_t result;
+    memset(&result, 0, sizeof(result));
+
+    start_time2 = esp_timer_get_time();
+    bool success = timeseries_query(&query, &result);
+    end_time2 = esp_timer_get_time();
+
+    TEST_ASSERT_TRUE(success);
+    TEST_ASSERT_TRUE(result.num_points == 10);
+    TEST_ASSERT_TRUE(result.num_columns == 3);
+
+    for (size_t i = 0; i < 10; i++) {
+      TEST_ASSERT_TRUE(result.timestamps[i] == 1000 * i);
+      TEST_ASSERT_TRUE(result.columns[0].values[i].data.float_val == 1.23f * i);
+      TEST_ASSERT_TRUE(result.columns[1].values[i].data.bool_val == ((int)i % 2 == 0));
+      TEST_ASSERT_TRUE(result.columns[2].values[i].data.int_val == (int)i * 4);
+    }
+
+    timeseries_query_free_result(&result);
+  }
+
+  int64_t cached_duration = end_time2 - start_time2;
+
+  ESP_LOGI(TAG, "Cached query duration: %" PRId64 " us", cached_duration);
+
+  // Ensure the cached query is faster than the uncached query
+  TEST_ASSERT_TRUE(cached_duration < uncached_duration);
+}
+
+TEST_CASE("60‑second timeseries round‑trip", "[esp_idf_timeseries]") {
+  /* Tag & field metadata */
+  const char* tag_keys[] = {"device"};
+  const char* tag_values[] = {"weather_001"};
+  const char* field_names[] = {"temperature_celsius"};
+
+  /* Data buffers */
+  const size_t NUM_POINTS = 60;
+  uint64_t timestamps[NUM_POINTS];
+  timeseries_field_value_t field_values[NUM_POINTS];
+
+  /* Populate 1‑Hz datapoints covering 0 ms … 59 000 ms */
+  for (size_t i = 0; i < NUM_POINTS; ++i) {
+    timestamps[i] = 1750749962000 + (uint64_t)i * 1000ULL;  // milliseconds
+    field_values[i].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    field_values[i].data.float_val = 20.0f + i;  // deterministic pseudo‑data
+  }
+
+  /* Insert them into the DB */
+  timeseries_insert_data_t insert_data = {
+      .measurement_name = "weather_test",
+      .tag_keys = tag_keys,
+      .tag_values = tag_values,
+      .num_tags = 1,
+      .field_names = field_names,
+      .field_values = field_values,
+      .num_fields = 1,
+      .timestamps_ms = timestamps,
+      .num_points = NUM_POINTS,
+  };
+
+  TEST_ASSERT_TRUE(timeseries_insert(&insert_data));
+
+  /* Query the full range [0 ms, 60 000 ms) — end is exclusive */
+  timeseries_query_t query = {
+      .measurement_name = "weather_test",
+      .start_ms = 1750749962000,
+      .end_ms = 1750749962000 + 60000,  // exclusive
+      .limit = 1000,                    // comfortably above NUM_POINTS
+  };
+
+  timeseries_query_result_t result;
+  memset(&result, 0, sizeof(result));
+  TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+
+  ESP_LOGI("TS_TEST", "Query returned %d points", result.num_points);
+
+  /* Verify cardinality and boundary timestamps */
+  TEST_ASSERT_EQUAL(NUM_POINTS, result.num_points);
+  TEST_ASSERT_EQUAL_UINT64(timestamps[0], result.timestamps[0]);
+  TEST_ASSERT_EQUAL_UINT64(timestamps[NUM_POINTS - 1], result.timestamps[NUM_POINTS - 1]);
+
+  for (int i = 0; i < NUM_POINTS; ++i) {
+    TEST_ASSERT_EQUAL_FLOAT(field_values[i].data.float_val, result.columns[0].values[i].data.float_val);
+  }
+
+  timeseries_query_free_result(&result);
+}
+
+TEST_CASE("Timeseries query parser - happy path", "[tsdb_query_string_parse]") {
+  const char* QUERY = "avg:weather(temp, humidity){device:weather_001, site:perth}";
+  timeseries_query_t q;
+
+  TEST_ASSERT_EQUAL(ESP_OK, tsdb_query_string_parse(QUERY, &q));
+
+  TEST_ASSERT_NOT_NULL(q.measurement_name);
+  TEST_ASSERT_EQUAL_STRING("weather", q.measurement_name);
+
+  TEST_ASSERT_EQUAL(2, q.num_fields);
+  TEST_ASSERT_EQUAL_STRING("temp", q.field_names[0]);
+  TEST_ASSERT_EQUAL_STRING("humidity", q.field_names[1]);
+
+  TEST_ASSERT_EQUAL(2, q.num_tags);
+  TEST_ASSERT_EQUAL_STRING("device", q.tag_keys[0]);
+  TEST_ASSERT_EQUAL_STRING("weather_001", q.tag_values[0]);
+  TEST_ASSERT_EQUAL_STRING("site", q.tag_keys[1]);
+  TEST_ASSERT_EQUAL_STRING("perth", q.tag_values[1]);
+
+  tsdb_query_string_free(&q);
+}
+
+TEST_CASE("Timeseries query parser - rejects trailing parameters", "[tsdb_query_string_parse]") {
+  const char* BAD = "avg:weather(temp){site:x} start=1";
+  timeseries_query_t q;
+
+  TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, tsdb_query_string_parse(BAD, &q));
+}
+
+static bool tag_pair_matches(const tsdb_tag_pair_t* p, const char* key, const char* val) {
+  return (strcmp(p->key, key) == 0) && (strcmp(p->val, val) == 0);
+}
+
+TEST_CASE("Tag list API returns unique key/value pairs", "[esp_idf_timeseries][tags]") {
+  /* ------------------------------------------------- 1.  test fixture */
+  const char* measurement_name = "taglist_test";
+
+  /* two different tags */
+  const char* tag_keys[] = {"device", "sensor"};
+  const char* tag_values[] = {"weather_1", "dht22"};
+
+  const char* field_names[] = {"temperature_c"};
+
+  /* one single field value is enough for the tag-index to be created */
+  timeseries_field_value_t value = {
+      .type = TIMESERIES_FIELD_TYPE_FLOAT,
+      .data.float_val = 21.5f,
+  };
+  uint64_t ts_ms = 1750750000000ULL;
+
+  timeseries_insert_data_t ins = {
+      .measurement_name = measurement_name,
+      .tag_keys = tag_keys,
+      .tag_values = tag_values,
+      .num_tags = 2,
+
+      .field_names = field_names,
+      .field_values = &value,
+      .num_fields = 1,
+
+      .timestamps_ms = &ts_ms,
+      .num_points = 1,
+  };
+  TEST_ASSERT_TRUE_MESSAGE(timeseries_insert(&ins), "data insert failed");
+
+  /* do another insert with the *same* tag pairs – should *not*
+     create duplicates in the tag index                         */
+  TEST_ASSERT_TRUE(timeseries_insert(&ins));
+
+  /* ------------------------------------------------- 2.  call API   */
+  tsdb_tag_pair_t* pairs = NULL; /* ← now a single pointer        */
+  size_t n = 0;
+
+  TEST_ASSERT_TRUE_MESSAGE(timeseries_get_tags_for_measurement(measurement_name, &pairs, &n),
+                           "timeseries_get_tags_for_measurement() returned false");
+
+  /* ------------------------------------------------- 3.  assertions */
+  TEST_ASSERT_NOT_NULL(pairs);
+  TEST_ASSERT_EQUAL_UINT32(2, n); /* expect exactly two pairs   */
+
+  bool have_device = false;
+  bool have_sensor = false;
+
+  for (size_t i = 0; i < n; ++i) {
+    if (tag_pair_matches(&pairs[i], "device", "weather_1")) have_device = true;
+    if (tag_pair_matches(&pairs[i], "sensor", "dht22")) have_sensor = true;
+  }
+  TEST_ASSERT_TRUE_MESSAGE(have_device, "'device=weather_1' pair missing");
+  TEST_ASSERT_TRUE_MESSAGE(have_sensor, "'sensor=dht22' pair missing");
+
+  /* ------------------------------------------------- 4.  free heap  */
+  if (pairs) {
+    for (size_t i = 0; i < n; ++i) {
+      free(pairs[i].key);
+      free(pairs[i].val);
+    }
+    free(pairs);
+  }
+}

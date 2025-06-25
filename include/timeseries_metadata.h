@@ -12,6 +12,13 @@
 extern "C" {
 #endif
 
+typedef struct {
+  char key[128];
+  size_t key_len;
+  timeseries_series_id_list_t series_ids;
+  bool found;
+} tag_search_t;
+
 /**
  * @brief Load existing pages from flash into the in-memory page cache
  *        and ensure at least one active metadata page exists.
@@ -169,6 +176,9 @@ bool tsdb_measurement_cache_init(timeseries_db_t* db, size_t capacity);
 bool tsdb_find_series_ids_for_multiple_tags(timeseries_db_t* db, uint32_t measurement_id, size_t num_tags,
                                             const char** tag_keys, const char** tag_values,
                                             timeseries_series_id_list_t* out_series_list);
+
+bool timeseries_metadata_get_tags_for_measurement(timeseries_db_t* db, uint32_t measurement_id, tsdb_tag_pair_t** tags,
+                                                  size_t* num_tags);
 
 #ifdef __cplusplus
 }

@@ -273,7 +273,10 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
     return false;
   }
 
-  uint64_t start_time, end_time;
+  int64_t g_start_time, g_end_time;
+  int64_t start_time, end_time;
+
+  g_start_time = esp_timer_get_time();
 
   /* -------------------------------------------------------------------- */
   /*  House-keeping vars                                                  */
@@ -300,13 +303,13 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
 
   uint32_t measurement_id = 0;
   if (!tsdb_find_measurement_id(db, query->measurement_name, &measurement_id)) {
-    ESP_LOGW(TAG, "Measurement '%s' not found.", query->measurement_name);
+    ESP_LOGV(TAG, "Measurement '%s' not found.", query->measurement_name);
     ok = true; /* empty result   */
     goto cleanup;
   }
 
   end_time = esp_timer_get_time();
-  ESP_LOGI(TAG, "Resolved measurement in %.3f ms", (end_time - start_time) / 1000.0);
+  ESP_LOGV(TAG, "Resolved measurement in %.3f ms", (end_time - start_time) / 1000.0);
 
   /* -------------------------------------------------------------------- */
   /*  2.  Build `matched_series`                                          */
@@ -318,20 +321,20 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
                                            (const char**)query->tag_values, &matched_series);
   } else {
     if (!tsdb_find_all_series_ids_for_measurement(db, measurement_id, &matched_series) || matched_series.count == 0) {
-      ESP_LOGI(TAG, "No series found for measurement '%s'.", query->measurement_name);
+      ESP_LOGV(TAG, "No series found for measurement '%s'.", query->measurement_name);
       ok = true; /* empty result   */
       goto cleanup;
     }
   }
 
   if (matched_series.count == 0) {
-    ESP_LOGI(TAG, "No series matched the tag filters (or none exist).");
+    ESP_LOGV(TAG, "No series matched the tag filters (or none exist).");
     ok = true; /* empty result   */
     goto cleanup;
   }
 
   end_time = esp_timer_get_time();
-  ESP_LOGI(TAG, "Found %zu series for measurement '%s' in %.3f ms", matched_series.count, query->measurement_name,
+  ESP_LOGV(TAG, "Found %zu series for measurement '%s' in %.3f ms", matched_series.count, query->measurement_name,
            (end_time - start_time) / 1000.0);
 
   /* -------------------------------------------------------------------- */
@@ -341,7 +344,7 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
 
   if (query->num_fields == 0) {
     if (!tsdb_list_fields_for_measurement(db, measurement_id, &fields_to_query) || fields_to_query.count == 0) {
-      ESP_LOGI(TAG, "No fields found for measurement '%s'.", query->measurement_name);
+      ESP_LOGV(TAG, "No fields found for measurement '%s'.", query->measurement_name);
       ok = true; /* empty result   */
       goto cleanup;
     }
@@ -352,7 +355,7 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
   }
 
   end_time = esp_timer_get_time();
-  ESP_LOGI(TAG, "Found fields for measurement in %.3f ms", (end_time - start_time) / 1000.0);
+  ESP_LOGV(TAG, "Found fields for measurement in %.3f ms", (end_time - start_time) / 1000.0);
 
   /* -------------------------------------------------------------------- */
   /* 4. Build all field→series maps in one metadata pass                  */
@@ -409,7 +412,7 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
   free(lists);
 
   end_time = esp_timer_get_time();
-  ESP_LOGI(TAG, "Prepared %zu fields in %.3f ms", actual_fields_count, (end_time - start_time) / 1000.0);
+  ESP_LOGV(TAG, "Prepared %zu fields in %.3f ms", actual_fields_count, (end_time - start_time) / 1000.0);
 
   /* -------------------------------------------------------------------- */
   /*  5.  Fetch & aggregate                                               */
@@ -423,7 +426,7 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
   }
 
   end_time = esp_timer_get_time();
-  ESP_LOGI(TAG, "Fetched data in %.3f ms", (end_time - start_time) / 1000.0);
+  ESP_LOGV(TAG, "Fetched data in %.3f ms", (end_time - start_time) / 1000.0);
 
   /* -------------------------------------------------------------------- */
   /*  6.  SORT RESULTS BY TIMESTAMP (NEW)                                */
@@ -437,7 +440,7 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
   }
 
   end_time = esp_timer_get_time();
-  ESP_LOGI(TAG, "Sorted %zu result points in %.3f ms", result->num_points, (end_time - start_time) / 1000.0);
+  ESP_LOGV(TAG, "Sorted %zu result points in %.3f ms", result->num_points, (end_time - start_time) / 1000.0);
 
   ok = true; /* At this point the function succeeded – result is valid */
 
@@ -462,6 +465,9 @@ cleanup:
 
   tsdb_string_list_free(&fields_to_query);
   tsdb_series_id_list_free(&matched_series);
+
+  g_end_time = esp_timer_get_time();
+  ESP_LOGI(TAG, "Query execution took %.3f ms", (g_end_time - g_start_time) / 1000.0);
 
   return ok;
 }
@@ -760,6 +766,10 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
     return 0;
   }
 
+  int64_t start_time, end_time;
+
+  start_time = esp_timer_get_time();
+
   // --------------------------------------------------------------------------
   // PART A: Single pass to gather the record_info linked-lists for each series
   // --------------------------------------------------------------------------
@@ -769,6 +779,12 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
     ESP_LOGE(TAG, "OOM building series-id lookup table");
     return 0;
   }
+
+  end_time = esp_timer_get_time();
+  ESP_LOGW(TAG, "Built series lookup table in %.3f ms", (end_time - start_time) / 1000.0);
+
+  // Initialize the result structure
+  start_time = esp_timer_get_time();
 
   timeseries_page_cache_iterator_t page_iter;
   if (!timeseries_page_cache_iterator_init(db, &page_iter)) {
@@ -801,6 +817,12 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
         continue;
       }
 
+      // Ensure overlap with the query time range
+      if (fdh.end_time < query->start_ms || fdh.start_time > query->end_ms) {
+        // No overlap with the query time range => skip
+        continue;
+      }
+
       // Calculate the offset for the raw data portion
       uint32_t absolute_offset =
           page_offset + fdata_iter.current_record_offset + sizeof(timeseries_field_data_header_t);
@@ -815,6 +837,11 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
     }  // end while fielddata_iterator
   }  // end while page_iterator
 
+  end_time = esp_timer_get_time();
+  ESP_LOGI(TAG, "Gathered record info in %.3f ms", (end_time - start_time) / 1000.0);
+
+  start_time = esp_timer_get_time();
+
   // --------------------------------------------------------------------------
   // PART B: Verify that all series in each field share the same type
   // --------------------------------------------------------------------------
@@ -825,6 +852,8 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
   timeseries_aggregation_method_e agg_method = TSDB_AGGREGATION_AVG;
 
   for (size_t f = 0; f < num_fields; f++) {
+    start_time = esp_timer_get_time();
+
     field_info_t* fld = &fields_array[f];
     if (fld->num_series == 0) {
       continue;
@@ -864,11 +893,17 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
       continue;
     }
 
+    end_time = esp_timer_get_time();
+    ESP_LOGI(TAG, "Field '%s' has type %d with %zu series in %.3f ms", fld->field_name, (int)field_type,
+             fld->num_series, (end_time - start_time) / 1000.0);
+
     // ----------------------------------------------------------------------
     // PART C: Build multi_points_iterator per series, unify via
     // multi_series_iterator
     //         and store the aggregator results in the `result` struct.
     // ----------------------------------------------------------------------
+
+    start_time = esp_timer_get_time();
 
     // We'll create a column in `result` for this field (if not already
     // present). This is the column we'll store all aggregated points into.
@@ -1035,9 +1070,16 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
       }
     }
     free(series_multi_iters);
+
+    end_time = esp_timer_get_time();
+    ESP_LOGI(TAG, "Aggregated %zu points for field '%s' in %.3f ms", inserted_for_this_field, fld->field_name,
+             (end_time - start_time) / 1000.0);
   }  // end for each field
 
   series_lookup_free(&srl_tbl);
+
+  end_time = esp_timer_get_time();
+  ESP_LOGW(TAG, "Aggregated %zu points in %.3f ms", total_points_aggregated, (end_time - start_time) / 1000.0);
 
   return total_points_aggregated;
 }

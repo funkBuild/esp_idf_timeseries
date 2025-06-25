@@ -155,6 +155,11 @@ typedef struct timeseries_query_result_t {
   size_t num_columns;
 } timeseries_query_result_t;
 
+typedef struct {
+  char* key;
+  char* val;
+} tsdb_tag_pair_t;
+
 bool timeseries_init(void);
 
 /**
@@ -172,6 +177,12 @@ bool timeseries_query(const timeseries_query_t* query, timeseries_query_result_t
 void timeseries_query_free_result(timeseries_query_result_t* result);
 
 bool timeseries_clear_all();
+
+bool timeseries_get_measurements(char*** measurements, size_t* num_measurements);
+
+bool timeseries_get_fields_for_measurement(const char* measurement_name, char*** fields, size_t* num_fields);
+
+bool timeseries_get_tags_for_measurement(const char* measurement_name, tsdb_tag_pair_t** tags, size_t* num_tags);
 
 #ifdef __cplusplus
 }

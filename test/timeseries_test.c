@@ -871,6 +871,180 @@ TEST_CASE("Can handle duplicate timestamps", "[esp_idf_timeseries]") {
   timeseries_query_free_result(&result);
 }
 
+TEST_CASE("Can handle integer aggregation", "[esp_idf_timeseries]") {
+  const char* field_names[] = {"integer_positive", "integer_negative"};
+
+  const size_t NUM_POINTS = 8;
+  timeseries_field_value_t field_values[2 * NUM_POINTS];
+  uint64_t timestamps[NUM_POINTS];
+
+  for (size_t i = 0; i < NUM_POINTS; i++) {
+    timestamps[i] = 1000 * i;
+
+    // sensor_active: alternating pairs
+    field_values[0 * NUM_POINTS + i].type = TIMESERIES_FIELD_TYPE_INT;
+    field_values[0 * NUM_POINTS + i].data.int_val = i;
+
+    // alarm_triggered: offset pattern
+    field_values[1 * NUM_POINTS + i].type = TIMESERIES_FIELD_TYPE_INT;
+    field_values[1 * NUM_POINTS + i].data.int_val = -1 * (int64_t)(i);
+  }
+
+  timeseries_insert_data_t insert_data = {
+      .measurement_name = "int_agg_test",
+      .tag_keys = NULL,
+      .tag_values = NULL,
+      .num_tags = 0,
+      .field_names = field_names,
+      .field_values = field_values,
+      .num_fields = 2,
+      .timestamps_ms = timestamps,
+      .num_points = NUM_POINTS,
+  };
+
+  TEST_ASSERT_TRUE(timeseries_insert(&insert_data));
+
+  // Query with rollup of 2 seconds (aggregate pairs)
+  timeseries_query_t query = {
+      .measurement_name = "int_agg_test",
+      .limit = 10,
+      .start_ms = 0,
+      .end_ms = 2737381864000ULL,
+      .rollup_interval = 2000,
+  };
+
+  timeseries_query_result_t result;
+  memset(&result, 0, sizeof(result));
+  TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+
+  TEST_ASSERT_EQUAL(4, result.num_points);  // 8 points aggregated to 4
+
+  // Print points
+  for (int i = 0; i < result.num_points; i++) {
+    ESP_LOGI("Int Agg Test", "Point %d: Timestamp: %llu, Positive: %f, Negative: %f", i, result.timestamps[i],
+             result.columns[0].values[i].data.float_val, result.columns[1].values[i].data.float_val);
+  }
+
+  // Verify aggregation results (integer -> float average)
+  // First pair (0,1) -> 0.5, (2,3) -> 2.5 etc
+  for (int i = 0; i < 4; i++) {
+    /* integer → float */
+    TEST_ASSERT_TRUE(result.columns[0].values[i].type == TIMESERIES_FIELD_TYPE_FLOAT);
+    TEST_ASSERT_TRUE(result.columns[1].values[i].type == TIMESERIES_FIELD_TYPE_FLOAT);
+
+    /* (2i   + (2i+1)) / 2  ->  (4i+1)/2  */
+    double expected_positive = (4 * i + 1) / 2.0;
+
+    /* –(2i) + –(2i+1)  -> –(4i+1)  then /2 */
+    double expected_negative = -1 * (4 * i + 1) / 2.0;
+
+    TEST_ASSERT_EQUAL_FLOAT(expected_positive, result.columns[0].values[i].data.float_val);
+    TEST_ASSERT_EQUAL_FLOAT(expected_negative, result.columns[1].values[i].data.float_val);
+  }
+
+  timeseries_query_free_result(&result);
+}
+
+TEST_CASE("Can handle negative integers", "[esp_idf_timeseries]") {
+  const char* field_names[] = {"negative_value", "negative_value2"};
+
+  // Insert negative integers for two fields
+  const size_t NUM_POINTS = 5;
+  timeseries_field_value_t field_values[2 * NUM_POINTS];
+  uint64_t timestamps[NUM_POINTS];
+
+  for (size_t i = 0; i < NUM_POINTS; i++) {
+    timestamps[i] = 1000 * i;
+    // First field: -1 * (i + 10)
+    field_values[0 * NUM_POINTS + i].type = TIMESERIES_FIELD_TYPE_INT;
+    field_values[0 * NUM_POINTS + i].data.int_val = -1 * (int)(i + 10);
+    // Second field: -2 * (i + 20)
+    field_values[1 * NUM_POINTS + i].type = TIMESERIES_FIELD_TYPE_INT;
+    field_values[1 * NUM_POINTS + i].data.int_val = -2 * (int)(i + 20);
+  }
+
+  timeseries_insert_data_t insert_data = {
+      .measurement_name = "negative_int_test",
+      .tag_keys = NULL,
+      .tag_values = NULL,
+      .num_tags = 0,
+      .field_names = field_names,
+      .field_values = field_values,
+      .num_fields = 2,
+      .timestamps_ms = timestamps,
+      .num_points = NUM_POINTS,
+  };
+
+  TEST_ASSERT_TRUE(timeseries_insert(&insert_data));
+
+  // Query and verify
+  timeseries_query_t query = {
+      .measurement_name = "negative_int_test",
+      .limit = 10,
+      .start_ms = 0,
+      .end_ms = 2737381864000ULL,
+  };
+
+  timeseries_query_result_t result;
+  memset(&result, 0, sizeof(result));
+  TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+
+  TEST_ASSERT_EQUAL(NUM_POINTS, result.num_points);
+  TEST_ASSERT_EQUAL(2, result.num_columns);
+
+  for (size_t i = 0; i < NUM_POINTS; i++) {
+    TEST_ASSERT_EQUAL(-1 * (int)(i + 10), result.columns[0].values[i].data.int_val);
+    TEST_ASSERT_EQUAL(-2 * (int)(i + 20), result.columns[1].values[i].data.int_val);
+    TEST_ASSERT_EQUAL(timestamps[i], result.timestamps[i]);
+  }
+
+  timeseries_query_free_result(&result);
+}
+
+TEST_CASE("Can handle duplicate timestamps", "[esp_idf_timeseries]") {
+  const char* field_names[] = {"reading"};
+
+  // Insert multiple values with same timestamp
+  uint64_t timestamps[] = {1000, 1000, 2000, 2000, 2000, 3000};
+  timeseries_field_value_t field_values[6];
+
+  for (int i = 0; i < 6; i++) {
+    field_values[i].type = TIMESERIES_FIELD_TYPE_INT;
+    field_values[i].data.int_val = i;
+  }
+
+  timeseries_insert_data_t insert_data = {
+      .measurement_name = "dup_time_test",
+      .tag_keys = NULL,
+      .tag_values = NULL,
+      .num_tags = 0,
+      .field_names = field_names,
+      .field_values = field_values,
+      .num_fields = 1,
+      .timestamps_ms = timestamps,
+      .num_points = 6,
+  };
+
+  TEST_ASSERT_TRUE(timeseries_insert(&insert_data));
+
+  // Query without aggregation - should get all points
+  timeseries_query_t query = {
+      .measurement_name = "dup_time_test",
+      .limit = 10,
+      .start_ms = 0,
+      .end_ms = 2737381864000ULL,
+  };
+
+  timeseries_query_result_t result;
+  memset(&result, 0, sizeof(result));
+  TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+
+  // Should only return 3 points, removing duplicates
+  TEST_ASSERT_EQUAL(3, result.num_points);
+
+  timeseries_query_free_result(&result);
+}
+
 TEST_CASE("Can handle very long strings", "[esp_idf_timeseries]") {
   const char* field_names[] = {"log_entry"};
 
@@ -1525,5 +1699,81 @@ TEST_CASE("Tag list API returns unique key/value pairs", "[esp_idf_timeseries][t
       free(pairs[i].val);
     }
     free(pairs);
+  }
+}
+
+TEST_CASE("Timeseries usage summary returns sane values", "[esp_idf_timeseries][usage]") {
+  /* ---------------------------------------------------------------------- */
+  /* 1. Test fixture – insert a handful of points so pages get created      */
+  /* ---------------------------------------------------------------------- */
+  const char* measurement_name = "usage_test";
+
+  const char* tag_keys[] = {"device"};
+  const char* tag_values[] = {"weather_1"};
+  const char* field_names[] = {"temperature_c"};
+
+  timeseries_field_value_t field_val = {
+      .type = TIMESERIES_FIELD_TYPE_FLOAT,
+      .data.float_val = 25.0f,
+  };
+
+  /* ten points, one per second */
+  uint64_t ts_ms[10];
+  for (size_t i = 0; i < 10; ++i) {
+    ts_ms[i] = 1750750000000ULL + i * 1000ULL;
+  }
+
+  timeseries_insert_data_t ins = {
+      .measurement_name = measurement_name,
+      .tag_keys = tag_keys,
+      .tag_values = tag_values,
+      .num_tags = 1,
+
+      .field_names = field_names,
+      .field_values = &field_val,
+      .num_fields = 1,
+
+      .timestamps_ms = ts_ms,
+      .num_points = sizeof(ts_ms) / sizeof(ts_ms[0]),
+  };
+  TEST_ASSERT_TRUE_MESSAGE(timeseries_insert(&ins), "data insert failed");
+
+  /* ---------------------------------------------------------------------- */
+  /* 2. Call API under test                                                 */
+  /* ---------------------------------------------------------------------- */
+  tsdb_usage_summary_t summary;
+  TEST_ASSERT_TRUE_MESSAGE(timeseries_get_usage_summary(&summary), "timeseries_get_usage_summary() failed");
+
+  /* ---------------------------------------------------------------------- */
+  /* Print summary to console                                               */
+  /* ---------------------------------------------------------------------- */
+  ESP_LOGW("USAGE", "Total space: %lu bytes, Used space: %lu bytes", summary.total_space_bytes,
+           summary.used_space_bytes);
+  ESP_LOGW("USAGE", "Metadata: %lu pages, %lu bytes", summary.metadata_summary.num_pages,
+           summary.metadata_summary.size_bytes);
+  for (int lvl = 0; lvl < 5; ++lvl) {
+    ESP_LOGW("USAGE", "Level %d: %lu pages, %lu bytes", lvl, summary.page_summaries[lvl].num_pages,
+             summary.page_summaries[lvl].size_bytes);
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* 3. Sanity checks                                                       */
+  /* ---------------------------------------------------------------------- */
+  TEST_ASSERT_GREATER_THAN_UINT32(0, summary.total_space_bytes);
+  TEST_ASSERT_GREATER_THAN_UINT32(0, summary.used_space_bytes);
+  TEST_ASSERT_LESS_OR_EQUAL_UINT32(summary.total_space_bytes, summary.used_space_bytes);
+
+  /* sum of every category must equal used_space_bytes */
+  uint64_t computed_used = summary.metadata_summary.size_bytes;
+  for (int lvl = 0; lvl < 5; ++lvl) {
+    computed_used += summary.page_summaries[lvl].size_bytes;
+  }
+  TEST_ASSERT_EQUAL_UINT64_MESSAGE(computed_used, summary.used_space_bytes,
+                                   "Sum of category sizes does not match used_space_bytes");
+
+  /* page counts should also be reasonable (all non-negative) */
+  TEST_ASSERT_GREATER_OR_EQUAL_UINT32(0, summary.metadata_summary.num_pages);
+  for (int lvl = 0; lvl < 4; ++lvl) {
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(0, summary.page_summaries[lvl].num_pages);
   }
 }

@@ -303,7 +303,7 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
 
   uint32_t measurement_id = 0;
   if (!tsdb_find_measurement_id(db, query->measurement_name, &measurement_id)) {
-    ESP_LOGV(TAG, "Measurement '%s' not found.", query->measurement_name);
+    ESP_LOGE(TAG, "Measurement '%s' not found.", query->measurement_name);
     ok = true; /* empty result   */
     goto cleanup;
   }
@@ -321,7 +321,7 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
                                            (const char**)query->tag_values, &matched_series);
   } else {
     if (!tsdb_find_all_series_ids_for_measurement(db, measurement_id, &matched_series) || matched_series.count == 0) {
-      ESP_LOGV(TAG, "No series found for measurement '%s'.", query->measurement_name);
+      ESP_LOGE(TAG, "No series found for measurement '%s'.", query->measurement_name);
       ok = true; /* empty result   */
       goto cleanup;
     }
@@ -907,7 +907,20 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
 
     // We'll create a column in `result` for this field (if not already
     // present). This is the column we'll store all aggregated points into.
-    size_t col_index = find_or_create_column(result, fld->field_name, field_type);
+
+    timeseries_field_type_e output_field_type = field_type;
+
+    if (query->rollup_interval > 0 && agg_method == TSDB_AGGREGATION_AVG && field_type != TIMESERIES_FIELD_TYPE_FLOAT) {
+      ESP_LOGW(TAG,
+               "Field '%s' has type %d, but AVG aggregation requires float. "
+               "Will convert to float.",
+               fld->field_name, (int)field_type);
+
+      output_field_type = TIMESERIES_FIELD_TYPE_FLOAT;  // Ensure we store as float
+    }
+
+    // When we have a rollup interval, average always returns a float.
+    size_t col_index = find_or_create_column(result, fld->field_name, output_field_type);
 
     if (col_index == SIZE_MAX) {
       /* Fatal for this field – skip it but keep processing others */
@@ -919,7 +932,8 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
     size_t inserted_for_this_field = 0;
 
     // Build a multi_points_iterator for each series
-    timeseries_multi_points_iterator_t** series_multi_iters = calloc(fld->num_series, sizeof(*series_multi_iters));
+    timeseries_multi_points_iterator_t** series_multi_iters =
+        calloc(fld->num_series, sizeof(timeseries_multi_points_iterator_t*));
     if (!series_multi_iters) {
       ESP_LOGE(TAG, "OOM: cannot allocate multi-iter array for field='%s'", fld->field_name);
       continue;
@@ -940,8 +954,9 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
       }
 
       // Prepare arrays for sub-iterators
-      timeseries_points_iterator_t** sub_iters = calloc(record_count, sizeof(*sub_iters));
+      timeseries_points_iterator_t** sub_iters = calloc(record_count, sizeof(timeseries_points_iterator_t*));
       uint32_t* page_seqs = calloc(record_count, sizeof(uint32_t));
+
       if (!sub_iters || !page_seqs) {
         free(sub_iters);
         free(page_seqs);
@@ -1033,10 +1048,6 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
           ESP_LOGE(TAG, "OOM inserting new result row – aborting field '%s'", fld->field_name);
           break;
         }
-
-        // Use the type from the aggregated value as it may be different from
-        // the original field type
-        result->columns[col_index].values[row_index].type = val_agg.type;
 
         // Copy the aggregated value into the result, use copy for strings
         timeseries_field_value_t* cell = &result->columns[col_index].values[row_index];

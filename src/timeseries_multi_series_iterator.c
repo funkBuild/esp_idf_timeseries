@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include <float.h>
 /*
  * Existing field/value types:
  *
@@ -35,7 +35,7 @@
  *   TSDB_AGGREGATION_MIN,
  *   TSDB_AGGREGATION_MAX,
  *   TSDB_AGGREGATION_AVG,
- *   TSDB_AGGREGATION_LAST,
+ *   TSDB_AGGREGATION_LATEST,
  * } timeseries_aggregation_method_e;
  */
 
@@ -53,7 +53,7 @@ static double to_double_for_agg(const timeseries_field_value_t* val) {
       return (val->data.bool_val) ? 1.0 : 0.0;
 
     case TIMESERIES_FIELD_TYPE_INT:
-      return (double)val->data.int_val;
+      return val->data.int_val;
 
     case TIMESERIES_FIELD_TYPE_FLOAT:
       return val->data.float_val;
@@ -125,7 +125,7 @@ static timeseries_field_value_t finalize_aggregator(timeseries_aggregation_metho
 
   // If aggregator = LAST, we always return the last_val as-is, even if
   // it's a string or a bool, int, etc.
-  if (method == TSDB_AGGREGATION_LAST) {
+  if (method == TSDB_AGGREGATION_LATEST) {
     // If we never saw any point at all, last_val might be empty.
     // But typically, you only call finalize if something was processed.
     return *last_val;
@@ -169,7 +169,15 @@ static timeseries_field_value_t finalize_aggregator(timeseries_aggregation_metho
     case TSDB_AGGREGATION_AVG:
       // always produce float
       result.type = TIMESERIES_FIELD_TYPE_FLOAT;
-      result.data.float_val = accumulator / count;
+
+      if (count <= 0) {
+        // No samples => return 0.0
+        result.data.float_val = 0.0;
+      } else {
+        // Otherwise, float average
+        result.data.float_val = accumulator / count;
+      }
+
       break;
 
     case TSDB_AGGREGATION_NONE:
@@ -310,77 +318,77 @@ bool timeseries_multi_series_iterator_next(timeseries_multi_series_iterator_t* i
   /*-----------------------------------------------------------------------------
    *  ENABLED ROLLUP => bucket-based aggregation
    *-----------------------------------------------------------------------------*/
-  uint64_t window_start = iter->current_window_start;
-  uint64_t window_end = iter->current_window_end;
+  while (true) { /* ← new outer loop */
+    uint64_t window_start = iter->current_window_start;
+    uint64_t window_end = iter->current_window_end;
 
-  double accumulator = 0.0;
-  double sample_count = 0.0;
-  double min_v = +1.0e38;
-  double max_v = -1.0e38;
-  timeseries_field_value_t last_val;
-  memset(&last_val, 0, sizeof(last_val));
+    /* --- per-bucket state ---------------------------------------------------- */
+    bool window_has_values = false;
+    double accumulator = 0.0;
+    double sample_count = 0.0;
+    double min_v = DBL_MAX, max_v = -DBL_MAX;
+    timeseries_field_value_t last_val = {0};
 
-  // Gather points from each sub-iterator in [window_start, window_end)
-  for (size_t s = 0; s < iter->sub_count; s++) {
-    while (true) {
-      uint64_t ts_cur;
-      timeseries_field_value_t val_cur;
-      // 'Peek'
-      if (!timeseries_multi_points_iterator_peek(iter->sub_iters[s], &ts_cur, &val_cur)) {
-        // no more data
-        break;
-      }
-      if (ts_cur < window_start) {
-        // skip old data
-        (void)timeseries_multi_points_iterator_next(iter->sub_iters[s], &ts_cur, &val_cur);
-        continue;
-      }
-      if (ts_cur >= window_end) {
-        // belongs to a future window, stop
-        break;
-      }
+    /* --- gather points that fall into [window_start, window_end) ------------ */
+    for (size_t s = 0; s < iter->sub_count; ++s) {
+      while (true) {
+        uint64_t ts_cur;
+        timeseries_field_value_t v_cur;
+        if (!timeseries_multi_points_iterator_peek(iter->sub_iters[s], &ts_cur, &v_cur))
+          break; /* no more from this series */
 
-      // If here, ts_cur is in [window_start, window_end).
-      update_aggregator(iter->aggregator, &val_cur, &accumulator, &sample_count, &min_v, &max_v, &last_val);
+        if (ts_cur < window_start) { /* discard stale sample */
+          (void)timeseries_multi_points_iterator_next(iter->sub_iters[s], &ts_cur, &v_cur);
+          continue;
+        }
+        if (ts_cur >= window_end) /* future bucket -> stop scanning this series */
+          break;
 
-      // consume it
-      (void)timeseries_multi_points_iterator_next(iter->sub_iters[s], &ts_cur, &val_cur);
-    }
-  }
+        /* sample belongs to the current bucket */
+        window_has_values = true;
+        update_aggregator(iter->aggregator, &v_cur, &accumulator, &sample_count, &min_v, &max_v, &last_val);
 
-  // Finalize aggregator
-  timeseries_field_value_t aggregated =
-      finalize_aggregator(iter->aggregator, accumulator, sample_count, min_v, max_v, &last_val);
-
-  // Output
-  if (out_ts) {
-    *out_ts = window_start;
-  }
-  if (out_val) {
-    *out_val = aggregated;
-  }
-
-  // Advance the window
-  iter->current_window_start += iter->rollup_interval;
-  iter->current_window_end += iter->rollup_interval;
-
-  // Check if there's more data
-  bool has_more_data = false;
-  for (size_t s = 0; s < iter->sub_count; s++) {
-    uint64_t ts_cur;
-    timeseries_field_value_t dummy;
-    if (timeseries_multi_points_iterator_peek(iter->sub_iters[s], &ts_cur, &dummy)) {
-      if (ts_cur >= iter->current_window_start) {
-        has_more_data = true;
-        break;
+        (void)timeseries_multi_points_iterator_next(iter->sub_iters[s], &ts_cur, &v_cur);
       }
     }
-  }
-  if (!has_more_data) {
-    iter->valid = false;
-  }
 
-  return true;
+    /* --- empty bucket? ------------------------------------------------------- */
+    if (!window_has_values) {
+      /* advance the window and keep looking until we hit data or exhaust input */
+      iter->current_window_start += iter->rollup_interval;
+      iter->current_window_end += iter->rollup_interval;
+
+      /* still any data ≥ new window? */
+      bool still_has_data = false;
+      for (size_t s = 0; s < iter->sub_count; ++s) {
+        uint64_t ts_next;
+        timeseries_field_value_t dummy;
+        if (timeseries_multi_points_iterator_peek(iter->sub_iters[s], &ts_next, &dummy) &&
+            ts_next >= iter->current_window_start) {
+          still_has_data = true;
+          break;
+        }
+      }
+      if (!still_has_data) { /* nothing left anywhere */
+        iter->valid = false;
+        return false;
+      }
+      continue; /* loop again – do NOT emit */
+    }
+
+    /* --- non-empty bucket: finalise & emit ----------------------------------- */
+    timeseries_field_value_t agg =
+        finalize_aggregator(iter->aggregator, accumulator, sample_count, min_v, max_v, &last_val);
+
+    if (out_ts) *out_ts = window_start;
+    if (out_val) *out_val = agg;
+
+    /* advance window for next call */
+    iter->current_window_start += iter->rollup_interval;
+    iter->current_window_end += iter->rollup_interval;
+
+    return true; /* exactly one value emitted */
+  }
 }
 
 /*-------------------------------------------------------------------------------------

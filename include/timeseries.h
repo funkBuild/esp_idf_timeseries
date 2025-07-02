@@ -160,12 +160,20 @@ typedef struct {
   char* val;
 } tsdb_tag_pair_t;
 
+typedef struct {
+  uint32_t num_pages;
+  uint32_t size_bytes;
+} tsdb_page_usage_summary_t;
+
+typedef struct {
+  tsdb_page_usage_summary_t page_summaries[5];
+  tsdb_page_usage_summary_t metadata_summary;
+  uint32_t used_space_bytes;
+  uint32_t total_space_bytes;
+} tsdb_usage_summary_t;
+
 bool timeseries_init(void);
 
-/**
- * @brief Insert multiple data points for multiple fields in one call.
- *        Each field is stored in a single entry (multi (ts,value) array).
- */
 bool timeseries_insert(const timeseries_insert_data_t* data);
 
 bool timeseries_compact(void);
@@ -183,6 +191,8 @@ bool timeseries_get_measurements(char*** measurements, size_t* num_measurements)
 bool timeseries_get_fields_for_measurement(const char* measurement_name, char*** fields, size_t* num_fields);
 
 bool timeseries_get_tags_for_measurement(const char* measurement_name, tsdb_tag_pair_t** tags, size_t* num_tags);
+
+bool timeseries_get_usage_summary(tsdb_usage_summary_t* summary);
 
 #ifdef __cplusplus
 }

@@ -18,7 +18,7 @@ typedef enum {
   TSDB_AGGREGATION_MIN,
   TSDB_AGGREGATION_MAX,
   TSDB_AGGREGATION_AVG,
-  TSDB_AGGREGATION_LAST,
+  TSDB_AGGREGATION_LATEST,
   // etc.
 } timeseries_aggregation_method_e;
 

@@ -9,6 +9,7 @@ static const char* TAG = "timeseries_multi_iter";
 
 static bool field_value_deep_copy(timeseries_field_value_t* dst, const timeseries_field_value_t* src) {
   dst->type = src->type;
+
   if (src->type == TIMESERIES_FIELD_TYPE_STRING) {
     size_t len = src->data.string_val.length;
     if (!src->data.string_val.str || len == 0) {
@@ -26,8 +27,9 @@ static bool field_value_deep_copy(timeseries_field_value_t* dst, const timeserie
     dst->data.string_val.str = copy;
     dst->data.string_val.length = len;
   } else {
-    dst->data = src->data; /* plain scalar, shallow copy OK */
+    dst->data = src->data; /* for numeric types, just copy the union */
   }
+
   return true;
 }
 

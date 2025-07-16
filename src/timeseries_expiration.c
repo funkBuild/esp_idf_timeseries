@@ -4,18 +4,18 @@
 #include "esp_log.h"
 #include "esp_partition.h"
 
-#include "timeseries_compaction.h" // timeseries_compact_page_list() signature
-#include "timeseries_data.h"       // TSDB_FIELDDATA_FLAG_DELETED, etc.
-#include "timeseries_internal.h"   // timeseries_page_cache_iterator_t
-#include "timeseries_iterator.h"   // timeseries_fielddata_iterator_t
-#include "timeseries_metadata.h" // tsdb_lookup_series_type_in_metadata(), etc.
-#include "timeseries_page_cache.h" // tsdb_pagecache_get_total_active_size()
+#include "timeseries_compaction.h"  // timeseries_compact_page_list() signature
+#include "timeseries_data.h"        // TSDB_FIELDDATA_FLAG_DELETED, etc.
+#include "timeseries_internal.h"    // timeseries_page_cache_iterator_t
+#include "timeseries_iterator.h"    // timeseries_fielddata_iterator_t
+#include "timeseries_metadata.h"    // tsdb_lookup_series_type_in_metadata(), etc.
+#include "timeseries_page_cache.h"  // tsdb_pagecache_get_total_active_size()
 
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 
-static const char *TAG = "TimeseriesExpiration";
+static const char* TAG = "TimeseriesExpiration";
 
 /**
  * @brief Descriptor for a single field-data record we might expire.
@@ -28,16 +28,16 @@ static const char *TAG = "TimeseriesExpiration";
  */
 typedef struct {
   uint64_t start_time;
-  uint32_t page_offset;   // Base offset of the page in the partition
-  uint32_t record_offset; // Offset from the start of the page to the record
-  uint32_t record_length; // Size of this record, in bytes
+  uint32_t page_offset;    // Base offset of the page in the partition
+  uint32_t record_offset;  // Offset from the start of the page to the record
+  uint32_t record_length;  // Size of this record, in bytes
 } tsdb_oldest_fd_entry_t;
 
 /**
  * @brief Simple list to store unique page offsets that we modified.
  */
 typedef struct {
-  uint32_t *pages;
+  uint32_t* pages;
   size_t used;
   size_t capacity;
 } tsdb_modified_pages_list_t;
@@ -46,32 +46,25 @@ typedef struct {
 // Forward Declarations
 // -----------------------------------------------------------------------------
 
-static bool get_usage_ratio(timeseries_db_t *db, float *out_ratio);
-static bool gather_25_oldest_fielddata(timeseries_db_t *db,
-                                       tsdb_oldest_fd_entry_t *heap_25,
-                                       size_t *out_count);
-static void mark_entries_deleted(timeseries_db_t *db,
-                                 const tsdb_oldest_fd_entry_t *entries,
-                                 size_t count, uint32_t bytes_to_free,
-                                 tsdb_modified_pages_list_t *modified_out);
-static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs);
+static bool get_usage_ratio(timeseries_db_t* db, float* out_ratio);
+static bool gather_25_oldest_fielddata(timeseries_db_t* db, tsdb_oldest_fd_entry_t* heap_25, size_t* out_count);
+static void mark_entries_deleted(timeseries_db_t* db, const tsdb_oldest_fd_entry_t* entries, size_t count,
+                                 uint32_t bytes_to_free, tsdb_modified_pages_list_t* modified_out);
+static bool mark_record_deleted(timeseries_db_t* db, uint32_t record_hdr_abs);
 
-static void modified_pages_list_init(tsdb_modified_pages_list_t *list);
-static void modified_pages_list_add(tsdb_modified_pages_list_t *list,
-                                    uint32_t page_offset);
-static void modified_pages_list_free(tsdb_modified_pages_list_t *list);
+static void modified_pages_list_init(tsdb_modified_pages_list_t* list);
+static void modified_pages_list_add(tsdb_modified_pages_list_t* list, uint32_t page_offset);
+static void modified_pages_list_free(tsdb_modified_pages_list_t* list);
 
 // -----------------------------------------------------------------------------
 // Static Comparator Function
 // -----------------------------------------------------------------------------
 // Replaces the C++ lambda used in qsort.
-static int compare_fd_entries(const void *a, const void *b) {
-  const tsdb_oldest_fd_entry_t *A = (const tsdb_oldest_fd_entry_t *)a;
-  const tsdb_oldest_fd_entry_t *B = (const tsdb_oldest_fd_entry_t *)b;
-  if (A->start_time < B->start_time)
-    return -1;
-  if (A->start_time > B->start_time)
-    return 1;
+static int compare_fd_entries(const void* a, const void* b) {
+  const tsdb_oldest_fd_entry_t* A = (const tsdb_oldest_fd_entry_t*)a;
+  const tsdb_oldest_fd_entry_t* B = (const tsdb_oldest_fd_entry_t*)b;
+  if (A->start_time < B->start_time) return -1;
+  if (A->start_time > B->start_time) return 1;
   return 0;
 }
 
@@ -93,11 +86,10 @@ static int compare_fd_entries(const void *a, const void *b) {
  * @return true if the expiration step succeeded or was not needed, false
  * otherwise.
  */
-bool timeseries_expiration_run(timeseries_db_t *db, float usage_threshold,
-                               float reduction_threshold) {
+bool timeseries_expiration_run(timeseries_db_t* db, float usage_threshold, float reduction_threshold) {
   // Validate arguments
-  if (!db || usage_threshold <= 0.0f || usage_threshold >= 1.0f ||
-      reduction_threshold <= 0.0f || reduction_threshold >= 1.0f) {
+  if (!db || usage_threshold <= 0.0f || usage_threshold >= 1.0f || reduction_threshold <= 0.0f ||
+      reduction_threshold >= 1.0f) {
     ESP_LOGE(TAG, "Invalid arguments to expiration_run");
     return false;
   }
@@ -108,8 +100,7 @@ bool timeseries_expiration_run(timeseries_db_t *db, float usage_threshold,
     ESP_LOGE(TAG, "Failed to get usage ratio");
     return false;
   }
-  ESP_LOGI(TAG, "Current usage=%.2f%%, threshold=%.2f%%", used_ratio * 100.0f,
-           usage_threshold * 100.0f);
+  ESP_LOGI(TAG, "Current usage=%.2f%%, threshold=%.2f%%", used_ratio * 100.0f, usage_threshold * 100.0f);
 
   if (used_ratio < usage_threshold) {
     // Nothing to do
@@ -121,18 +112,16 @@ bool timeseries_expiration_run(timeseries_db_t *db, float usage_threshold,
   //    e.g. if partition is 1 MB and reduction_threshold is 0.05,
   //    we aim to free 0.05 * 1MB = 50 KB.
   uint32_t partition_size = db->partition->size;
-  uint32_t bytes_to_free =
-      (uint32_t)((float)partition_size * reduction_threshold);
+  uint32_t bytes_to_free = (uint32_t)((float)partition_size * reduction_threshold);
   if (bytes_to_free == 0) {
     // If rounding caused it to be 0, just exit early or pick a minimum
     bytes_to_free = 1;
   }
-  ESP_LOGI(TAG,
-           "Target: freeing at least %u bytes (reduction_threshold=%.2f%%).",
-           (unsigned int)bytes_to_free, reduction_threshold * 100.0f);
+  ESP_LOGI(TAG, "Target: freeing at least %u bytes (reduction_threshold=%.2f%%).", (unsigned int)bytes_to_free,
+           reduction_threshold * 100.0f);
 
   // 3) Gather the 25 oldest (non-deleted) field-data entries by `start_time`
-  tsdb_oldest_fd_entry_t top25[25]; // static array for max-25
+  tsdb_oldest_fd_entry_t top25[25];  // static array for max-25
   memset(top25, 0, sizeof(top25));
   size_t found_count = 0;
 
@@ -177,7 +166,7 @@ bool timeseries_expiration_run(timeseries_db_t *db, float usage_threshold,
 /**
  * @brief Return usage as a fraction (0.0..1.0).
  */
-static bool get_usage_ratio(timeseries_db_t *db, float *out_ratio) {
+static bool get_usage_ratio(timeseries_db_t* db, float* out_ratio) {
   if (!db || !out_ratio) {
     return false;
   }
@@ -197,8 +186,7 @@ static bool get_usage_ratio(timeseries_db_t *db, float *out_ratio) {
  *
  * We'll define a few static inline helpers for clarity.
  * -------------------------------------------------------------------------- */
-static inline void swap_fd_entries(tsdb_oldest_fd_entry_t *a,
-                                   tsdb_oldest_fd_entry_t *b) {
+static inline void swap_fd_entries(tsdb_oldest_fd_entry_t* a, tsdb_oldest_fd_entry_t* b) {
   tsdb_oldest_fd_entry_t tmp = *a;
   *a = *b;
   *b = tmp;
@@ -207,7 +195,7 @@ static inline void swap_fd_entries(tsdb_oldest_fd_entry_t *a,
 /**
  * @brief Sift up a newly inserted node in a max-heap
  */
-static void heap_sift_up(tsdb_oldest_fd_entry_t *heap, size_t idx) {
+static void heap_sift_up(tsdb_oldest_fd_entry_t* heap, size_t idx) {
   while (idx > 0) {
     size_t parent = (idx - 1) / 2;
     if (heap[parent].start_time >= heap[idx].start_time) {
@@ -223,8 +211,7 @@ static void heap_sift_up(tsdb_oldest_fd_entry_t *heap, size_t idx) {
 /**
  * @brief Sift down the root in a max-heap
  */
-static void heap_sift_down(tsdb_oldest_fd_entry_t *heap, size_t count,
-                           size_t idx) {
+static void heap_sift_down(tsdb_oldest_fd_entry_t* heap, size_t count, size_t idx) {
   while (true) {
     size_t left = 2 * idx + 1;
     size_t right = 2 * idx + 2;
@@ -255,8 +242,7 @@ static void heap_sift_down(tsdb_oldest_fd_entry_t *heap, size_t count,
  * (start_time < largest), we pop the largest and insert the new entry.
  * If the new entry is newer than or equal to the largest, we do nothing.
  */
-static void heap_insert_max25(tsdb_oldest_fd_entry_t *heap, size_t *size,
-                              const tsdb_oldest_fd_entry_t *entry) {
+static void heap_insert_max25(tsdb_oldest_fd_entry_t* heap, size_t* size, const tsdb_oldest_fd_entry_t* entry) {
   // If we have fewer than 25, just push it
   if (*size < 25) {
     heap[*size] = *entry;
@@ -290,9 +276,7 @@ static void heap_insert_max25(tsdb_oldest_fd_entry_t *heap, size_t *size,
  * @param heap_25    [out] array of up to 25 entries (as a max-heap)
  * @param out_count  [out] how many entries were actually added
  */
-static bool gather_25_oldest_fielddata(timeseries_db_t *db,
-                                       tsdb_oldest_fd_entry_t *heap_25,
-                                       size_t *out_count) {
+static bool gather_25_oldest_fielddata(timeseries_db_t* db, tsdb_oldest_fd_entry_t* heap_25, size_t* out_count) {
   if (!db || !heap_25 || !out_count) {
     return false;
   }
@@ -309,16 +293,13 @@ static bool gather_25_oldest_fielddata(timeseries_db_t *db,
 
   // We'll iterate over every active field-data record, but
   // we only keep track of the 25 oldest in the max-heap.
-  while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &page_offset,
-                                             &page_size)) {
+  while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &page_offset, &page_size)) {
     // Check for an active field-data page
-    if (hdr.magic_number == TIMESERIES_MAGIC_NUM &&
-        hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
+    if (hdr.magic_number == TIMESERIES_MAGIC_NUM && hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
         hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE) {
       timeseries_fielddata_iterator_t f_iter;
-      if (!timeseries_fielddata_iterator_init(db, page_offset, page_size,
-                                              &f_iter)) {
-        continue; // skip
+      if (!timeseries_fielddata_iterator_init(db, page_offset, page_size, &f_iter)) {
+        continue;  // skip
       }
 
       timeseries_field_data_header_t fd_hdr;
@@ -358,19 +339,17 @@ static bool gather_25_oldest_fielddata(timeseries_db_t *db,
  * @param bytes_to_free   Target number of bytes to remove from use
  * @param modified_out    Collects the set of pages we changed
  */
-static void mark_entries_deleted(timeseries_db_t *db,
-                                 const tsdb_oldest_fd_entry_t *entries,
-                                 size_t count, uint32_t bytes_to_free,
-                                 tsdb_modified_pages_list_t *modified_out) {
+static void mark_entries_deleted(timeseries_db_t* db, const tsdb_oldest_fd_entry_t* entries, size_t count,
+                                 uint32_t bytes_to_free, tsdb_modified_pages_list_t* modified_out) {
   if (count == 0) {
     return;
   }
 
   // 1) Copy to a small array we can sort by ascending start_time
-  tsdb_oldest_fd_entry_t *sorted = calloc(count, sizeof(*sorted));
+  tsdb_oldest_fd_entry_t* sorted = calloc(count, sizeof(*sorted));
   if (!sorted) {
     ESP_LOGE(TAG, "OOM copying top-25 entries");
-    return; // fallback => do nothing
+    return;  // fallback => do nothing
   }
   memcpy(sorted, entries, count * sizeof(*sorted));
 
@@ -381,14 +360,13 @@ static void mark_entries_deleted(timeseries_db_t *db,
   uint32_t sum_freed = 0;
   for (size_t i = 0; i < count; i++) {
     if (sum_freed >= bytes_to_free) {
-      ESP_LOGI(TAG, "Freed %u bytes, which meets or exceeds the target %u.",
-               (unsigned int)sum_freed, (unsigned int)bytes_to_free);
+      ESP_LOGI(TAG, "Freed %u bytes, which meets or exceeds the target %u.", (unsigned int)sum_freed,
+               (unsigned int)bytes_to_free);
       break;
     }
     uint32_t record_hdr_abs = sorted[i].page_offset + sorted[i].record_offset;
     if (!mark_record_deleted(db, record_hdr_abs)) {
-      ESP_LOGW(TAG, "Failed marking record as deleted @0x%08" PRIx32,
-               record_hdr_abs);
+      ESP_LOGW(TAG, "Failed marking record as deleted @0x%08" PRIx32, record_hdr_abs);
       continue;
     }
 
@@ -416,13 +394,11 @@ static void mark_entries_deleted(timeseries_db_t *db,
  *
  * @return true on success, false on error
  */
-static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs) {
+static bool mark_record_deleted(timeseries_db_t* db, uint32_t record_hdr_abs) {
   timeseries_field_data_header_t fd_hdr;
-  esp_err_t err = esp_partition_read(db->partition, record_hdr_abs, &fd_hdr,
-                                     sizeof(fd_hdr));
+  esp_err_t err = esp_partition_read(db->partition, record_hdr_abs, &fd_hdr, sizeof(fd_hdr));
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed reading record header @0x%08" PRIx32 " (err=0x%x)",
-             record_hdr_abs, err);
+    ESP_LOGE(TAG, "Failed reading record header @0x%08" PRIx32 " (err=0x%x)", record_hdr_abs, err);
     return false;
   }
 
@@ -435,18 +411,14 @@ static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs) {
   // Clear the bit
   fd_hdr.flags &= ~(TSDB_FIELDDATA_FLAG_DELETED);
 
-  err = esp_partition_write(db->partition,
-                            record_hdr_abs +
-                                offsetof(timeseries_field_data_header_t, flags),
+  err = esp_partition_write(db->partition, record_hdr_abs + offsetof(timeseries_field_data_header_t, flags),
                             &fd_hdr.flags, sizeof(fd_hdr.flags));
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed clearing DELETED bit @0x%08" PRIx32 " (err=0x%x)",
-             record_hdr_abs, err);
+    ESP_LOGE(TAG, "Failed clearing DELETED bit @0x%08" PRIx32 " (err=0x%x)", record_hdr_abs, err);
     return false;
   }
 
-  ESP_LOGW(TAG, "Record @0x%08" PRIx32 " => DELETED bit cleared.",
-           record_hdr_abs);
+  ESP_LOGW(TAG, "Record @0x%08" PRIx32 " => DELETED bit cleared.", record_hdr_abs);
   return true;
 }
 
@@ -454,13 +426,13 @@ static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs) {
 // Modified Pages List
 // -----------------------------------------------------------------------------
 
-static void modified_pages_list_init(tsdb_modified_pages_list_t *list) {
+static void modified_pages_list_init(tsdb_modified_pages_list_t* list) {
   list->pages = NULL;
   list->used = 0;
   list->capacity = 0;
 }
 
-static void modified_pages_list_free(tsdb_modified_pages_list_t *list) {
+static void modified_pages_list_free(tsdb_modified_pages_list_t* list) {
   if (!list) {
     return;
   }
@@ -474,8 +446,7 @@ static void modified_pages_list_free(tsdb_modified_pages_list_t *list) {
  * @brief Ensure uniqueness of page_offset in the list, then append if not
  *        found.
  */
-static void modified_pages_list_add(tsdb_modified_pages_list_t *list,
-                                    uint32_t page_offset) {
+static void modified_pages_list_add(tsdb_modified_pages_list_t* list, uint32_t page_offset) {
   for (size_t i = 0; i < list->used; i++) {
     if (list->pages[i] == page_offset) {
       return;
@@ -483,8 +454,7 @@ static void modified_pages_list_add(tsdb_modified_pages_list_t *list,
   }
   if (list->used == list->capacity) {
     size_t newcap = (list->capacity == 0) ? 8 : list->capacity * 2;
-    uint32_t *grow =
-        (uint32_t *)realloc(list->pages, newcap * sizeof(uint32_t));
+    uint32_t* grow = (uint32_t*)realloc(list->pages, newcap * sizeof(uint32_t));
     if (!grow) {
       ESP_LOGE(TAG, "OOM growing modified_pages_list");
       return;

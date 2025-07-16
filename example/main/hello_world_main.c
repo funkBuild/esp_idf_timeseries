@@ -7,7 +7,7 @@
 
 #include "esp_timer.h"
 
-static const char *TAG = "example";
+static const char* TAG = "example";
 
 void example_query_weather_data(void) {
   // Build a timeseries_query_t for "weather"
@@ -18,16 +18,16 @@ void example_query_weather_data(void) {
   query.measurement_name = "weather";
 
   // 3) Tag filtering: same tags as inserted by app_main()
-  static const char *tag_keys[] = {"suburb", "city"};
-  static const char *tag_values[] = {"beldon", "perth"};
+  static const char* tag_keys[] = {"suburb", "city"};
+  static const char* tag_values[] = {"beldon", "perth"};
   query.tag_keys = tag_keys;
   query.tag_values = tag_values;
   query.num_tags = 2;
 
   // 4) Field filtering. If you set num_fields = 0, it means "ALL fields".
   //    But here, let's explicitly request the 3 known fields.
-  static const char *fields[] = {"temperature", "status", "device_id"};
-  query.field_names = fields; // fields;
+  static const char* fields[] = {"temperature", "status", "device_id"};
+  query.field_names = fields;  // fields;
   query.num_fields = 1;
 
   // 5) Limit: maximum total data points across all returned columns.
@@ -61,39 +61,33 @@ void example_query_weather_data(void) {
   }
 
   // Print the results
-  ESP_LOGI(TAG, "Query returned %u points and %u columns",
-           (unsigned)result.num_points, (unsigned)result.num_columns);
+  ESP_LOGI(TAG, "Query returned %u points and %u columns", (unsigned)result.num_points, (unsigned)result.num_columns);
 
   // Print timestamps first
   for (size_t r = 0; r < result.num_points; r++) {
-    ESP_LOGI(TAG, "Row %u: timestamp = %llu", (unsigned)r,
-             (unsigned long long)result.timestamps[r]);
+    ESP_LOGI(TAG, "Row %u: timestamp = %llu", (unsigned)r, (unsigned long long)result.timestamps[r]);
     // For each column, print the value
     for (size_t c = 0; c < result.num_columns; c++) {
-      timeseries_query_result_column_t *col = &result.columns[c];
-      timeseries_field_value_t *val = &col->values[r];
+      timeseries_query_result_column_t* col = &result.columns[c];
+      timeseries_field_value_t* val = &col->values[r];
 
       // Print the column name + value
       switch (val->type) {
-      case TIMESERIES_FIELD_TYPE_FLOAT:
-        ESP_LOGI(TAG, "  Column '%s': float=%.3f", col->name,
-                 val->data.float_val);
-        break;
-      case TIMESERIES_FIELD_TYPE_INT:
-        ESP_LOGI(TAG, "  Column '%s': int=%lld", col->name, val->data.int_val);
-        break;
-      case TIMESERIES_FIELD_TYPE_BOOL:
-        ESP_LOGI(TAG, "  Column '%s': bool=%s", col->name,
-                 val->data.bool_val ? "true" : "false");
-        break;
-      case TIMESERIES_FIELD_TYPE_STRING:
-        ESP_LOGI(TAG, "  Column '%s': string=%s", col->name,
-                 val->data.string_val.str);
-        break;
-      default:
-        ESP_LOGI(TAG, "  Column '%s': unknown/unsupported type %d", col->name,
-                 (int)val->type);
-        break;
+        case TIMESERIES_FIELD_TYPE_FLOAT:
+          ESP_LOGI(TAG, "  Column '%s': float=%.3f", col->name, val->data.float_val);
+          break;
+        case TIMESERIES_FIELD_TYPE_INT:
+          ESP_LOGI(TAG, "  Column '%s': int=%lld", col->name, val->data.int_val);
+          break;
+        case TIMESERIES_FIELD_TYPE_BOOL:
+          ESP_LOGI(TAG, "  Column '%s': bool=%s", col->name, val->data.bool_val ? "true" : "false");
+          break;
+        case TIMESERIES_FIELD_TYPE_STRING:
+          ESP_LOGI(TAG, "  Column '%s': string=%s", col->name, val->data.string_val.str);
+          break;
+        default:
+          ESP_LOGI(TAG, "  Column '%s': unknown/unsupported type %d", col->name, (int)val->type);
+          break;
       }
     }
   }
@@ -109,138 +103,86 @@ void app_main(void) {
     return;
   }
 
-  // example_query_weather_data();
-  // return;
+  // ------------------------------------------------------------------
+  // Constants shared by every write
+  // ------------------------------------------------------------------
+  const char* tag_keys[] = {"suburb", "city"};
+  const char* tag_values[] = {"beldon", "perth"};
+  const size_t NUM_TAGS = 2;
 
-  // Common tags & field definitions
-  const char *tags_keys[] = {"suburb", "city"};
-  const char *tags_values[] = {"beldon", "perth"};
-  size_t num_tags = 2;
+  const char* field_names[] = {"temperature", "status", "device_id"};
+  const size_t NUM_FIELDS = 3;
 
-  const char *field_names[] = {"temperature", "status", "device_id"};
-  size_t num_fields = 3;
+  // ------------------------------------------------------------------
+  // Continuous writer – 10 points every cycle, forever
+  // ------------------------------------------------------------------
+  static const size_t BATCH_N = 10;
+  static const uint32_t WRITE_PERIOD_MS = 10;  // 30 s
 
-  // ---------------------------------------------------------
-  // First batch of data (10 points) inserted just once
-  // ---------------------------------------------------------
-  {
-    const size_t NUM_POINTS_1 = 10;
-    uint64_t timestamps1[NUM_POINTS_1];
-    // We need 'num_fields * NUM_POINTS_1' field values, in row-major form:
-    // field_values[ field_index * num_points + point_index ]
-    timeseries_field_value_t field_values1[num_fields * NUM_POINTS_1];
-
-    // Fill the arrays for i in [0..9]
-    for (size_t i = 0; i < NUM_POINTS_1; i++) {
-      timestamps1[i] = 1737381864000ULL + i; // some fake epoch ms
-
-      // Field 0: "temperature" (float)
-      size_t idx_temp = 0 * NUM_POINTS_1 + i;
-      field_values1[idx_temp].type = TIMESERIES_FIELD_TYPE_FLOAT;
-      field_values1[idx_temp].data.float_val = 1.23f * (float)i;
-
-      // Field 1: "status" (bool)
-      size_t idx_status = 1 * NUM_POINTS_1 + i;
-      field_values1[idx_status].type = TIMESERIES_FIELD_TYPE_BOOL;
-      field_values1[idx_status].data.bool_val = ((int)i % 2 == 0);
-
-      // Field 2: "device_id" (int)
-      size_t idx_device = 2 * NUM_POINTS_1 + i;
-      field_values1[idx_device].type = TIMESERIES_FIELD_TYPE_INT;
-      field_values1[idx_device].data.int_val = (int)i * 4;
-    }
-
-    // Prepare the insert descriptor
-    timeseries_insert_data_t insert_data1 = {
-        .measurement_name = "weather",
-        .tag_keys = tags_keys,
-        .tag_values = tags_values,
-        .num_tags = num_tags,
-
-        .field_names = field_names,
-        .field_values = field_values1,
-        .num_fields = num_fields,
-
-        .timestamps_ms = timestamps1,
-        .num_points = NUM_POINTS_1,
-    };
-
-    if (!timeseries_insert(&insert_data1)) {
-      ESP_LOGE(TAG, "First multi-point insert failed!");
-      return;
-    }
-    ESP_LOGI(TAG, "First batch of 10 data points inserted successfully.");
-
-    // Optionally do a compaction pass here
-    ESP_LOGI(TAG, "Starting initial compaction...");
-    if (!timeseries_compact()) {
-      ESP_LOGE(TAG, "Timeseries compaction failed!");
-    } else {
-      ESP_LOGI(TAG, "Initial compaction finished successfully.");
-    }
-  }
-
-  // ---------------------------------------------------------
-  // 2) Continuously write new data points every 30 seconds
-  // ---------------------------------------------------------
-  ESP_LOGI(TAG, "Now continuously writing new points every 30 seconds...");
-
-  // We'll keep an incrementing index to vary the data
-  uint64_t base_ts = 1737381865000ULL; // arbitrary start
-  size_t i = 0;
+  uint64_t last_ts = 1737381865010ULL;  // strictly > last point above
+  uint64_t inserted_values = 0;         // for logging
+  size_t batch_no = 0;
+  float prev_value = 0.0f;  // for temperature field
 
   for (;;) {
-    // Wait 30 seconds between each write
-    vTaskDelay(pdMS_TO_TICKS(1));
+    vTaskDelay(pdMS_TO_TICKS(WRITE_PERIOD_MS));
 
-    // Build a single point (timestamp + 3 fields)
-    unsigned int random_increment = (rand() % 10000) + 50000;
-    base_ts += random_increment;
+    /* --- build one batch of 10 points --- */
+    uint64_t timestamps[BATCH_N];
+    timeseries_field_value_t field_values[NUM_FIELDS * BATCH_N];
 
-    timeseries_field_value_t single_point_fields[3];
+    for (size_t i = 0; i < BATCH_N; i++) {
+      /*  Guarantee monotonic, non-overlapping timestamps:
+          - leave a small random gap in front of each batch,
+          - then step 1 ms per point inside the batch.
+      */
+      if (i == 0) {
+        uint32_t gap = (rand() % 100) + 1;  // 1-100 ms
+        last_ts += gap;
+      } else {
+        last_ts += 1;  // 1 ms apart in-batch
+      }
+      timestamps[i] = last_ts;
 
-    // Field 0: temperature
-    single_point_fields[0].type = TIMESERIES_FIELD_TYPE_FLOAT;
-    single_point_fields[0].data.float_val = 0.5f * i;
+      /* Field 0: temperature (float) */
+      size_t idx_temp = 0 * BATCH_N + i;
+      field_values[idx_temp].type = TIMESERIES_FIELD_TYPE_FLOAT;
+      // add random small amount to prev_value
+      prev_value += ((rand() % 100) / 100.0f) - 0.5f;  // random float in [-0.5, +0.5]
+      field_values[idx_temp].data.float_val = prev_value;
 
-    // Field 1: status (bool)
-    single_point_fields[1].type = TIMESERIES_FIELD_TYPE_BOOL;
-    single_point_fields[1].data.bool_val = (i % 2 == 0);
+      /* Field 1: status (bool) */
+      size_t idx_status = 1 * BATCH_N + i;
+      field_values[idx_status].type = TIMESERIES_FIELD_TYPE_FLOAT;
+      field_values[idx_status].data.bool_val = prev_value;
 
-    // Field 2: device_id (int)
-    single_point_fields[2].type = TIMESERIES_FIELD_TYPE_INT;
-    single_point_fields[2].data.int_val = (int)(100 + random_increment);
+      /* Field 2: device_id (int) */
+      size_t idx_dev = 2 * BATCH_N + i;
+      field_values[idx_dev].type = TIMESERIES_FIELD_TYPE_FLOAT;
+      field_values[idx_dev].data.int_val = prev_value;
+    }
 
-    // Prepare insert descriptor for 1 point
-    timeseries_insert_data_t insert_data = {
+    timeseries_insert_data_t insert = {
         .measurement_name = "weather",
-        .tag_keys = tags_keys,
-        .tag_values = tags_values,
-        .num_tags = num_tags,
+        .tag_keys = tag_keys,
+        .tag_values = tag_values,
+        .num_tags = NUM_TAGS,
 
         .field_names = field_names,
-        .field_values = single_point_fields,
-        .num_fields = num_fields,
+        .field_values = field_values,
+        .num_fields = NUM_FIELDS,
 
-        .timestamps_ms = &base_ts,
-        .num_points = 1, // single point
+        .timestamps_ms = timestamps,
+        .num_points = BATCH_N,
     };
 
-    if (!timeseries_insert(&insert_data)) {
-      ESP_LOGE(TAG, "Failed to insert single-point data (i=%u)!", (unsigned)i);
+    if (!timeseries_insert(&insert)) {
+      ESP_LOGE(TAG, "Failed to insert %u-point batch #%u!", (unsigned)BATCH_N, (unsigned)batch_no);
+    } else {
+      inserted_values += 3 * BATCH_N;
 
-      while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-      }
+      ESP_LOGI(TAG, "Batch #%u inserted, total points %llu", (unsigned)batch_no, inserted_values);
     }
-
-    if (i % 100 == 0) {
-      ESP_LOGE(TAG, "Inserted point #%u at time=%llu ms", (unsigned)i,
-               (unsigned long long)base_ts);
-
-      timeseries_expire();
-    }
-
-    i++;
+    batch_no++;
   }
 }

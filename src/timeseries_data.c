@@ -2,7 +2,7 @@
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "mbedtls/md5.h"
-#include "timeseries_compaction.h" // for timeseries_compact_level0_pages()
+#include "timeseries_compaction.h"
 #include "timeseries_internal.h"
 #include "timeseries_iterator.h"
 #include "timeseries_page_cache.h"
@@ -11,39 +11,32 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *TAG = "TimeseriesData";
+static const char* TAG = "TimeseriesData";
 
 // Forward declarations
-static bool find_level0_page_with_space(timeseries_db_t *db,
-                                        size_t bytes_needed,
-                                        bool *out_any_l0_exists,
-                                        uint32_t *out_page_offset,
-                                        uint32_t *out_used_offset);
-static bool create_level0_field_page(timeseries_db_t *db, uint32_t *out_offset);
+static bool find_level0_page_with_space(timeseries_db_t* db, size_t bytes_needed, bool* out_any_l0_exists,
+                                        uint32_t* out_page_offset, uint32_t* out_used_offset);
+static bool create_level0_field_page(timeseries_db_t* db, uint32_t* out_offset);
 
 // Writes a multi-point record: [field_data_header_t + data].
-static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
-                                 uint32_t used_offset,
-                                 const unsigned char series_id[16],
-                                 const uint64_t *timestamps,
-                                 const timeseries_field_value_t *vals,
-                                 size_t npoints);
+static bool write_points_to_page(timeseries_db_t* db, uint32_t page_offset, uint32_t used_offset,
+                                 const unsigned char series_id[16], const uint64_t* timestamps,
+                                 const timeseries_field_value_t* vals, size_t npoints);
 
 /**
  * @brief Returns the uncompressed size for a single field value (in a column).
  */
 
-static size_t
-field_value_uncompressed_size(const timeseries_field_value_t *val) {
+static size_t field_value_uncompressed_size(const timeseries_field_value_t* val) {
   switch (val->type) {
-  case TIMESERIES_FIELD_TYPE_FLOAT:
-  case TIMESERIES_FIELD_TYPE_INT:
-    return 8; // store as 8-byte double or int64
-  case TIMESERIES_FIELD_TYPE_BOOL:
-    return 1; // store as 0/1
-  case TIMESERIES_FIELD_TYPE_STRING:
-    // store a 4-byte length + the string data
-    return 4 + val->data.string_val.length;
+    case TIMESERIES_FIELD_TYPE_FLOAT:
+    case TIMESERIES_FIELD_TYPE_INT:
+      return 8;  // store as 8-byte double or int64
+    case TIMESERIES_FIELD_TYPE_BOOL:
+      return 1;  // store as 0/1
+    case TIMESERIES_FIELD_TYPE_STRING:
+      // store a 4-byte length + the string data
+      return 4 + val->data.string_val.length;
   }
   return 0;
 }
@@ -52,38 +45,36 @@ field_value_uncompressed_size(const timeseries_field_value_t *val) {
  * @brief Write the uncompressed value into `out_buf` (which must be big
  * enough). Returns how many bytes were written.
  */
-static size_t
-field_value_write_uncompressed(const timeseries_field_value_t *val,
-                               uint8_t *out_buf) {
+static size_t field_value_write_uncompressed(const timeseries_field_value_t* val, uint8_t* out_buf) {
   size_t written = 0;
   switch (val->type) {
-  case TIMESERIES_FIELD_TYPE_FLOAT: {
-    double d = (double)val->data.float_val;
-    memcpy(out_buf, &d, 8);
-    written = 8;
-    break;
-  }
-  case TIMESERIES_FIELD_TYPE_INT: {
-    int64_t i64 = (int64_t)val->data.int_val;
-    memcpy(out_buf, &i64, 8);
-    written = 8;
-    break;
-  }
-  case TIMESERIES_FIELD_TYPE_BOOL: {
-    out_buf[0] = val->data.bool_val ? 1 : 0;
-    written = 1;
-    break;
-  }
-  case TIMESERIES_FIELD_TYPE_STRING: {
-    uint32_t len = (uint32_t)val->data.string_val.length;
-    memcpy(out_buf, &len, 4);
-    written = 4;
-    if (len > 0) {
-      memcpy(out_buf + 4, val->data.string_val.str, len);
-      written += len;
+    case TIMESERIES_FIELD_TYPE_FLOAT: {
+      double d = (double)val->data.float_val;
+      memcpy(out_buf, &d, 8);
+      written = 8;
+      break;
     }
-    break;
-  }
+    case TIMESERIES_FIELD_TYPE_INT: {
+      int64_t i64 = (int64_t)val->data.int_val;
+      memcpy(out_buf, &i64, 8);
+      written = 8;
+      break;
+    }
+    case TIMESERIES_FIELD_TYPE_BOOL: {
+      out_buf[0] = val->data.bool_val ? 1 : 0;
+      written = 1;
+      break;
+    }
+    case TIMESERIES_FIELD_TYPE_STRING: {
+      uint32_t len = (uint32_t)val->data.string_val.length;
+      memcpy(out_buf, &len, 4);
+      written = 4;
+      if (len > 0) {
+        memcpy(out_buf + 4, val->data.string_val.str, len);
+        written += len;
+      }
+      break;
+    }
   }
   return written;
 }
@@ -98,11 +89,8 @@ field_value_write_uncompressed(const timeseries_field_value_t *val,
  *   (npoints * 8 for timestamps) +
  *   sum of uncompressed sizes of all values.
  */
-static size_t
-calc_bytes_needed_for_npoints_columnar(size_t npoints,
-                                       const timeseries_field_value_t *vals) {
-  size_t overhead = sizeof(timeseries_field_data_header_t) +
-                    sizeof(timeseries_col_data_header_t);
+static size_t calc_bytes_needed_for_npoints_columnar(size_t npoints, const timeseries_field_value_t* vals) {
+  size_t overhead = sizeof(timeseries_field_data_header_t) + sizeof(timeseries_col_data_header_t);
 
   // Timestamps always 8 bytes each
   size_t timestamps_sz = npoints * 8;
@@ -121,19 +109,15 @@ calc_bytes_needed_for_npoints_columnar(size_t npoints,
  *        splitting if needed. If none exist, create a new L0 page.
  *        If all are full, run compaction, then create a new page.
  */
-bool tsdb_append_multiple_points(timeseries_db_t *db,
-                                 const unsigned char series_id[16],
-                                 const uint64_t *timestamps,
-                                 const timeseries_field_value_t *values,
-                                 size_t count) {
+bool tsdb_append_multiple_points(timeseries_db_t* db, const unsigned char series_id[16], const uint64_t* timestamps,
+                                 const timeseries_field_value_t* values, size_t count) {
   if (!db || !series_id || !timestamps || !values || (count == 0)) {
     ESP_LOGE(TAG, "Invalid arguments to tsdb_append_multiple_points.");
     return false;
   }
 
-  ESP_LOGV(TAG,
-           "tsdb_append_multiple_points: series=%.2X%.2X%.2X%.2X..., count=%zu",
-           series_id[0], series_id[1], series_id[2], series_id[3], count);
+  ESP_LOGV(TAG, "tsdb_append_multiple_points: series=%.2X%.2X%.2X%.2X..., count=%zu", series_id[0], series_id[1],
+           series_id[2], series_id[3], count);
 
   size_t remaining = count;
   size_t idx = 0;
@@ -142,20 +126,16 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
     size_t npoints_possible = remaining;
 
     while (npoints_possible > 0) {
-      size_t bytes_needed = calc_bytes_needed_for_npoints_columnar(
-          npoints_possible, values + idx);
+      size_t bytes_needed = calc_bytes_needed_for_npoints_columnar(npoints_possible, values + idx);
 
       bool any_l0_exists = false;
       uint32_t page_offset = 0, used_offset = 0;
 
-      if (find_level0_page_with_space(db, bytes_needed, &any_l0_exists,
-                                      &page_offset, &used_offset)) {
+      if (find_level0_page_with_space(db, bytes_needed, &any_l0_exists, &page_offset, &used_offset)) {
         // We have space => write
-        if (!write_points_to_page(db, page_offset, used_offset, series_id,
-                                  timestamps + idx, values + idx,
+        if (!write_points_to_page(db, page_offset, used_offset, series_id, timestamps + idx, values + idx,
                                   npoints_possible)) {
-          ESP_LOGE(TAG, "Failed writing points to L0=0x%08" PRIx32,
-                   page_offset);
+          ESP_LOGE(TAG, "Failed writing points to L0=0x%08" PRIx32, page_offset);
           return false;
         }
         idx += npoints_possible;
@@ -179,8 +159,8 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
             // can't store even 1 => compaction + new L0
             ESP_LOGV(TAG, "All L0 full => compaction + new page.");
             if (!timeseries_compact_all_levels(db)) {
-              ESP_LOGE(TAG, "Compaction failed, can't proceed.");
-              return false;
+              ESP_LOGE(TAG, "Compaction failed,");
+              // We can continue here as long as we can create a new L0 page
             }
             uint32_t new_page_offset = 0;
             if (!create_level0_field_page(db, &new_page_offset)) {
@@ -194,13 +174,13 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
           }
         }
       }
-    } // end while (npoints_possible > 0)
+    }  // end while (npoints_possible > 0)
 
     if (npoints_possible == 0) {
       ESP_LOGE(TAG, "Unable to store any points. Out of space?");
       return false;
     }
-  } // end while (remaining > 0)
+  }  // end while (remaining > 0)
 
   ESP_LOGV(TAG, "Successfully appended all %zu points to L0 pages", count);
   return true;
@@ -209,11 +189,8 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
 /**
  * @brief Finds or creates an L0 page that has enough space for `bytes_needed`.
  */
-static bool find_level0_page_with_space(timeseries_db_t *db,
-                                        size_t bytes_needed,
-                                        bool *out_any_l0_exists,
-                                        uint32_t *out_page_offset,
-                                        uint32_t *out_used_offset) {
+static bool find_level0_page_with_space(timeseries_db_t* db, size_t bytes_needed, bool* out_any_l0_exists,
+                                        uint32_t* out_page_offset, uint32_t* out_used_offset) {
   if (!db || !out_any_l0_exists || !out_page_offset || !out_used_offset) {
     return false;
   }
@@ -225,16 +202,13 @@ static bool find_level0_page_with_space(timeseries_db_t *db,
   // ---------------------------------------
   if (db->last_l0_cache_valid) {
     timeseries_page_header_t hdr;
-    esp_err_t err = esp_partition_read(db->partition, db->last_l0_page_offset,
-                                       &hdr, sizeof(hdr));
+    esp_err_t err = esp_partition_read(db->partition, db->last_l0_page_offset, &hdr, sizeof(hdr));
     if (err == ESP_OK) {
       // Confirm the cached page is still a valid, active L0 field-data page
-      if (hdr.magic_number == TIMESERIES_MAGIC_NUM &&
-          hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
-          hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE &&
-          hdr.field_data_level == 0) {
-        *out_any_l0_exists = true;          // At least one L0 page exists
-        uint32_t page_size = hdr.page_size; // from the header
+      if (hdr.magic_number == TIMESERIES_MAGIC_NUM && hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
+          hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE && hdr.field_data_level == 0) {
+        *out_any_l0_exists = true;           // At least one L0 page exists
+        uint32_t page_size = hdr.page_size;  // from the header
         uint32_t free_space = page_size - db->last_l0_used_offset;
 
         if (free_space >= bytes_needed) {
@@ -262,20 +236,16 @@ static bool find_level0_page_with_space(timeseries_db_t *db,
   timeseries_page_header_t hdr;
   uint32_t page_offset = 0, page_size = 0;
 
-  while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &page_offset,
-                                             &page_size)) {
-    if (hdr.magic_number == TIMESERIES_MAGIC_NUM &&
-        hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
-        hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE &&
-        hdr.field_data_level == 0) {
-      *out_any_l0_exists = true; // We have at least one L0 page
+  while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &page_offset, &page_size)) {
+    if (hdr.magic_number == TIMESERIES_MAGIC_NUM && hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
+        hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE && hdr.field_data_level == 0) {
+      *out_any_l0_exists = true;  // We have at least one L0 page
 
       // Determine how many bytes have been used in this L0 page
       // by iterating its field-data records (the existing method):
       timeseries_fielddata_iterator_t f_iter;
-      if (!timeseries_fielddata_iterator_init(db, page_offset, page_size,
-                                              &f_iter)) {
-        continue; // skip on error
+      if (!timeseries_fielddata_iterator_init(db, page_offset, page_size, &f_iter)) {
+        continue;  // skip on error
       }
 
       uint32_t last_offset = sizeof(timeseries_page_header_t);
@@ -308,8 +278,7 @@ static bool find_level0_page_with_space(timeseries_db_t *db,
  * @brief Creates a new L0 page using the blank iterator to find space.
  */
 
-static bool create_level0_field_page(timeseries_db_t *db,
-                                     uint32_t *out_offset) {
+static bool create_level0_field_page(timeseries_db_t* db, uint32_t* out_offset) {
   if (!db || !db->partition || !out_offset) {
     return false;
   }
@@ -325,10 +294,8 @@ static bool create_level0_field_page(timeseries_db_t *db,
 
   uint32_t blank_offset = 0;
   uint32_t blank_length = 0;
-  if (!timeseries_blank_iterator_next(&blank_iter, &blank_offset,
-                                      &blank_length)) {
-    ESP_LOGW(TAG, "No blank region found to create L0 page (size=%u).",
-             (unsigned int)l0_size);
+  if (!timeseries_blank_iterator_next(&blank_iter, &blank_offset, &blank_length)) {
+    ESP_LOGW(TAG, "No blank region found to create L0 page (size=%u).", (unsigned int)l0_size);
     return false;
   }
 
@@ -337,9 +304,10 @@ static bool create_level0_field_page(timeseries_db_t *db,
     return false;
   }
 
+  ESP_LOGW(TAG, "Found blank region @0x%08" PRIx32 " (length=%" PRIu32 " bytes).", blank_offset, blank_length);
+
   // 2) Erase it
-  esp_err_t err =
-      esp_partition_erase_range(db->partition, blank_offset, l0_size);
+  esp_err_t err = esp_partition_erase_range(db->partition, blank_offset, l0_size);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to erase region for L0 page (err=0x%x)", err);
     return false;
@@ -355,16 +323,14 @@ static bool create_level0_field_page(timeseries_db_t *db,
   new_hdr.field_data_level = 0;
   new_hdr.page_size = l0_size;
 
-  err = esp_partition_write(db->partition, blank_offset, &new_hdr,
-                            sizeof(new_hdr));
+  err = esp_partition_write(db->partition, blank_offset, &new_hdr, sizeof(new_hdr));
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to write L0 header (err=0x%x)", err);
     return false;
   }
 
   *out_offset = blank_offset;
-  ESP_LOGV(TAG, "Created new level-0 page @0x%08" PRIx32 " (size=%u bytes).",
-           blank_offset, (unsigned int)l0_size);
+  ESP_LOGV(TAG, "Created new level-0 page @0x%08" PRIx32 " (size=%u bytes).", blank_offset, (unsigned int)l0_size);
 
   // 4) Update the page cache system
   tsdb_pagecache_add_entry(db, blank_offset, &new_hdr);
@@ -382,12 +348,9 @@ static bool create_level0_field_page(timeseries_db_t *db,
  * timeseries_field_data_header_t, storing how many bytes follow in
  * 'record_length'.
  */
-static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
-                                 uint32_t used_offset,
-                                 const unsigned char series_id[16],
-                                 const uint64_t *timestamps,
-                                 const timeseries_field_value_t *vals,
-                                 size_t npoints) {
+static bool write_points_to_page(timeseries_db_t* db, uint32_t page_offset, uint32_t used_offset,
+                                 const unsigned char series_id[16], const uint64_t* timestamps,
+                                 const timeseries_field_value_t* vals, size_t npoints) {
   // 1) Prepare the field_data_header
   timeseries_field_data_header_t fhdr;
   memset(&fhdr, 0xff, sizeof(fhdr));
@@ -412,16 +375,10 @@ static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
   col_hdr.val_len = (uint16_t)val_size;
 
   size_t total_col_data = sizeof(col_hdr) + ts_size + val_size;
-  if (total_col_data > 0xFFFF) {
-    ESP_LOGE(TAG,
-             "Record too big for 16-bit field_data_header.record_length: %zu",
-             total_col_data);
-    return false;
-  }
-  fhdr.record_length = (uint16_t)total_col_data;
+  fhdr.record_length = (uint32_t)total_col_data;
 
   // 3) Allocate a buffer for [col_hdr + timestamps + values]
-  uint8_t *col_buf = (uint8_t *)malloc(total_col_data);
+  uint8_t* col_buf = (uint8_t*)malloc(total_col_data);
   if (!col_buf) {
     return false;
   }
@@ -435,14 +392,12 @@ static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
   buf_offset += ts_size;
 
   for (size_t i = 0; i < npoints; i++) {
-    buf_offset +=
-        field_value_write_uncompressed(&vals[i], col_buf + buf_offset);
+    buf_offset += field_value_write_uncompressed(&vals[i], col_buf + buf_offset);
   }
 
   // 5) Write fhdr + col_buf to flash
   uint32_t write_addr = page_offset + used_offset;
-  esp_err_t err =
-      esp_partition_write(db->partition, write_addr, &fhdr, sizeof(fhdr));
+  esp_err_t err = esp_partition_write(db->partition, write_addr, &fhdr, sizeof(fhdr));
   if (err != ESP_OK) {
     free(col_buf);
     return false;
@@ -462,8 +417,7 @@ static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
     db->last_l0_used_offset = used_offset + sizeof(fhdr) + fhdr.record_length;
   }
 
-  ESP_LOGV(TAG, "Wrote %zu pts @0x%08" PRIx32 " -> next=0x%08" PRIx32, npoints,
-           (page_offset + used_offset),
+  ESP_LOGV(TAG, "Wrote %zu pts @0x%08" PRIx32 " -> next=0x%08" PRIx32, npoints, (page_offset + used_offset),
            (page_offset + used_offset + sizeof(fhdr) + fhdr.record_length));
 
   return true;

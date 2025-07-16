@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <float.h>
+#include "timeseries.h"
 /*
  * Existing field/value types:
  *
@@ -179,11 +180,32 @@ static timeseries_field_value_t finalize_aggregator(timeseries_aggregation_metho
       }
 
       break;
+    case TSDB_AGGREGATION_COUNT:
+      // Count always produces an int, even if last_val was float or string.
+      result.type = TIMESERIES_FIELD_TYPE_INT;
+      result.data.int_val = (int64_t)count;  // watch for overflow
+      break;
 
-    case TSDB_AGGREGATION_NONE:
-      // By convention, treat as SUM
-      // (you could do something else for "none")
-      /* fallthrough */
+    case TSDB_AGGREGATION_LATEST:
+      // Latest always returns the last_val as-is, even if it's a string or
+      // a bool/int. We already handled this above, so just return it.
+      result = *last_val;
+      break;
+
+    case TSDB_AGGREGATION_SUM:
+      // Sum always produces a float, even if last_val was int or bool.
+      // If last_val was int or bool, we produce an int sum (0 or 1 for bool).
+      // Otherwise float sum.
+      if (last_val->type == TIMESERIES_FIELD_TYPE_INT || last_val->type == TIMESERIES_FIELD_TYPE_BOOL) {
+        int64_t sum_as_int = (int64_t)accumulator;  // watch for overflow
+        result.type = TIMESERIES_FIELD_TYPE_INT;
+        result.data.int_val = sum_as_int;
+      } else {
+        result.type = TIMESERIES_FIELD_TYPE_FLOAT;
+        result.data.float_val = accumulator;
+      }
+      break;
+
     default:
       // Summation
       // If last_val was int or bool, produce an int sum (0 or 1 for bool).

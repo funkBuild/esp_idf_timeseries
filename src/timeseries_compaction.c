@@ -24,22 +24,8 @@
 
 static const char* TAG = "TimeseriesCompaction";
 
-/**
- * @brief Minimum number of pages needed at a level before compaction occurs.
- */
-#define MIN_PAGES_FOR_COMPACTION 4
-
-/**
- * @brief Maximum level we support in ascending compaction. Adjust as needed.
- */
-#define TSDB_MAX_LEVEL 4
-
-// -----------------------------------------------------------------------------
-// Forward Declarations
-// -----------------------------------------------------------------------------
-
-static bool tsdb_find_level_pages(timeseries_db_t* db, uint8_t source_level, tsdb_level_page_t** out_pages,
-                                  size_t* out_count);
+static bool tsdb_find_level_pages(timeseries_db_t* db, uint8_t source_level, size_t max_pages,
+                                  tsdb_level_page_t** out_pages, size_t* out_count, size_t* out_total_pages);
 
 static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t source_level,
                                                const tsdb_level_page_t* pages, size_t page_count);
@@ -91,67 +77,48 @@ bool timeseries_compact_all_levels(timeseries_db_t* db) {
     return false;
   }
 
-  /**
-   * For each level from 0 up to TSDB_MAX_LEVEL-1, attempt compaction
-   * from that level to the next (level+1).
-   *
-   * We always do them in ascending order so that if compaction of L0→L1
-   * creates multiple L1 pages, the L1→L2 step can then run, and so on.
-   */
-  for (uint8_t from_level = 0; from_level < TSDB_MAX_LEVEL; from_level++) {
-    uint8_t to_level = (uint8_t)(from_level + 1);
+  static const size_t PAGES_PER_COMPACT = 4;
 
-    // 1) Figure out how many pages are at `from_level`
-    tsdb_level_page_t* pages = NULL;
-    size_t page_count = 0;
-    if (!tsdb_find_level_pages(db, from_level, &pages, &page_count)) {
-      // If we fail to even list pages, treat as an error
-      free(pages);
-      ESP_LOGE(TAG, "Failed listing pages at level %u", from_level);
-      return false;
+  for (uint8_t from_lvl = 0; from_lvl < TSDB_MAX_LEVEL; ++from_lvl) {
+    const uint8_t to_lvl = (uint8_t)(from_lvl + 1);
+
+    while (true) {
+      tsdb_level_page_t* pages = NULL;
+      size_t subset_cnt = 0;
+      size_t total_at_lvl = 0;
+
+      if (!tsdb_find_level_pages(db, from_lvl, PAGES_PER_COMPACT, &pages, &subset_cnt, &total_at_lvl)) {
+        ESP_LOGE(TAG, "Failed enumerating pages at L%u", from_lvl);
+        free(pages);
+        return false;
+      }
+
+      /* subset_cnt is the amount of pages found that can be compacted */
+      if (subset_cnt < MIN_PAGES_FOR_COMPACTION) {
+        free(pages);
+        break; /* Move on to next level. */
+      }
+
+      free(pages); /* pages were only informational here */
+
+      int64_t t0 = esp_timer_get_time();
+      if (!timeseries_compact_level_pages(db, from_lvl, to_lvl)) {
+        ESP_LOGE(TAG, "Compaction L%u→L%u failed – aborting further work", from_lvl, to_lvl);
+        break; /* Stop trying this level.            */
+      }
+      int64_t t1 = esp_timer_get_time();
+      ESP_LOGI(TAG, "Compaction L%u→L%u (batch of %zu) took %.3f ms", from_lvl, to_lvl, PAGES_PER_COMPACT,
+               (t1 - t0) / 1000.0);
+
+      /* Loop again: if ≥ MIN_PAGES_FOR_COMPACTION still remain,
+       * we’ll compact the next batch of 4.
+       */
     }
-
-    // If no pages or fewer than MIN_PAGES_FOR_COMPACTION, skip compaction
-    if (page_count < MIN_PAGES_FOR_COMPACTION) {
-      free(pages);
-      ESP_LOGV(TAG, "Level-%u has %zu page(s), below threshold=%d => skip", from_level, page_count,
-               MIN_PAGES_FOR_COMPACTION);
-      continue;
-    }
-    free(pages);
-
-    int64_t start_time = esp_timer_get_time();
-
-    // 2) We have enough pages => do the actual compaction
-    if (!timeseries_compact_level_pages(db, from_level, to_level)) {
-      ESP_LOGE(TAG, "Compaction from level %u to %u failed.", from_level, to_level);
-      // Decide if you want to continue or break on failure
-      return false;
-    }
-
-    int64_t end_time = esp_timer_get_time();
-    ESP_LOGI(TAG, "Compaction from level %u to %u took %.3f ms", from_level, to_level,
-             (end_time - start_time) / 1000.0);
   }
 
-  // Count the highest level for debug
-  tsdb_level_page_t* pages = NULL;
-  size_t page_count = 0;
-
-  if (!tsdb_find_level_pages(db, 4, &pages, &page_count)) {
-    // If we fail to even list pages, treat as an error
-    free(pages);
-    ESP_LOGE(TAG, "Failed listing pages at level %u", 4);
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Highest level has %zu page(s)", page_count);
-
-  uint32_t partition_size = db->partition->size;
-  uint32_t used_space = tsdb_pagecache_get_total_active_size(db);
-  ESP_LOGI(TAG, "Total used space: %u, %f", (unsigned int)(used_space / 1024), 100.0f * used_space / partition_size);
-
-  free(pages);
+  uint32_t part_sz = db->partition->size;
+  uint32_t used_sz = tsdb_pagecache_get_total_active_size(db);
+  ESP_LOGI(TAG, "Used space: %u KiB (%.2f %%)", (unsigned)(used_sz / 1024), 100.0f * used_sz / part_sz);
 
   return true;
 }
@@ -281,17 +248,21 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
   if (!db) {
     return false;
   }
+
   ESP_LOGV(TAG, "Starting compaction from level=%u to level=%u ...", from_level, to_level);
 
   // 1) Find all active pages at `from_level`.
+  static const size_t PAGES_PER_COMPACT = 4;
   tsdb_level_page_t* pages = NULL;
-  size_t page_count = 0;
-  if (!tsdb_find_level_pages(db, from_level, &pages, &page_count)) {
+  size_t total_pages = 0;  // Total pages at `from_level` (not just those to compact)
+  size_t subset_cnt = 0;   // Number of pages to compact (subset of total_pages)
+  if (!tsdb_find_level_pages(db, from_level, PAGES_PER_COMPACT, /* cap */
+                             &pages, &subset_cnt, &total_pages)) {
     return false;
   }
-  if (page_count < MIN_PAGES_FOR_COMPACTION) {
+  if (subset_cnt < MIN_PAGES_FOR_COMPACTION) {
     // skip
-    ESP_LOGV(TAG, "Level-%u has only %zu pages => skip", from_level, page_count);
+    ESP_LOGV(TAG, "Level-%u has only %zu pages => skip", from_level, subset_cnt);
     free(pages);
     return true;
   }
@@ -312,7 +283,7 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
     // (A) Gather all unique series IDs from L0
     tsdb_series_id_list_t uniq_ids;
     memset(&uniq_ids, 0, sizeof(uniq_ids));
-    if (!gather_unique_series_ids(db, pages, page_count, &uniq_ids)) {
+    if (!gather_unique_series_ids(db, pages, subset_cnt, &uniq_ids)) {
       ESP_LOGE(TAG, "Failed gathering unique series IDs");
       free(pages);
       return false;
@@ -321,7 +292,7 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
     if (uniq_ids.count == 0) {
       // No data => just mark pages obsolete
       ESP_LOGV(TAG, "No valid series in L0 => marking pages obsolete.");
-      tsdb_mark_old_level_pages_obsolete(db, from_level, pages, page_count);
+      tsdb_mark_old_level_pages_obsolete(db, from_level, pages, subset_cnt);
       free(pages);
       return true;
     }
@@ -346,7 +317,7 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       start_time = esp_timer_get_time();
 
       // Collect this series’s points from all L0 pages
-      if (!collect_points_for_series(db, pages, page_count, uniq_ids.list[i], &pts, &pts_used, &pts_cap, &ftype,
+      if (!collect_points_for_series(db, pages, subset_cnt, uniq_ids.list[i], &pts, &pts_used, &pts_cap, &ftype,
                                      &min_ts, &max_ts)) {
         // If we fail, bail out
         free(pts);
@@ -413,7 +384,7 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       free(pts);
 
       end_time = esp_timer_get_time();
-      ESP_LOGI(TAG, "Wrote series with %zu points in %.3f ms", i + 1, (end_time - start_time) / 1000.0);
+      ESP_LOGI(TAG, "Wrote series with %zu points in %.3f ms", pts_used, (end_time - start_time) / 1000.0);
     }
 
     free(uniq_ids.list);
@@ -432,12 +403,12 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
     // Use your existing multi-iterator approach
     // --------------------------------------------------------------------
     ESP_LOGI(TAG, "Compacting from level-%u => level-%u using multi-iterator...", from_level, to_level);
-    success = tsdb_compact_multi_iterator(db, pages, page_count, to_level);
+    success = tsdb_compact_multi_iterator(db, pages, subset_cnt, to_level);
   }
 
   // If we succeeded, mark old pages as obsolete
   if (success) {
-    if (!tsdb_mark_old_level_pages_obsolete(db, from_level, pages, page_count)) {
+    if (!tsdb_mark_old_level_pages_obsolete(db, from_level, pages, subset_cnt)) {
       ESP_LOGW(TAG, "Failed marking old level-%u pages obsolete!", from_level);
     }
   }
@@ -446,62 +417,80 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
   return success;
 }
 
-bool timeseries_compact_level0_pages(timeseries_db_t* db) {
-  // Just call the generic function with from_level=0, to_level=1
-  return timeseries_compact_level_pages(db, 0, 1);
-}
-
 // -----------------------------------------------------------------------------
 // Step 1) Find pages at the source level
 // -----------------------------------------------------------------------------
 
-static bool tsdb_find_level_pages(timeseries_db_t* db, uint8_t source_level, tsdb_level_page_t** out_pages,
-                                  size_t* out_count) {
-  if (!db || !out_pages || !out_count) {
+static bool tsdb_find_level_pages(timeseries_db_t* db, uint8_t source_level, size_t max_pages,
+                                  tsdb_level_page_t** out_pages, size_t* out_count, size_t* out_total_pages) {
+  if (!db || !out_pages || !out_count || !out_total_pages) {
     return false;
   }
+
   *out_pages = NULL;
   *out_count = 0;
+  *out_total_pages = 0;
 
-  timeseries_page_cache_iterator_t page_iter;
-  if (!timeseries_page_cache_iterator_init(db, &page_iter)) {
+  /* Allow callers to request “only tell me the total”.            */
+  const bool collect_subset = (max_pages > 0);
+
+  tsdb_level_page_t* subset = NULL;
+  if (collect_subset) {
+    subset = malloc(max_pages * sizeof(tsdb_level_page_t));
+    if (!subset) {
+      return false;
+    }
+  }
+
+  timeseries_page_cache_iterator_t it;
+  if (!timeseries_page_cache_iterator_init(db, &it)) {
+    free(subset);
     return false;
   }
 
   timeseries_page_header_t hdr;
   uint32_t offset = 0, size = 0;
+  size_t subset_found = 0;
+  size_t total_found = 0;
 
-// For demo, limit to 32 pages
-#define MAX_PAGES_PER_LEVEL 32
-  tsdb_level_page_t temp[MAX_PAGES_PER_LEVEL];
-  size_t found = 0;
+  while (timeseries_page_cache_iterator_next(&it, &hdr, &offset, &size)) {
+    const bool wanted = hdr.magic_number == TIMESERIES_MAGIC_NUM && hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
+                        hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE && hdr.field_data_level == source_level;
 
-  while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &offset, &size)) {
-    // Is it an active field-data page at the desired level?
-    if (hdr.magic_number == TIMESERIES_MAGIC_NUM && hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
-        hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE && hdr.field_data_level == source_level) {
-      if (found < MAX_PAGES_PER_LEVEL) {
-        temp[found].offset = offset;
-        temp[found].size = size;
-        found++;
-      } else {
-        ESP_LOGW(TAG, "Too many pages found at level=%u (> %d).", source_level, MAX_PAGES_PER_LEVEL);
-        break;
-      }
+    if (!wanted) {
+      continue;
+    }
+
+    /* Count every page … */
+    ++total_found;
+
+    /* copy only the first @max_pages into the caller buffer but only if its less than 256k */
+    if (hdr.page_size < MAX_PAGE_SIZE && collect_subset && subset_found < max_pages) {
+      subset[subset_found].offset = offset;
+      subset[subset_found].size = size;
+      ++subset_found;
     }
   }
 
-  if (found == 0) {
-    return true;  // no pages => nothing to do
+  *out_total_pages = total_found;
+
+  /* Nothing worth returning?  We’re done. */
+  if (subset_found == 0) {
+    free(subset);
+    return true;
   }
 
-  tsdb_level_page_t* arr = (tsdb_level_page_t*)malloc(found * sizeof(tsdb_level_page_t));
-  if (!arr) {
+  /* Trim to exact size for the caller. */
+  tsdb_level_page_t* exact = malloc(subset_found * sizeof(tsdb_level_page_t));
+  if (!exact) {
+    free(subset);
     return false;
   }
-  memcpy(arr, temp, found * sizeof(tsdb_level_page_t));
-  *out_pages = arr;
-  *out_count = found;
+  memcpy(exact, subset, subset_found * sizeof(tsdb_level_page_t));
+
+  free(subset);
+  *out_pages = exact;
+  *out_count = subset_found;
   return true;
 }
 

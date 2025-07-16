@@ -7,6 +7,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#define MIN_PAGES_FOR_COMPACTION 4
+#define MAX_PAGE_SIZE (64 * 1024)  // 64 KiB
+#define TSDB_MAX_LEVEL 4
+
 // -----------------------------------------------------------------------------
 // Page State Constants
 // -----------------------------------------------------------------------------
@@ -135,7 +139,7 @@ typedef struct {
    * The number of records in this entry (like the # of points).
    */
   uint16_t record_count;
-  uint16_t record_length;
+  uint32_t record_length;
 
   /**
    * Start and end timestamps for these points.
@@ -178,6 +182,7 @@ typedef struct {
   timeseries_cached_page_t* page_cache;  // dynamic array
   size_t page_cache_count;
   size_t page_cache_capacity;
+  uint32_t total_active_size;
 
   // Last used L0 page/offset
   bool last_l0_cache_valid;

@@ -329,7 +329,7 @@ bool timeseries_fielddata_iterator_next(timeseries_fielddata_iterator_t* f_iter,
   // Debug print the header
   ESP_LOGV(TAG, "FieldData record: series_id=%.2X%.2X%.2X%.2X...", local_hdr.series_id[0], local_hdr.series_id[1],
            local_hdr.series_id[2], local_hdr.series_id[3]);
-  ESP_LOGV(TAG, "  flags=0x%02X, record_count=%u, record_length=%u", local_hdr.flags, local_hdr.record_count,
+  ESP_LOGV(TAG, "  flags=0x%02X, record_count=%u, record_length=%lu", local_hdr.flags, local_hdr.record_count,
            local_hdr.record_length);
 
   // Provide the header if requested
@@ -390,9 +390,45 @@ bool timeseries_blank_iterator_init(timeseries_db_t* db, timeseries_blank_iterat
   iter->partition = db->partition;
   iter->min_size = min_size;
   iter->valid = true;
-  iter->current_offset = 0;
-  iter->current_index = 0;
 
+  /* ------------------------------------------------------------------------
+   * 1. Locate the page with the greatest sequence number
+   * ---------------------------------------------------------------------- */
+  uint32_t max_seq = 0;
+  uint32_t max_seq_offset = 0;
+  uint32_t max_seq_size = 0;
+
+  for (size_t i = 0; i < db->page_cache_count; ++i) {
+    const timeseries_cached_page_t* p = &db->page_cache[i];
+    if (p->header.page_state != TIMESERIES_PAGE_STATE_FREE && p->header.sequence_num >= max_seq) {
+      max_seq = p->header.sequence_num;
+      max_seq_offset = p->offset;
+      max_seq_size = p->header.page_size;
+    }
+  }
+
+  /* 2. Begin scanning at the *byte after* that page (wrap if needed) */
+  uint32_t start_offset = max_seq_offset + max_seq_size;
+  if (start_offset >= iter->partition->size) {
+    start_offset -= iter->partition->size;  // wrap to 0
+  }
+
+  iter->start_offset = start_offset;
+  iter->current_offset = start_offset;
+  iter->wrapped = false;
+
+  /* 3. Find the first cache entry whose *end* crosses current_offset          */
+  iter->current_index = 0;
+  while (iter->current_index < db->page_cache_count) {
+    const timeseries_cached_page_t* p = &db->page_cache[iter->current_index];
+    uint32_t end = p->offset + p->header.page_size;
+    if (end > start_offset) {
+      break;
+    }
+    ++iter->current_index;
+  }
+
+  /* 4. Blank-run bookkeeping */
   iter->in_blank_run = false;
   iter->run_start = 0;
   iter->run_length = 0;
@@ -407,154 +443,150 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t*
 
   timeseries_db_t* db = iter->db;
   const esp_partition_t* part = iter->partition;
-  uint32_t part_size = part->size;
+  const uint32_t part_size = part->size;
 
-  // Continue until we either find a run >= min_size or exhaust partition
   while (true) {
-    // If we've already found a run >= min_size, return it:
-    if (iter->in_blank_run && iter->run_length >= iter->min_size) {
-      // Return the run
-      if (out_offset) {
-        *out_offset = iter->run_start;
-      }
-      if (out_size) {
-        *out_size = iter->run_length;
-      }
-      // Move current_offset to the end of this run
-      iter->current_offset = iter->run_start + iter->run_length;
-
-      // Reset for next time
-      iter->in_blank_run = false;
-      iter->run_start = 0;
-      iter->run_length = 0;
-
-      return true;
-    }
-
-    // 1) If we've consumed all cached pages, the rest of the partition is free
-    if (iter->current_index >= db->page_cache_count) {
-      // The entire region from current_offset..end is free
-      if (iter->current_offset >= part_size) {
-        // no more space left
-        iter->valid = false;
-        return false;
-      }
-
-      uint32_t free_start = iter->current_offset;
-      uint32_t free_len = part_size - free_start;
-
-      // Merge/extend with any existing run
-      if (!iter->in_blank_run) {
-        iter->in_blank_run = true;
-        iter->run_start = free_start;
-        iter->run_length = free_len;
-      } else {
-        // check for contiguity
-        uint32_t expected_next = iter->run_start + iter->run_length;
-        if (free_start == expected_next) {
-          iter->run_length += free_len;
-        } else {
-          // finalize old run if >= min_size
-          if (iter->run_length >= iter->min_size) {
-            if (out_offset) *out_offset = iter->run_start;
-            if (out_size) *out_size = iter->run_length;
-            iter->current_offset = iter->run_start + iter->run_length;
-            // reset
-            iter->in_blank_run = false;
-            iter->run_start = 0;
-            iter->run_length = 0;
-            return true;
-          }
-          // else discard old run, start a new run
-          iter->run_start = free_start;
-          iter->run_length = free_len;
-        }
-      }
-      // Now check if new run >= min_size
-      if (iter->run_length >= iter->min_size) {
-        if (out_offset) {
-          *out_offset = iter->run_start;
-        }
-        if (out_size) {
-          *out_size = iter->run_length;
-        }
-        iter->current_offset = iter->run_start + iter->run_length;
-        // reset
-        iter->in_blank_run = false;
-        iter->run_start = 0;
-        iter->run_length = 0;
-        return true;
-      }
-      // If still no success, we are done
+    /* --------------------------------------------------------------
+     * Termination: wrapped once and back at / past start_offset
+     * ------------------------------------------------------------*/
+    if (iter->wrapped && iter->current_offset >= iter->start_offset) {
       iter->valid = false;
       return false;
     }
 
-    // 2) Get the next cached page
+    /* --------------------------------------------------------------
+     * 1.  Already holding a sufficiently long blank run?  Return it.
+     * ------------------------------------------------------------*/
+    if (iter->in_blank_run && iter->run_length >= iter->min_size) {
+      if (out_offset) *out_offset = iter->run_start;
+      if (out_size) *out_size = iter->run_length;
+
+      iter->current_offset = iter->run_start + iter->run_length;
+      iter->in_blank_run = false;
+      iter->run_start = 0;
+      iter->run_length = 0;
+      return true;
+    }
+
+    /* --------------------------------------------------------------
+     * 2.  Reached the end of the page-cache?
+     *     Treat the rest of the device as free, then wrap/terminate.
+     * ------------------------------------------------------------*/
+    if (iter->current_index >= db->page_cache_count) {
+      /* a) Consume the area current_offset .. part_size as free */
+      if (iter->current_offset < part_size) {
+        uint32_t free_start = iter->current_offset;
+        uint32_t free_len = part_size - free_start;
+
+        /* merge / start a blank run exactly like original code */
+        if (!iter->in_blank_run) {
+          iter->in_blank_run = true;
+          iter->run_start = free_start;
+          iter->run_length = free_len;
+        } else {
+          uint32_t expected = iter->run_start + iter->run_length;
+          if (free_start == expected) {
+            iter->run_length += free_len;
+          } else {
+            if (iter->run_length >= iter->min_size) {
+              if (out_offset) *out_offset = iter->run_start;
+              if (out_size) *out_size = iter->run_length;
+              iter->current_offset = iter->run_start + iter->run_length;
+              iter->in_blank_run = false;
+              iter->run_start = 0;
+              iter->run_length = 0;
+              return true;
+            }
+            iter->run_start = free_start;
+            iter->run_length = free_len;
+          }
+        }
+
+        /* If big enough, return it immediately */
+        if (iter->run_length >= iter->min_size) {
+          if (out_offset) *out_offset = iter->run_start;
+          if (out_size) *out_size = iter->run_length;
+          iter->current_offset = iter->run_start + iter->run_length;
+          iter->in_blank_run = false;
+          iter->run_start = 0;
+          iter->run_length = 0;
+          return true;
+        }
+
+        /* Move to the physical end */
+        iter->current_offset = part_size;
+      }
+
+      /* b) Now either wrap or terminate */
+      if (!iter->wrapped) {
+        iter->wrapped = true;  // first wrap
+        iter->current_offset = 0;
+        iter->current_index = 0;
+        continue;  // back to while(true)
+      } else {
+        iter->valid = false;  // second time – done
+        return false;
+      }
+    }
+
+    /* --------------------------------------------------------------
+     * 3.  Get the next cached page
+     * ------------------------------------------------------------*/
     timeseries_cached_page_t* entry = &db->page_cache[iter->current_index];
     uint32_t page_offset = entry->offset;
     uint32_t page_size = entry->header.page_size;
     uint8_t page_state = entry->header.page_state;
-
-    // If the page is completely before our current_offset, skip it
     uint32_t page_end = page_offset + page_size;
+
+    /* Skip pages that end before our cursor */
     if (page_end <= iter->current_offset) {
-      // move on to next page
-      iter->current_index++;
+      ++iter->current_index;
       continue;
     }
 
-    // if there's a gap from current_offset..page_offset, that's free
+    /* Gap [current_offset .. page_offset) is free */
     if (page_offset > iter->current_offset) {
       uint32_t gap_start = iter->current_offset;
       uint32_t gap_len = page_offset - gap_start;
 
-      // Merge with existing run if contiguous
-      if (iter->in_blank_run) {
+      /* merge / start blank-run exactly like original */
+      if (!iter->in_blank_run) {
+        iter->in_blank_run = true;
+        iter->run_start = gap_start;
+        iter->run_length = gap_len;
+      } else {
         uint32_t expected = iter->run_start + iter->run_length;
         if (gap_start == expected) {
           iter->run_length += gap_len;
         } else {
-          // finalize old run if big enough
           if (iter->run_length >= iter->min_size) {
             if (out_offset) *out_offset = iter->run_start;
             if (out_size) *out_size = iter->run_length;
             iter->current_offset = iter->run_start + iter->run_length;
-            // reset
             iter->in_blank_run = false;
             iter->run_start = 0;
             iter->run_length = 0;
             return true;
           }
-          // else discard old run, start new
           iter->run_start = gap_start;
           iter->run_length = gap_len;
         }
-      } else {
-        // start new run
-        iter->in_blank_run = true;
-        iter->run_start = gap_start;
-        iter->run_length = gap_len;
       }
-      // Now current_offset is at least page_offset
       iter->current_offset = page_offset;
     }
 
-    // Now handle the page itself
+    /* Handle the page itself */
     if (page_state == TIMESERIES_PAGE_STATE_OBSOLETE) {
-      // This entire page is free => merge with the run if contiguous
+      /* merge free page with run */
       if (!iter->in_blank_run) {
-        // start new run
         iter->in_blank_run = true;
         iter->run_start = page_offset;
         iter->run_length = page_size;
       } else {
-        // check contiguity
         uint32_t expected = iter->run_start + iter->run_length;
         if (page_offset == expected) {
           iter->run_length += page_size;
         } else {
-          // finalize old run if big enough
           if (iter->run_length >= iter->min_size) {
             if (out_offset) *out_offset = iter->run_start;
             if (out_size) *out_size = iter->run_length;
@@ -564,15 +596,13 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t*
             iter->run_length = 0;
             return true;
           }
-          // else discard old run, start new
           iter->run_start = page_offset;
           iter->run_length = page_size;
         }
       }
       iter->current_offset = page_offset + page_size;
-      iter->current_index++;
-    } else {
-      // This page is used => finalize any blank run before it
+      ++iter->current_index;
+    } else { /* ACTIVE or other – in use */
       if (iter->in_blank_run && iter->run_length >= iter->min_size) {
         if (out_offset) *out_offset = iter->run_start;
         if (out_size) *out_size = iter->run_length;
@@ -582,16 +612,14 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t*
         iter->run_length = 0;
         return true;
       }
-      // Reset run
+      /* reset blank-run state and jump past the used page */
       iter->in_blank_run = false;
       iter->run_start = 0;
       iter->run_length = 0;
-
-      // skip the entire used page
       iter->current_offset = page_offset + page_size;
-      iter->current_index++;
+      ++iter->current_index;
     }
-  }
+  } /* while(true) */
 }
 
 /**

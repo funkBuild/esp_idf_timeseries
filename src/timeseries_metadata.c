@@ -157,7 +157,7 @@ bool timeseries_metadata_create_page(timeseries_db_t* db) {
     return false;
   }
 
-  ESP_LOGV(TAG, "Found blank region @0x%08" PRIx32 " (length=%" PRIu32 " bytes).", blank_offset, blank_length);
+  ESP_LOGW(TAG, "Found blank region @0x%08" PRIx32 " (length=%" PRIu32 " bytes).", blank_offset, blank_length);
 
   // 3) Create the empty metadata page here
   if (!tsdb_create_empty_metadata_page(db, blank_offset)) {

@@ -75,19 +75,23 @@ typedef struct {
  *        4096-byte aligned sectors.
  */
 typedef struct {
-  bool valid;
+  timeseries_db_t* db;
+  const esp_partition_t* partition;
   uint32_t min_size;
-  uint32_t current_offset;  // where we are scanning in the partition
-  size_t current_index;     // which entry in the page_cache we're examining
+  bool valid;
 
-  // We'll accumulate a "free region" start + length as we go
+  /* cursor into the partition / page-cache */
+  uint32_t current_offset;
+  size_t current_index;
+
+  /* wear-levelling helpers */
+  uint32_t start_offset;  // first byte we will examine
+  bool wrapped;           // true once we've jumped past the end -> 0
+
+  /* state for an in-progress blank run */
+  bool in_blank_run;
   uint32_t run_start;
   uint32_t run_length;
-  bool in_blank_run;
-
-  // We still store a pointer to db->partition for partition->size
-  const esp_partition_t* partition;
-  timeseries_db_t* db;
 } timeseries_blank_iterator_t;
 
 typedef struct {

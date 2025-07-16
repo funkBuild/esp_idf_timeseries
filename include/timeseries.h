@@ -16,6 +16,18 @@ typedef enum {
   TIMESERIES_FIELD_TYPE_STRING,
 } timeseries_field_type_e;
 
+/**
+ * @brief Supported aggregation methods for rollups
+ */
+typedef enum {
+  TSDB_AGGREGATION_AVG = 0,
+  TSDB_AGGREGATION_MIN,
+  TSDB_AGGREGATION_MAX,
+  TSDB_AGGREGATION_LATEST,
+  TSDB_AGGREGATION_SUM,
+  TSDB_AGGREGATION_COUNT,
+} timeseries_aggregation_method_e;
+
 typedef struct {
   timeseries_field_type_e type;
   union {
@@ -97,7 +109,7 @@ typedef struct timeseries_query_t {
    */
   size_t limit;
   uint32_t rollup_interval;
-
+  timeseries_aggregation_method_e aggregate_method;
 } timeseries_query_t;
 
 /**

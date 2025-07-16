@@ -51,9 +51,6 @@ static SemaphoreHandle_t s_tsdb_mutex = NULL;
       xSemaphoreGiveRecursive(s_tsdb_mutex); \
     }                                        \
   } while (0)
-/* ------------------------------------------------------------------------ */
-
-/* =============================  API  ==================================== */
 
 bool timeseries_init(void) {
   /* Ensure mutex exists before any other work */

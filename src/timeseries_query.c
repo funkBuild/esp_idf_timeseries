@@ -849,7 +849,7 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
 
   // Example aggregator settings. In real usage, these might come from the
   // query:
-  timeseries_aggregation_method_e agg_method = TSDB_AGGREGATION_AVG;
+  timeseries_aggregation_method_e agg_method = query->aggregate_method;
 
   for (size_t f = 0; f < num_fields; f++) {
     start_time = esp_timer_get_time();
@@ -917,6 +917,27 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
                fld->field_name, (int)field_type);
 
       output_field_type = TIMESERIES_FIELD_TYPE_FLOAT;  // Ensure we store as float
+    }
+
+    if (agg_method == TSDB_AGGREGATION_COUNT && field_type != TIMESERIES_FIELD_TYPE_INT) {
+      ESP_LOGW(TAG,
+               "Field '%s' has type %d, but COUNT aggregation requires integer. "
+               "Will convert to integer.",
+               fld->field_name, (int)field_type);
+
+      output_field_type = TIMESERIES_FIELD_TYPE_INT;  // Ensure we store as integer
+    }
+
+    if (agg_method == TSDB_AGGREGATION_SUM && field_type != TIMESERIES_FIELD_TYPE_FLOAT &&
+        field_type != TIMESERIES_FIELD_TYPE_INT) {
+      ESP_LOGW(TAG,
+               "Field '%s' has type %d, but SUM aggregation requires float or integer. "
+               "Will convert to float.",
+               fld->field_name, (int)field_type);
+
+      // Only applies to boolean fields, result is returned as integer
+
+      output_field_type = TIMESERIES_FIELD_TYPE_INT;
     }
 
     // When we have a rollup interval, average always returns a float.

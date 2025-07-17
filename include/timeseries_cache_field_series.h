@@ -21,4 +21,6 @@ bool tsdb_fieldseries_cache_lookup(ts_cache_t* cache, uint32_t measurement_id, c
 bool tsdb_fieldseries_cache_insert(ts_cache_t* cache, uint32_t measurement_id, const char* field_name,
                                    const timeseries_series_id_list_t* list);
 
+bool tsdb_fieldseries_cache_delete(ts_cache_t* cache, uint32_t measurement_id, const char* field_name);
+
 #endif /* TSDB_CACHE_FIELD_SERIES_H */

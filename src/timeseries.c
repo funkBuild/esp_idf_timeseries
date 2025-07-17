@@ -9,6 +9,9 @@
 #include "timeseries_metadata.h"
 #include "timeseries_page_cache.h"
 #include "timeseries_query.h"
+#include "timeseries_delete.h"
+#include "timeseries_series_id.h"
+
 #include "esp_timer.h"
 
 #include "mbedtls/md5.h"
@@ -135,28 +138,13 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
 
   /* For each field i => build the series_id => store all points in one shot */
   for (size_t i = 0; i < data->num_fields; i++) {
-    char buffer[256];
-    memset(buffer, 0, sizeof(buffer));
-    size_t offset = 0;
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%s", data->measurement_name);
-    for (size_t t = 0; t < data->num_tags; t++) {
-      offset += snprintf(buffer + offset, sizeof(buffer) - offset, ":%s:%s", data->tag_keys[t], data->tag_values[t]);
-      if (offset >= sizeof(buffer)) {
-        ESP_LOGE(TAG, "MD5 input buffer overflow for field '%s'", data->field_names[i]);
-        TSDB_MUTEX_UNLOCK();
-        return false;
-      }
-    }
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ":%s", data->field_names[i]);
-    if (offset >= sizeof(buffer)) {
-      ESP_LOGE(TAG, "MD5 buffer overflow (field_name too long?)");
+    /* Calculate series_id using sorted tags */
+    unsigned char series_id[16];
+    if (!calculate_series_id(data->measurement_name, data->tag_keys, data->tag_values, data->num_tags,
+                             data->field_names[i], series_id)) {
       TSDB_MUTEX_UNLOCK();
       return false;
     }
-
-    /* MD5 => series_id */
-    unsigned char series_id[16];
-    mbedtls_md5((const unsigned char*)buffer, strlen(buffer), series_id);
 
     /* Ensure the field name to series_id mapping is in metadata */
     if (!tsdb_index_field_for_series(&s_tsdb, measurement_id, data->field_names[i], series_id)) {
@@ -476,4 +464,44 @@ bool timeseries_get_usage_summary(tsdb_usage_summary_t* summary) {
 
   TSDB_MUTEX_UNLOCK();
   return true;
+}
+
+bool timeseries_delete_measurement(const char* measurement_name) {
+  TSDB_MUTEX_LOCK();
+
+  if (!s_tsdb.initialized) {
+    ESP_LOGE(TAG, "Timeseries DB not initialized yet.");
+    TSDB_MUTEX_UNLOCK();
+    return false;
+  }
+  if (!measurement_name) {
+    ESP_LOGE(TAG, "Invalid parameters for delete by measurement.");
+    TSDB_MUTEX_UNLOCK();
+    return false;
+  }
+  bool result = timeseries_delete_by_measurement(&s_tsdb, measurement_name);
+
+  TSDB_MUTEX_UNLOCK();
+
+  return result;
+}
+
+bool timeseries_delete_measurement_and_field(const char* measurement_name, const char* field_name) {
+  TSDB_MUTEX_LOCK();
+
+  if (!s_tsdb.initialized) {
+    ESP_LOGE(TAG, "Timeseries DB not initialized yet.");
+    TSDB_MUTEX_UNLOCK();
+    return false;
+  }
+  if (!measurement_name || !field_name) {
+    ESP_LOGE(TAG, "Invalid parameters for delete by measurement and field.");
+    TSDB_MUTEX_UNLOCK();
+    return false;
+  }
+
+  bool ok = timeseries_delete_by_measurement_and_field(&s_tsdb, measurement_name, field_name);
+
+  TSDB_MUTEX_UNLOCK();
+  return ok;
 }

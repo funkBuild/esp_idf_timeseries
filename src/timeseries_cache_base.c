@@ -345,3 +345,80 @@ void ts_cache_get_stats(const ts_cache_t* c, ts_cache_stats_t* out) {
   out->entries = c->entry_cnt;
   out->bytes_in_use = c->mem_used;
 }
+
+bool ts_cache_remove(ts_cache_t* c, key_kind_e kind, const char* str_key, uint32_t meas_id) {
+  if (!c) return false;
+
+  uint32_t h = str_key ? djb2(str_key) : meas_id;
+  size_t b = bucket_of(h, c->bucket_cnt);
+  entry_t* e = c->buckets[b];
+  entry_t* prev = NULL;
+
+  while (e) {
+    if (e->hash == h && e->kind == kind && e->meas_id == meas_id &&
+        ((str_key == NULL && e->str_key == NULL) || (str_key && e->str_key && strcmp(e->str_key, str_key) == 0))) {
+      // Unlink from bucket chain
+      if (prev)
+        prev->next = e->next;
+      else
+        c->buckets[b] = e->next;
+
+      // Unlink from LRU list
+      lru_unlink(&c->lru, &e->lru);
+
+      // Update counters
+      c->mem_used -= entry_mem(e);
+      c->entry_cnt--;
+      c->st.evictions++;  // Count as eviction for consistency
+
+      // Free memory
+      free(e->str_key);
+      free(e->blob);
+      free(e);
+
+      return true;
+    }
+    prev = e;
+    e = e->next;
+  }
+  return false;  // Key not found
+}
+
+/* ---------- u32 removal API ------------------------------------------- */
+bool ts_cache_remove_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, uint32_t meas_id) {
+  if (!c) return false;
+
+  uint32_t h = str_key ? djb2(str_key) : meas_id;
+  size_t b = bucket_of(h, c->bucket_cnt);
+
+  entry_t* e = c->buckets[b];
+  entry_t* prev = NULL;
+
+  while (e) {
+    if (e->hash == h && e->kind == kind && e->meas_id == meas_id &&
+        ((str_key == NULL && e->str_key == NULL) || (str_key && e->str_key && strcmp(e->str_key, str_key) == 0))) {
+      /* --- unlink from bucket chain --- */
+      if (prev)
+        prev->next = e->next;
+      else
+        c->buckets[b] = e->next;
+
+      /* --- unlink from LRU list --- */
+      lru_unlink(&c->lru, &e->lru);
+
+      /* --- update accounting --- */
+      c->mem_used -= entry_mem(e);
+      c->entry_cnt -= 1;
+      c->st.evictions++; /* reuse eviction counter */
+
+      /* --- free resources --- */
+      free(e->str_key);
+      free(e->blob);
+      free(e);
+      return true; /* removed! */
+    }
+    prev = e;
+    e = e->next;
+  }
+  return false; /* not found */
+}

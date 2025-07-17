@@ -25,4 +25,6 @@ bool tsdb_fieldnames_cache_lookup(ts_cache_t* cache, uint32_t meas_id, timeserie
  */
 bool tsdb_fieldnames_cache_insert(ts_cache_t* cache, uint32_t meas_id, const timeseries_string_list_t* list);
 
+bool tsdb_fieldnames_cache_delete(ts_cache_t* cache, uint32_t meas_id);
+
 #endif /* TSDB_CACHE_FIELD_NAMES_H */

@@ -47,4 +47,8 @@ typedef struct {
 
 void ts_cache_get_stats(const ts_cache_t* c, ts_cache_stats_t* out);
 
+bool ts_cache_remove(ts_cache_t* c, key_kind_e kind, const char* str_key, uint32_t meas_id);
+
+bool ts_cache_remove_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, uint32_t meas_id);
+
 #endif /* TSDB_CACHE_BASE_H */

@@ -1777,3 +1777,298 @@ TEST_CASE("Timeseries usage summary returns sane values", "[esp_idf_timeseries][
     TEST_ASSERT_GREATER_OR_EQUAL_UINT32(0, summary.page_summaries[lvl].num_pages);
   }
 }
+
+TEST_CASE("Delete by measurement removes all data", "[esp_idf_timeseries][delete]") {
+  /* ------------------------------------------------- 1. Test fixture */
+  const char* measurement_name = "delete_test_measurement";
+
+  /* Insert data with multiple series (different tags) */
+  const char* tag_keys[] = {"device", "location"};
+  const char* tag_values_1[] = {"sensor_1", "room_a"};
+  const char* tag_values_2[] = {"sensor_2", "room_b"};
+
+  const char* field_names[] = {"temperature", "humidity"};
+
+  const size_t NUM_POINTS = 10;
+  uint64_t timestamps[NUM_POINTS];
+  timeseries_field_value_t temp_values[NUM_POINTS];
+  timeseries_field_value_t humidity_values[NUM_POINTS];
+
+  /* Create test data */
+  for (size_t i = 0; i < NUM_POINTS; ++i) {
+    timestamps[i] = 1750750000000ULL + (uint64_t)i * 1000ULL;
+    temp_values[i].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    temp_values[i].data.float_val = 20.0f + i;
+    humidity_values[i].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    humidity_values[i].data.float_val = 50.0f + i;
+  }
+
+  /* Combine field values for insert */
+  timeseries_field_value_t field_values[NUM_POINTS * 2];
+  for (size_t i = 0; i < NUM_POINTS; ++i) {
+    field_values[i] = temp_values[i];
+    field_values[NUM_POINTS + i] = humidity_values[i];
+  }
+
+  /* Insert first series */
+  timeseries_insert_data_t insert_data_1 = {
+      .measurement_name = measurement_name,
+      .tag_keys = tag_keys,
+      .tag_values = tag_values_1,
+      .num_tags = 2,
+      .field_names = field_names,
+      .field_values = field_values,
+      .num_fields = 2,
+      .timestamps_ms = timestamps,
+      .num_points = NUM_POINTS,
+  };
+  TEST_ASSERT_TRUE(timeseries_insert(&insert_data_1));
+
+  /* Insert second series */
+  timeseries_insert_data_t insert_data_2 = {
+      .measurement_name = measurement_name,
+      .tag_keys = tag_keys,
+      .tag_values = tag_values_2,
+      .num_tags = 2,
+      .field_names = field_names,
+      .field_values = field_values,
+      .num_fields = 2,
+      .timestamps_ms = timestamps,
+      .num_points = NUM_POINTS,
+  };
+  TEST_ASSERT_TRUE(timeseries_insert(&insert_data_2));
+
+  /* ------------------------------------------------- 2. Verify data exists */
+  timeseries_query_t query = {
+      .measurement_name = measurement_name,
+      .start_ms = timestamps[0],
+      .end_ms = timestamps[NUM_POINTS - 1] + 1000,
+      .limit = 1000,
+  };
+
+  timeseries_query_result_t result;
+  memset(&result, 0, sizeof(result));
+  TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+  TEST_ASSERT_GREATER_THAN(0, result.num_points);
+  ESP_LOGI("DELETE_TEST", "Before delete: %d points found", result.num_points);
+  timeseries_query_free_result(&result);
+
+  /* ------------------------------------------------- 3. Delete measurement */
+  TEST_ASSERT_TRUE(timeseries_delete_measurement(measurement_name));
+
+  /* ------------------------------------------------- 4. Verify data is gone */
+  memset(&result, 0, sizeof(result));
+  TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+  TEST_ASSERT_EQUAL(0, result.num_points);
+  ESP_LOGI("DELETE_TEST", "After delete: %d points found", result.num_points);
+  timeseries_query_free_result(&result);
+
+  /* ------------------------------------------------- 5. Test deleting non-existent measurement */
+  TEST_ASSERT_TRUE(timeseries_delete_measurement("non_existent_measurement"));
+}
+
+TEST_CASE("Delete by measurement and field removes specific field data", "[esp_idf_timeseries][delete]") {
+  const char* measurement_name = "delete_field_test";
+
+  const char* tag_keys[] = {"device"};
+  const char* tag_values[] = {"multi_sensor"};
+
+  const char* field_names[] = {"temperature", "humidity", "pressure"};
+
+  const size_t NUM_POINTS = 5;
+  uint64_t timestamps[NUM_POINTS];
+  timeseries_field_value_t field_values[NUM_POINTS * 3];
+
+  for (size_t i = 0; i < NUM_POINTS; ++i) {
+    timestamps[i] = 1750751000000ULL + (uint64_t)i * 1000ULL;
+
+    field_values[i].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    field_values[i].data.float_val = 22.0f + i;
+
+    field_values[NUM_POINTS + i].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    field_values[NUM_POINTS + i].data.float_val = 60.0f + i;
+
+    field_values[2 * NUM_POINTS + i].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    field_values[2 * NUM_POINTS + i].data.float_val = 1013.0f + i;
+  }
+
+  timeseries_insert_data_t insert_data = {
+      .measurement_name = measurement_name,
+      .tag_keys = tag_keys,
+      .tag_values = tag_values,
+      .num_tags = 1,
+      .field_names = field_names,
+      .field_values = field_values,
+      .num_fields = 3,
+      .timestamps_ms = timestamps,
+      .num_points = NUM_POINTS,
+  };
+  TEST_ASSERT_TRUE(timeseries_insert(&insert_data));
+
+  timeseries_query_t query_all = {
+      .measurement_name = measurement_name,
+      .start_ms = timestamps[0],
+      .end_ms = timestamps[NUM_POINTS - 1] + 1000,
+      .limit = 1000,
+  };
+
+  timeseries_query_result_t result;
+  memset(&result, 0, sizeof(result));
+  TEST_ASSERT_TRUE(timeseries_query(&query_all, &result));
+  TEST_ASSERT_EQUAL(3, result.num_columns);
+  TEST_ASSERT_EQUAL(NUM_POINTS, result.num_points);
+  timeseries_query_free_result(&result);
+
+  TEST_ASSERT_TRUE(timeseries_delete_measurement_and_field(measurement_name, "humidity"));
+
+  memset(&result, 0, sizeof(result));
+  TEST_ASSERT_TRUE(timeseries_query(&query_all, &result));
+  TEST_ASSERT_EQUAL(2, result.num_columns);
+  TEST_ASSERT_EQUAL(NUM_POINTS, result.num_points);
+
+  bool has_temperature = false;
+  bool has_pressure = false;
+  bool has_humidity = false;
+
+  for (size_t i = 0; i < result.num_columns; ++i) {
+    if (strcmp(result.columns[i].name, "temperature") == 0) has_temperature = true;
+    if (strcmp(result.columns[i].name, "pressure") == 0) has_pressure = true;
+    if (strcmp(result.columns[i].name, "humidity") == 0) has_humidity = true;
+  }
+
+  TEST_ASSERT_TRUE(has_temperature);
+  TEST_ASSERT_TRUE(has_pressure);
+  TEST_ASSERT_FALSE(has_humidity);
+
+  timeseries_query_free_result(&result);
+
+  TEST_ASSERT_TRUE(timeseries_delete_measurement_and_field(measurement_name, "non_existent_field"));
+}
+
+TEST_CASE("Delete functions handle edge cases gracefully", "[esp_idf_timeseries][delete]") {
+  // Test NULL measurement name
+  TEST_ASSERT_FALSE(timeseries_delete_measurement(NULL));
+
+  // Test empty measurement name (should succeed)
+  TEST_ASSERT_TRUE(timeseries_delete_measurement(""));
+
+  // Test NULL measurement name for field deletion
+  TEST_ASSERT_FALSE(timeseries_delete_measurement_and_field(NULL, "field"));
+
+  // Test NULL field name
+  TEST_ASSERT_FALSE(timeseries_delete_measurement_and_field("test", NULL));
+
+  // Test both NULL (should fail)
+  TEST_ASSERT_FALSE(timeseries_delete_measurement_and_field(NULL, NULL));
+
+  // Test empty strings (should succeed)
+  TEST_ASSERT_TRUE(timeseries_delete_measurement_and_field("", "field"));
+
+  // Test non-existent measurement (should succeed)
+  TEST_ASSERT_TRUE(timeseries_delete_measurement("non_existent_measurement"));
+  TEST_ASSERT_TRUE(timeseries_delete_measurement_and_field("non_existent_measurement", "field"));
+}
+
+static void query_and_check(const char* measurement, const char* tag_key, /* NULL ⇒ no tag filter */
+                            const char* tag_value,                        /* NULL ⇒ no tag filter */
+                            uint64_t start_ms, uint64_t end_ms, size_t expect_points, size_t expect_columns) {
+  /* build query struct ------------------------------------------------ */
+  timeseries_query_t q;
+  memset(&q, 0, sizeof(q));
+  q.measurement_name = measurement;
+  q.limit = 100;
+  q.start_ms = start_ms;
+  q.end_ms = end_ms;
+
+  const char* keys[1];
+  const char* vals[1];
+  if (tag_key && tag_value) {
+    keys[0] = tag_key;
+    vals[0] = tag_value;
+    q.tag_keys = keys;
+    q.tag_values = vals;
+    q.num_tags = 1;
+  }
+
+  // Log start and end timestamps
+  ESP_LOGI(TAG, "Querying measurement '%s' from %llu ms to %llu ms", measurement, start_ms, end_ms);
+
+  /* execute ----------------------------------------------------------- */
+  timeseries_query_result_t res;
+  memset(&res, 0, sizeof(res));
+
+  TEST_ASSERT_TRUE_MESSAGE(timeseries_query(&q, &res), "timeseries_query() failed");
+
+  TEST_ASSERT_EQUAL_UINT(expect_points, res.num_points);
+  TEST_ASSERT_EQUAL_UINT(expect_columns, res.num_columns);
+
+  timeseries_query_free_result(&res);
+}
+
+/* -------------------------------------------------------------------- */
+/*  The test case                                                       */
+/* -------------------------------------------------------------------- */
+TEST_CASE("Insert & query by device_id tag", "[esp_idf_timeseries]") {
+  /* -------- constants ----------------------------------------------- */
+  static const char* MEASUREMENT = "Demo_Data";
+  static const char* TAG_KEY = "device_id";
+  static const char* DEVICES[2] = {"Gen_001", "pump_001"};
+
+  static const char* FIELD_NAMES[] = {"pressure", "temperature", "flow"};
+  const size_t NUM_FIELDS = 3;
+  const size_t PTS_PER_SER = 10;
+
+  /* -------- timestamps over the last hour --------------------------- */
+  uint64_t now_ms = 1752737543ULL;                   /* current time in ms */
+  uint64_t hour_ago_ms = now_ms - 60ULL * 60ULL;     /* 1 h ago */
+  uint64_t delta_ms = (60ULL * 60ULL) / PTS_PER_SER; /* ≈6 min   */
+
+  /* -------- insert two series (Gen_001 / pump_001) ------------------ */
+  for (int dev = 0; dev < 2; ++dev) {
+    const char* tag_keys[1] = {TAG_KEY};
+    const char* tag_values[1] = {DEVICES[dev]};
+
+    for (size_t i = 0; i < PTS_PER_SER; ++i) {
+      uint64_t ts = hour_ago_ms + i * delta_ms + 10 * dev;
+      ESP_LOGI(TAG, "Inserting data for %s at %llu ms", DEVICES[dev], ts);
+
+      /* prepare field values */
+      timeseries_field_value_t fvals[3];
+
+      fvals[0].type = TIMESERIES_FIELD_TYPE_FLOAT;
+      fvals[0].data.float_val = 1.0f + dev * 0.1f + (float)i; /* pressure   */
+
+      fvals[1].type = TIMESERIES_FIELD_TYPE_FLOAT;
+      fvals[1].data.float_val = 20.0f + dev * 0.5f + (float)i * 0.1f; /* temperature*/
+
+      fvals[2].type = TIMESERIES_FIELD_TYPE_FLOAT;
+      fvals[2].data.float_val = 100.0f + dev * 2.0f + (float)i * 0.5f; /* flow       */
+
+      timeseries_insert_data_t ins = {
+          .measurement_name = MEASUREMENT,
+          .tag_keys = tag_keys,
+          .tag_values = tag_values,
+          .num_tags = 1,
+          .field_names = FIELD_NAMES,
+          .field_values = fvals,
+          .num_fields = NUM_FIELDS,
+          .timestamps_ms = &ts,
+          .num_points = 1,
+      };
+
+      TEST_ASSERT_TRUE_MESSAGE(timeseries_insert(&ins), "timeseries_insert() failed");
+    }
+  }
+
+  /* -------- queries -------------------------------------------------- */
+  /* 1) aggregate (all device_ids) */
+  query_and_check(MEASUREMENT,
+                  /*no tag filter*/ NULL, NULL, hour_ago_ms, now_ms + 1, PTS_PER_SER * 2, /* expected points */
+                  NUM_FIELDS);
+
+  /* 2) device_id == "Gen_001" */
+  query_and_check(MEASUREMENT, TAG_KEY, "Gen_001", hour_ago_ms, now_ms + 1, PTS_PER_SER, NUM_FIELDS);
+
+  /* 3) device_id == "pump_001" */
+  query_and_check(MEASUREMENT, TAG_KEY, "pump_001", hour_ago_ms, now_ms + 1, PTS_PER_SER, NUM_FIELDS);
+}

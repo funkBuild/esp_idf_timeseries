@@ -9,4 +9,6 @@ bool tsdb_measurement_cache_lookup(ts_cache_t* cache, const char* measurement_na
 
 bool tsdb_measurement_cache_insert(ts_cache_t* cache, const char* measurement_name, uint32_t id);
 
+bool tsdb_measurement_cache_delete(ts_cache_t* cache, const char* measurement_name);
+
 #endif

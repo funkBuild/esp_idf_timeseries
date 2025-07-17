@@ -65,3 +65,13 @@ bool tsdb_fieldnames_cache_insert(ts_cache_t* cache, uint32_t meas_id, const tim
   free(blob);
   return ok;
 }
+
+bool tsdb_fieldnames_cache_delete(ts_cache_t* cache, uint32_t meas_id) {
+  if (!cache) return false;
+
+  /*  key_kind  = K_FIELD_NAMES
+   *  str_key   = NULL   (we key exclusively by meas_id)
+   *  meas_id   = meas_id
+   */
+  return ts_cache_remove_u32(cache, K_FIELD_NAMES, NULL, meas_id);
+}

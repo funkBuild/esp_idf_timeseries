@@ -206,6 +206,10 @@ bool timeseries_get_tags_for_measurement(const char* measurement_name, tsdb_tag_
 
 bool timeseries_get_usage_summary(tsdb_usage_summary_t* summary);
 
+bool timeseries_delete_measurement(const char* measurement_name);
+
+bool timeseries_delete_measurement_and_field(const char* measurement_name, const char* field_name);
+
 #ifdef __cplusplus
 }
 #endif

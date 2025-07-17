@@ -335,58 +335,6 @@ bool tsdb_create_measurement_id(timeseries_db_t* db, const char* measurement_nam
   return true;
 }
 
-bool tsdb_insert_single_field(timeseries_db_t* db, uint32_t measurement_id, const char* measurement_name,
-                              const char* field_name, const timeseries_field_value_t* field_val, const char** tag_keys,
-                              const char** tag_values, size_t num_tags, uint64_t timestamp_ms) {
-  if (!db || !measurement_name || !field_name || !field_val) {
-    return false;
-  }
-
-  // 1) Build MD5 input
-  char buffer[256];
-  memset(buffer, 0, sizeof(buffer));
-
-  size_t offset = 0;
-  offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%s", measurement_name);
-  for (size_t i = 0; i < num_tags; i++) {
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ":%s:%s", tag_keys[i], tag_values[i]);
-    if (offset >= sizeof(buffer)) {
-      ESP_LOGE(TAG, "MD5 input buffer overflow");
-      return false;
-    }
-  }
-  offset += snprintf(buffer + offset, sizeof(buffer) - offset, ":%s", field_name);
-  if (offset >= sizeof(buffer)) {
-    ESP_LOGE(TAG, "MD5 input buffer overflow (field_name too long?)");
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Series ID calc string: '%s'", buffer);
-
-  // 2) MD5 => series_id
-  unsigned char series_id[16];
-  mbedtls_md5((const unsigned char*)buffer, strlen(buffer), series_id);
-
-  // 3) Ensure field type in metadata
-  if (!tsdb_ensure_series_type_in_metadata(db, series_id, field_val->type)) {
-    return false;
-  }
-
-  // 4) Index tags
-  if (!tsdb_index_tags_for_series(db, measurement_id, tag_keys, tag_values, num_tags, series_id)) {
-    return false;
-  }
-
-  // 5) Append data to field data page
-  if (!tsdb_append_field_data(db, series_id, timestamp_ms, field_val)) {
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Inserted field='%s' meas_id=%" PRIu32 " ts=%" PRIu64 " (SeriesID=%.2X%.2X%.2X%.2X...)", field_name,
-           measurement_id, timestamp_ms, series_id[0], series_id[1], series_id[2], series_id[3]);
-  return true;
-}
-
 /**
  * @brief Lookup an existing field type in metadata for the given series_id.
  *
@@ -1466,4 +1414,286 @@ oom_cleanup:
   return false;
 
 #undef ENSURE_CAPACITY
+}
+
+/* ---------------------------------------------------------------------------
+ * Remove a (possibly large) set of series‑IDs from all metadata structures.
+ *
+ *  • FIELDINDEX ............... entry is deleted if its key matches any ID
+ *  • TAGINDEX / FIELDLISTINDEX  the value array is filtered; if it becomes
+ *                               empty the entry is deleted, otherwise a new
+ *                               entry is written with the trimmed array
+ *
+ * Returns true if at least one metadata entry was changed (deleted or rewritten)
+ * so that callers can invalidate caches when necessary.
+ * ------------------------------------------------------------------------- */
+static bool id_in_delete_set(const timeseries_series_id_list_t* set, const unsigned char candidate[16]) {
+  for (size_t i = 0; i < set->count; ++i)
+    if (memcmp(set->ids[i].bytes, candidate, 16) == 0) return true;
+  return false;
+}
+
+bool tsdb_remove_series_ids_from_metadata(timeseries_db_t* db, const timeseries_series_id_list_t* series_to_delete) {
+  if (!db || !series_to_delete || series_to_delete->count == 0) return false;
+
+  bool any_removed = false;
+  uint8_t* scratch = NULL;
+  size_t scratch_cap = 0;
+
+  timeseries_metadata_page_iterator_t pg_it;
+  if (!timeseries_metadata_page_iterator_init(db, &pg_it)) {
+    ESP_LOGE(TAG, "Failed to init metadata iterator");
+    return false;
+  }
+
+  timeseries_page_header_t pg_hdr;
+  uint32_t pg_off, pg_sz;
+
+  while (timeseries_metadata_page_iterator_next(&pg_it, &pg_hdr, &pg_off, &pg_sz)) {
+    timeseries_entity_iterator_t ent_it;
+    if (!timeseries_entity_iterator_init(db, pg_off, pg_sz, &ent_it)) continue; /* skip damaged page */
+
+    timeseries_entry_header_t eh;
+    while (timeseries_entity_iterator_next(&ent_it, &eh)) {
+      if (eh.delete_marker != TIMESERIES_DELETE_MARKER_VALID) continue;
+
+      /* ------------------------------ FIELDINDEX (key == series‑id) ---- */
+      if (eh.key_type == TIMESERIES_KEYTYPE_FIELDINDEX && eh.key_len == 16) {
+        unsigned char keybuf[16];
+        if (timeseries_entity_iterator_peek_key(&ent_it, &eh, keybuf) && id_in_delete_set(series_to_delete, keybuf)) {
+          if (tsdb_soft_delete_entry(db, pg_off, ent_it.current_entry_offset)) any_removed = true;
+        }
+        continue;
+      }
+
+      /* ------------- TAGINDEX / FIELDLISTINDEX (value[] == series‑ids) - */
+      if ((eh.key_type == TIMESERIES_KEYTYPE_TAGINDEX || eh.key_type == TIMESERIES_KEYTYPE_FIELDLISTINDEX) &&
+          eh.value_len && (eh.value_len % 16u) == 0) {
+        /* grow scratch if necessary */
+        if (eh.value_len > scratch_cap) {
+          uint8_t* nb = realloc(scratch, eh.value_len);
+          if (!nb) {
+            ESP_LOGE(TAG, "OOM");
+            break;
+          }
+          scratch = nb;
+          scratch_cap = eh.value_len;
+        }
+
+        char key_buf[128];
+        if (eh.key_len >= sizeof(key_buf)) continue;
+
+        if (!timeseries_entity_iterator_read_data(&ent_it, &eh, key_buf, scratch)) continue;
+
+        size_t old_cnt = eh.value_len / 16u;
+        size_t new_cnt = 0;
+        for (size_t i = 0; i < old_cnt; ++i) {
+          unsigned char* src = scratch + i * 16u;
+          if (!id_in_delete_set(series_to_delete, src)) {
+            if (new_cnt != i) memcpy(scratch + new_cnt * 16u, src, 16u);
+            ++new_cnt;
+          }
+        }
+
+        if (new_cnt == old_cnt) continue; /* nothing removed */
+
+        /* delete the old entry */
+        tsdb_soft_delete_entry(db, pg_off, ent_it.current_entry_offset);
+        any_removed = true;
+
+        /* rewrite only if IDs remain */
+        if (new_cnt > 0) {
+          key_buf[eh.key_len] = '\0';
+          tsdb_create_new_index_entry(db, (timeseries_keytype_t)eh.key_type, key_buf, scratch,
+                                      (uint16_t)(new_cnt * 16u));
+        }
+      }
+    } /* entity loop */
+
+    timeseries_entity_iterator_deinit(&ent_it);
+  } /* page loop */
+
+  free(scratch);
+  return any_removed;
+}
+
+/**
+ * Delete a measurement and all metadata that references it.
+ *
+ *   • First finds the numeric measurement‑ID from the text name
+ *   • Soft‑deletes the MEASUREMENT entry itself
+ *   • Soft‑deletes every TAGINDEX / FIELDLISTINDEX entry whose key starts with
+ *     "<measurement_id>:"
+ *
+ * Nothing else is modified (series‑IDs remain, caches are not purged here).
+ *
+ * @return true  At least one metadata entry was removed
+ *         false Measurement not found or iterator error
+ */
+bool tsdb_remove_measurement_from_metadata(timeseries_db_t* db, const char* measurement_name) {
+  if (!db || !measurement_name) return false;
+
+  /* ------------------------------------------------------ 1. lookup id */
+  uint32_t measurement_id = 0;
+  if (!tsdb_find_measurement_id(db, measurement_name, &measurement_id)) return false; /* measurement unknown */
+
+  char id_prefix[12]; /* enough for 32‑bit int */
+  int id_prefix_len = snprintf(id_prefix, sizeof(id_prefix), "%" PRIu32, measurement_id);
+
+  bool any_removed = false;
+
+  /* ------------------------------------------------------ 2. walk pages */
+  timeseries_metadata_page_iterator_t pg_it;
+  if (!timeseries_metadata_page_iterator_init(db, &pg_it)) {
+    ESP_LOGE(TAG, "Failed to init metadata iterator");
+    return false;
+  }
+
+  timeseries_page_header_t pg_hdr;
+  uint32_t pg_off, pg_sz;
+
+  while (timeseries_metadata_page_iterator_next(&pg_it, &pg_hdr, &pg_off, &pg_sz)) {
+    timeseries_entity_iterator_t ent_it;
+    if (!timeseries_entity_iterator_init(db, pg_off, pg_sz, &ent_it)) continue; /* skip broken page */
+
+    timeseries_entry_header_t eh;
+    while (timeseries_entity_iterator_next(&ent_it, &eh)) {
+      if (eh.delete_marker != TIMESERIES_DELETE_MARKER_VALID) continue;
+
+      /* ------------------------------------------------ MEASUREMENT key */
+      if (eh.key_type == TIMESERIES_KEYTYPE_MEASUREMENT) {
+        if (eh.key_len != strlen(measurement_name)) continue;
+
+        char key_buf[64];
+        if (!timeseries_entity_iterator_peek_key(&ent_it, &eh, key_buf)) continue;
+
+        if (strncmp(key_buf, measurement_name, eh.key_len) == 0 &&
+            tsdb_soft_delete_entry(db, pg_off, ent_it.current_entry_offset)) {
+          ESP_LOGW(TAG, "Soft‑deleted MEASUREMENT entry for '%s' @0x%08" PRIx32, measurement_name,
+                   pg_off + ent_it.current_entry_offset);
+
+          /* ------------- Purge all related cache entries ---------- */
+          tsdb_measurement_cache_delete(db->meta_cache, measurement_name);
+          tsdb_measser_cache_delete(db->meta_cache, measurement_id);
+          tsdb_fieldnames_cache_delete(db->meta_cache, measurement_id);
+
+          /* Note: individual FIELDLISTINDEX entries will be encountered
+           * and handled separately below (they carry a field‑name part). */
+
+          any_removed = true;
+        }
+        continue; /* nothing else to check for this entry */
+      }
+
+      /* ---------------- TAGINDEX / FIELDLISTINDEX – look at prefix ---- */
+      if (eh.key_type == TIMESERIES_KEYTYPE_TAGINDEX || eh.key_type == TIMESERIES_KEYTYPE_FIELDLISTINDEX) {
+        if (eh.key_len < (size_t)id_prefix_len + 1 /*':'*/) continue;
+        if (eh.key_len >= 128) /* guard   */
+          continue;
+
+        char key_buf[128];
+        if (!timeseries_entity_iterator_peek_key(&ent_it, &eh, key_buf)) continue;
+
+        /* Does the key start with "<measurement_id>:" ? */
+        if (memcmp(key_buf, id_prefix, id_prefix_len) == 0 && key_buf[id_prefix_len] == ':') {
+          ESP_LOGW(TAG,
+                   "Soft‑deleting TAGINDEX/FIELDLISTINDEX entry for measurement "
+                   "'%s', key='%.*s' @0x%08" PRIx32,
+                   measurement_name, (int)eh.key_len, key_buf, pg_off + ent_it.current_entry_offset);
+
+          if (tsdb_soft_delete_entry(db, pg_off, ent_it.current_entry_offset)) {
+            any_removed = true;
+
+            /* ----------- NEW: purge field‑series cache when relevant --- */
+            if (eh.key_type == TIMESERIES_KEYTYPE_FIELDLISTINDEX) {
+              /* Extract the field‑name part after the '<id>:' prefix. */
+              size_t fname_len = eh.key_len - (size_t)id_prefix_len - 1 /*':'*/;
+
+              if (fname_len < sizeof(key_buf)) {
+                char field_name[sizeof(key_buf)];
+                memcpy(field_name, key_buf + id_prefix_len + 1, /* skip the ':' */
+                       fname_len);
+                field_name[fname_len] = '\0';
+
+                tsdb_fieldseries_cache_delete(db->meta_cache, measurement_id, field_name);
+              }
+            }
+          }
+        }
+      }
+    } /* entity loop */
+
+    timeseries_entity_iterator_deinit(&ent_it);
+  } /* page loop */
+
+  return any_removed;
+}
+
+/**
+ * Soft‑delete one FIELDLISTINDEX entry that maps
+ * "<measurement_id>:<field_name>" → series list.
+ *
+ * @param db             Open timeseries DB handle
+ * @param measurement_id Numeric measurement‑ID
+ * @param field_name     Field whose mapping is to be removed
+ *
+ * @return true  At least one metadata entry was removed
+ *         false Nothing matched or iterator error
+ */
+bool tsdb_soft_delete_fieldlistindex_entry(timeseries_db_t* db, uint32_t measurement_id, const char* field_name) {
+  if (!db || !field_name) return false;
+
+  /* ------------- build "<id>:" prefix ----------------- */
+  char id_prefix[12]; /* enough for 32‑bit int */
+  int id_prefix_len = snprintf(id_prefix, sizeof(id_prefix), "%" PRIu32, measurement_id);
+  size_t field_len = strlen(field_name);
+  size_t full_len = (size_t)id_prefix_len + 1 /*':'*/ + field_len;
+
+  bool any_removed = false;
+
+  /* ------------- walk all metadata pages -------------- */
+  timeseries_metadata_page_iterator_t pg_it;
+  if (!timeseries_metadata_page_iterator_init(db, &pg_it)) {
+    ESP_LOGE(TAG, "Failed to init metadata iterator");
+    return false;
+  }
+
+  timeseries_page_header_t pg_hdr;
+  uint32_t pg_off, pg_sz;
+
+  while (timeseries_metadata_page_iterator_next(&pg_it, &pg_hdr, &pg_off, &pg_sz)) {
+    timeseries_entity_iterator_t ent_it;
+    if (!timeseries_entity_iterator_init(db, pg_off, pg_sz, &ent_it)) continue; /* skip broken page */
+
+    timeseries_entry_header_t eh;
+    while (timeseries_entity_iterator_next(&ent_it, &eh)) {
+      if (eh.delete_marker != TIMESERIES_DELETE_MARKER_VALID) continue;
+      if (eh.key_type != TIMESERIES_KEYTYPE_FIELDLISTINDEX) continue;
+      if (eh.key_len != full_len) /* must match exactly */
+        continue;
+      if (eh.key_len >= 128) /* guard */
+        continue;
+
+      char key_buf[128];
+      if (!timeseries_entity_iterator_peek_key(&ent_it, &eh, key_buf)) continue;
+
+      /* key must be "<id>:" + field_name */
+      if (memcmp(key_buf, id_prefix, id_prefix_len) == 0 && key_buf[id_prefix_len] == ':' &&
+          memcmp(key_buf + id_prefix_len + 1, field_name, field_len) == 0) {
+        ESP_LOGW(TAG, "Soft‑deleting FIELDLISTINDEX entry '%.*s' @0x%08" PRIx32, (int)eh.key_len, key_buf,
+                 pg_off + ent_it.current_entry_offset);
+
+        if (tsdb_soft_delete_entry(db, pg_off, ent_it.current_entry_offset)) {
+          any_removed = true;
+
+          /* purge the (meas_id, field_name) cache entry */
+          tsdb_fieldseries_cache_delete(db->meta_cache, measurement_id, field_name);
+        }
+      }
+    } /* entity loop */
+
+    timeseries_entity_iterator_deinit(&ent_it);
+  } /* page loop */
+
+  return any_removed;
 }

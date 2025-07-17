@@ -15,4 +15,6 @@ bool tsdb_measser_cache_lookup(ts_cache_t* cache, uint32_t measurement_id, times
 /*  Inserts (or overwrites) the list in the cache. */
 bool tsdb_measser_cache_insert(ts_cache_t* cache, uint32_t measurement_id, const timeseries_series_id_list_t* list);
 
+bool tsdb_measser_cache_delete(ts_cache_t* cache, uint32_t meas_id);
+
 #endif /* TSDB_CACHE_MEASUREMENT_SERIES_H */

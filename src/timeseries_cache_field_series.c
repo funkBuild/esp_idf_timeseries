@@ -45,3 +45,14 @@ bool tsdb_fieldseries_cache_insert(ts_cache_t* cache, uint32_t measurement_id, c
   free(blob);
   return ok;
 }
+
+/* Delete the cached list of series‑IDs for a (measurement‑ID, field‑name) pair */
+bool tsdb_fieldseries_cache_delete(ts_cache_t* cache, uint32_t measurement_id, const char* field_name) {
+  if (!cache || !field_name) return false;
+
+  /*  key_kind  = K_FIELD_LIST
+   *  str_key   = field_name
+   *  meas_id   = measurement_id
+   */
+  return ts_cache_remove_u32(cache, K_FIELD_LIST, field_name, measurement_id);
+}

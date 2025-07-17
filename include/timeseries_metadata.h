@@ -180,6 +180,10 @@ bool tsdb_find_series_ids_for_multiple_tags(timeseries_db_t* db, uint32_t measur
 bool timeseries_metadata_get_tags_for_measurement(timeseries_db_t* db, uint32_t measurement_id, tsdb_tag_pair_t** tags,
                                                   size_t* num_tags);
 
+bool tsdb_remove_measurement_from_metadata(timeseries_db_t* db, const char* measurement_name);
+
+bool tsdb_soft_delete_fieldlistindex_entry(timeseries_db_t* db, uint32_t measurement_id, const char* field_name);
+
 #ifdef __cplusplus
 }
 #endif

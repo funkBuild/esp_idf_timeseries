@@ -41,3 +41,14 @@ bool tsdb_measser_cache_insert(ts_cache_t* cache, uint32_t meas_id, const timese
   free(blob);
   return ok;
 }
+
+/* Delete the series‑list associated with a measurement‑ID entry */
+bool tsdb_measser_cache_delete(ts_cache_t* cache, uint32_t meas_id) {
+  if (!cache) return false;
+
+  /*  key_kind  = K_MEASUREMENT_SER
+   *  str_key   = NULL    (we key purely by meas_id here)
+   *  meas_id   = meas_id (32‑bit numeric key)
+   */
+  return ts_cache_remove_u32(cache, K_MEASUREMENT_SER, NULL, meas_id);
+}

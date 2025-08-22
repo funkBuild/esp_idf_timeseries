@@ -630,6 +630,14 @@ bool tsdb_index_field_for_series(timeseries_db_t* db, uint32_t measurement_id, c
   /* (tsdb_upsert_fieldlist_entry keeps the old signature)         */
   /* ------------------------------------------------------------ */
   bool ok = tsdb_upsert_fieldlist_entry(db, offsets, count, key_buf, series_id);
+  
+  /* ------------------------------------------------------------ */
+  /* Invalidate field names cache when new field is indexed        */
+  /* ------------------------------------------------------------ */
+  if (ok && db->meta_cache) {
+    tsdb_fieldnames_cache_delete(db->meta_cache, measurement_id);
+  }
+  
   free(offsets);
   return ok;
 }

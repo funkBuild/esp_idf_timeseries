@@ -2072,3 +2072,91 @@ TEST_CASE("Insert & query by device_id tag", "[esp_idf_timeseries]") {
   /* 3) device_id == "pump_001" */
   query_and_check(MEASUREMENT, TAG_KEY, "pump_001", hour_ago_ms, now_ms + 1, PTS_PER_SER, NUM_FIELDS);
 }
+
+TEST_CASE("Field cache is invalidated when new fields are added", "[esp_idf_timeseries]") {
+  const char* measurement = "cache_test";
+  
+  // 1) Insert data with initial field
+  const char* initial_field = "temperature";
+  const char* initial_field_names[] = {initial_field};
+  
+  uint64_t timestamp = 1000000000ULL;
+  timeseries_field_value_t initial_field_values[1];
+  initial_field_values[0].type = TIMESERIES_FIELD_TYPE_FLOAT;
+  initial_field_values[0].data.float_val = 25.5f;
+  
+  timeseries_insert_data_t initial_insert = {
+      .measurement_name = measurement,
+      .tag_keys = NULL,
+      .tag_values = NULL,
+      .num_tags = 0,
+      .field_names = initial_field_names,
+      .field_values = initial_field_values,
+      .num_fields = 1,
+      .timestamps_ms = &timestamp,
+      .num_points = 1,
+  };
+  
+  TEST_ASSERT_TRUE(timeseries_insert(&initial_insert));
+  
+  // 2) Call get_fields_for_measurement to populate cache
+  char** fields_before = NULL;
+  size_t num_fields_before = 0;
+  TEST_ASSERT_TRUE(timeseries_get_fields_for_measurement(measurement, &fields_before, &num_fields_before));
+  TEST_ASSERT_EQUAL(1, num_fields_before);
+  TEST_ASSERT_EQUAL_STRING("temperature", fields_before[0]);
+  
+  // Free the returned fields
+  for (size_t i = 0; i < num_fields_before; i++) {
+    free(fields_before[i]);
+  }
+  free(fields_before);
+  
+  // 3) Insert data with a new field (this should invalidate the cache)
+  const char* new_field = "humidity";
+  const char* new_field_names[] = {new_field};
+  
+  timestamp = 1000000001ULL;
+  timeseries_field_value_t new_field_values[1];
+  new_field_values[0].type = TIMESERIES_FIELD_TYPE_FLOAT;
+  new_field_values[0].data.float_val = 60.0f;
+  
+  timeseries_insert_data_t new_insert = {
+      .measurement_name = measurement,
+      .tag_keys = NULL,
+      .tag_values = NULL,
+      .num_tags = 0,
+      .field_names = new_field_names,
+      .field_values = new_field_values,
+      .num_fields = 1,
+      .timestamps_ms = &timestamp,
+      .num_points = 1,
+  };
+  
+  TEST_ASSERT_TRUE(timeseries_insert(&new_insert));
+  
+  // 4) Call get_fields_for_measurement again - should now return both fields
+  char** fields_after = NULL;
+  size_t num_fields_after = 0;
+  TEST_ASSERT_TRUE(timeseries_get_fields_for_measurement(measurement, &fields_after, &num_fields_after));
+  
+  // This assertion will FAIL because the cache is not invalidated
+  // The cache still contains only "temperature" even though we added "humidity"
+  TEST_ASSERT_EQUAL_MESSAGE(2, num_fields_after, "Expected 2 fields but cache returned stale data");
+  
+  // Check that both fields are present
+  bool found_temp = false, found_humidity = false;
+  for (size_t i = 0; i < num_fields_after; i++) {
+    if (strcmp(fields_after[i], "temperature") == 0) found_temp = true;
+    if (strcmp(fields_after[i], "humidity") == 0) found_humidity = true;
+  }
+  
+  TEST_ASSERT_TRUE_MESSAGE(found_temp, "temperature field missing from cached results");
+  TEST_ASSERT_TRUE_MESSAGE(found_humidity, "humidity field missing from cached results - cache not invalidated");
+  
+  // Free the returned fields
+  for (size_t i = 0; i < num_fields_after; i++) {
+    free(fields_after[i]);
+  }
+  free(fields_after);
+}

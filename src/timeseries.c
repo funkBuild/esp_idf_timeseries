@@ -78,6 +78,12 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
     }
   }
 
+  // Log if this is a large insert
+  if (data->num_points > 500) {
+    ESP_LOGI(TAG, "Starting large insert: %zu points x %zu fields = %zu total values",
+             data->num_points, data->num_fields, data->num_points * data->num_fields);
+  }
+
   // For each field i => build the series_id => store all points in one shot
   for (size_t i = 0; i < data->num_fields; i++) {
     // Build MD5 input =>
@@ -128,17 +134,24 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
     const timeseries_field_value_t* field_array = &data->field_values[i * data->num_points];
 
     // 2) Insert multi data points in one entry
+    ESP_LOGI(TAG, "Inserting field %zu/%zu: '%s' (%zu points)",
+             i + 1, data->num_fields, data->field_names[i], data->num_points);
     if (!tsdb_append_multiple_points(&s_tsdb, series_id, data->timestamps_ms, field_array, data->num_points)) {
       ESP_LOGE(TAG, "Failed to insert multi points for field '%s'", data->field_names[i]);
       return false;
     }
-    ESP_LOGV(TAG, "Inserted field='%s' with %zu points for measurement=%s", data->field_names[i], data->num_points,
-             data->measurement_name);
+    ESP_LOGV(TAG, "Successfully inserted field='%s' with %zu points for measurement=%s",
+             data->field_names[i], data->num_points, data->measurement_name);
   }
 
   uint64_t end_time = esp_timer_get_time();
   ESP_LOGI(TAG, "Inserted %zu points in %zu fields for measurement '%s' in %.3f ms", data->num_points, data->num_fields,
            data->measurement_name, (end_time - start_time) / 1000.0);
+
+  // Suggest compaction for large inserts
+  if (data->num_points > 500) {
+    ESP_LOGI(TAG, "Large insert complete. Consider calling timeseries_compact() to optimize storage.");
+  }
 
   return true;
 }

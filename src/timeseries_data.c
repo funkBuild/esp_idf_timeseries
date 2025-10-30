@@ -135,11 +135,22 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
            "tsdb_append_multiple_points: series=%.2X%.2X%.2X%.2X..., count=%zu",
            series_id[0], series_id[1], series_id[2], series_id[3], count);
 
+  // Maximum points to attempt in a single write (to avoid excessive halving)
+  // With 8KB pages and ~20 bytes per point, we can fit ~300-400 points max
+  // Since we're not compacting during insert, we can be more aggressive
+  const size_t MAX_INITIAL_CHUNK = 300;
+
   size_t remaining = count;
   size_t idx = 0;
 
   while (remaining > 0) {
-    size_t npoints_possible = remaining;
+    size_t npoints_possible = (remaining > MAX_INITIAL_CHUNK) ? MAX_INITIAL_CHUNK : remaining;
+
+    // Log progress for large inserts
+    if (count > MAX_INITIAL_CHUNK && remaining % 500 == 0) {
+      ESP_LOGI(TAG, "Insert progress: %zu/%zu points completed",
+               count - remaining, count);
+    }
 
     while (npoints_possible > 0) {
       size_t bytes_needed = calc_bytes_needed_for_npoints_columnar(
@@ -151,6 +162,8 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
       if (find_level0_page_with_space(db, bytes_needed, &any_l0_exists,
                                       &page_offset, &used_offset)) {
         // We have space => write
+        ESP_LOGV(TAG, "Writing %zu points to page @0x%08X (bytes needed: %zu)",
+                 npoints_possible, page_offset, bytes_needed);
         if (!write_points_to_page(db, page_offset, used_offset, series_id,
                                   timestamps + idx, values + idx,
                                   npoints_possible)) {
@@ -176,20 +189,20 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
         } else {
           // L0 pages exist but all are full
           if (npoints_possible == 1) {
-            // can't store even 1 => compaction + new L0
-            ESP_LOGV(TAG, "All L0 full => compaction + new page.");
-            if (!timeseries_compact_all_levels(db)) {
-              ESP_LOGE(TAG, "Compaction failed, can't proceed.");
-              return false;
-            }
+            // can't store even 1 => create new L0 page without compaction
+            ESP_LOGV(TAG, "All L0 pages full => creating new L0 page (progress: %zu/%zu points)",
+                     count - remaining, count);
             uint32_t new_page_offset = 0;
             if (!create_level0_field_page(db, &new_page_offset)) {
-              ESP_LOGE(TAG, "Failed to create new L0 after compaction.");
+              ESP_LOGE(TAG, "Failed to create new L0 page.");
               return false;
             }
+            ESP_LOGV(TAG, "Created new L0 page @0x%08X (skipping compaction during insert)", new_page_offset);
             continue;
           } else {
             // reduce npoints_possible
+            ESP_LOGV(TAG, "Can't fit %zu points (need %zu bytes), trying %zu points",
+                     npoints_possible, bytes_needed, npoints_possible / 2);
             npoints_possible /= 2;
           }
         }

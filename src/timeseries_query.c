@@ -300,11 +300,9 @@ bool timeseries_query_execute(timeseries_db_t *db,
 
   start_time = esp_timer_get_time();
 
-  if (!fetch_series_data(db, fields_array, actual_fields_count, query,
-                         result)) {
-    ESP_LOGE(TAG, "fetch_series_data(...) returned error");
-    /* keep going – we still clean everything */
-  }
+  size_t points_fetched = fetch_series_data(db, fields_array, actual_fields_count, query,
+                         result);
+  // Note: 0 points is a valid result, not an error
 
   ok = true; /* At this point the function succeeded – result is valid */
 
@@ -536,7 +534,7 @@ static bool field_record_list_append(field_record_info_t **list,
   }
   memset(new_node, 0, sizeof(*new_node));
 
-  new_node->page_offset = 0;
+  new_node->page_offset = 0;  // Not used anymore
   new_node->record_offset = absolute_offset;
   new_node->start_time = fdh->start_time;
   new_node->end_time = fdh->end_time;
@@ -670,13 +668,18 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
   timeseries_page_header_t hdr;
   uint32_t page_offset = 0;
   uint32_t page_size = 0;
+  int pages_processed = 0;
+  int field_data_pages = 0;
+  int records_found = 0;
 
   while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &page_offset,
                                              &page_size)) {
+    pages_processed++;
     // Only process FIELD_DATA pages
     if (hdr.page_type != TIMESERIES_PAGE_TYPE_FIELD_DATA) {
       continue;
     }
+    field_data_pages++;
 
     timeseries_fielddata_iterator_t fdata_iter;
     if (!timeseries_fielddata_iterator_init(db, page_offset, page_size,
@@ -690,12 +693,12 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     while (timeseries_fielddata_iterator_next(&fdata_iter, &fdh)) {
       // Skip if flagged as deleted
       if ((fdh.flags & TSDB_FIELDDATA_FLAG_DELETED) == 0) {
-        ESP_LOGW(TAG, "Skipping deleted record @0x%08X",
+        ESP_LOGV(TAG, "Skipping deleted record @0x%08X",
                  (unsigned int)fdata_iter.current_record_offset);
         continue;
       }
 
-      // Calculate the offset for the raw data portion
+      // Calculate the absolute offset for the raw data portion
       uint32_t absolute_offset = page_offset +
                                  fdata_iter.current_record_offset +
                                  sizeof(timeseries_field_data_header_t);
@@ -703,6 +706,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
       /* Fast path: single probe instead of nested loops */
       series_record_list_t *srl = series_lookup_find(&srl_tbl, fdh.series_id);
       if (srl) {
+        records_found++;
         if (field_record_list_append(&srl->records_head, &fdh, absolute_offset,
                                      query->limit)) {
           field_record_list_prune(&srl->records_head, query->limit);
@@ -710,6 +714,9 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
       }
     } // end while fielddata_iterator
   } // end while page_iterator
+
+  ESP_LOGI(TAG, "Page scan complete: %d pages, %d field_data pages, %d matching records",
+           pages_processed, field_data_pages, records_found);
 
   // --------------------------------------------------------------------------
   // PART B: Verify that all series in each field share the same type
@@ -831,12 +838,16 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
           rec = rec->next;
           continue;
         }
+        // Debug: log the actual offset being used
+        ESP_LOGV(TAG, "Initializing points_iter: absolute_offset=0x%08X, length=%u, count=%u",
+                 rec->record_offset, rec->record_length, rec->record_count);
         bool ok = timeseries_points_iterator_init(
-            db, rec->page_offset + rec->record_offset, rec->record_length,
+            db, rec->record_offset, rec->record_length,
             rec->record_count, field_type, rec->compressed, pit);
         if (!ok) {
-          ESP_LOGW(TAG, "Failed init of points_iter offset=0x%08X",
-                   (unsigned)(rec->page_offset + rec->record_offset));
+          ESP_LOGW(TAG, "Failed init of points_iter offset=0x%08X, length=%u, count=%u, type=%d",
+                   (unsigned)(rec->record_offset),
+                   rec->record_length, rec->record_count, field_type);
           free(pit);
           rec = rec->next;
           continue;

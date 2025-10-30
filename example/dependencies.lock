@@ -12,10 +12,10 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.4.0
+    version: 5.5.1
 direct_dependencies:
 - espressif/zlib
 - idf
 manifest_hash: 28fe0d9e689983ea3c106e28488d4997f6a4e5e7b630558fc69b298f15b1e2eb
-target: esp32s3
+target: esp32p4
 version: 2.0.0

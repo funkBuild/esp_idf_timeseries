@@ -35,7 +35,7 @@ bool timeseries_init(void) {
 
   const esp_partition_t* part = esp_partition_find_first(0x40, ESP_PARTITION_SUBTYPE_ANY, "timeseries");
   if (!part) {
-    ESP_LOGE(TAG, "Failed to find 'storage' partition in partition table.");
+    ESP_LOGE(TAG, "Failed to find 'timeseries' partition in partition table.");
     return false;
   }
   s_tsdb.partition = part;

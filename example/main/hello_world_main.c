@@ -4,102 +4,52 @@
 #include "timeseries.h"
 #include "timeseries_query.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <sys/time.h>
+#include <math.h>
+#include <limits.h>
 
 #include "esp_timer.h"
 
-static const char *TAG = "example";
+static const char *TAG = "solar_example";
 
-void example_query_weather_data(void) {
-  // Build a timeseries_query_t for "weather"
-  timeseries_query_t query;
-  memset(&query, 0, sizeof(query));
+// Solar field names (6 fields)
+static const char *solar_fields[] = {
+    "grid_import_w",
+    "grid_export_w",
+    "solar_w",
+    "battery_charge_w",
+    "battery_discharge_w",
+    "house_w"
+};
 
-  // 2) Set the measurement name
-  query.measurement_name = "weather";
+#define NUM_SOLAR_FIELDS 6
+#define SECONDS_PER_5MIN 300
+#define MS_PER_5MIN (SECONDS_PER_5MIN * 1000ULL)
+#define POINTS_PER_DAY (24 * 60 / 5)  // 288 points per day
+#define DAYS_TO_GENERATE 14
+#define TOTAL_POINTS (POINTS_PER_DAY * DAYS_TO_GENERATE)  // 4032 points
 
-  // 3) Tag filtering: same tags as inserted by app_main()
-  static const char *tag_keys[] = {"suburb", "city"};
-  static const char *tag_values[] = {"beldon", "perth"};
-  query.tag_keys = tag_keys;
-  query.tag_values = tag_values;
-  query.num_tags = 2;
+// Simple random number generator for demo data
+static float rand_float(float min, float max) {
+    return min + ((float)rand() / (float)RAND_MAX) * (max - min);
+}
 
-  // 4) Field filtering. If you set num_fields = 0, it means "ALL fields".
-  //    But here, let's explicitly request the 3 known fields.
-  static const char *fields[] = {"temperature", "status", "device_id"};
-  query.field_names = fields; // fields;
-  query.num_fields = 1;
+// Get current time aligned to 5-minute boundary
+static uint64_t get_aligned_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint64_t ms = (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
+    // Align to 5-minute boundary
+    return ms - (ms % MS_PER_5MIN);
+}
 
-  // 5) Limit: maximum total data points across all returned columns.
-  //    e.g. 50 means we won't read more than 50 total points among all fields.
-  query.limit = 250;
-
-  query.start_ms = 0;
-  query.end_ms = 2737381864000ULL;
-
-  // Prepare the result structure
-  timeseries_query_result_t result;
-  memset(&result, 0, sizeof(result));
-
-  // Execute the query
-  int64_t start_time = esp_timer_get_time();
-  bool success = timeseries_query(&query, &result);
-  int64_t end_time = esp_timer_get_time();
-
-  ESP_LOGI(TAG, "Query took %lld ms", (end_time - start_time) / 1000);
-
-  if (!success) {
-    ESP_LOGE(TAG, "Query execution failed!");
-    return;
-  }
-
-  if (result.num_points == 0 || result.num_columns == 0) {
-    ESP_LOGI(TAG, "Query returned no points.");
-    // Free the result and return
-    timeseries_query_free_result(&result);
-    return;
-  }
-
-  // Print the results
-  ESP_LOGI(TAG, "Query returned %u points and %u columns",
-           (unsigned)result.num_points, (unsigned)result.num_columns);
-
-  // Print timestamps first
-  for (size_t r = 0; r < result.num_points; r++) {
-    ESP_LOGI(TAG, "Row %u: timestamp = %llu", (unsigned)r,
-             (unsigned long long)result.timestamps[r]);
-    // For each column, print the value
-    for (size_t c = 0; c < result.num_columns; c++) {
-      timeseries_query_result_column_t *col = &result.columns[c];
-      timeseries_field_value_t *val = &col->values[r];
-
-      // Print the column name + value
-      switch (val->type) {
-      case TIMESERIES_FIELD_TYPE_FLOAT:
-        ESP_LOGI(TAG, "  Column '%s': float=%.3f", col->name,
-                 val->data.float_val);
-        break;
-      case TIMESERIES_FIELD_TYPE_INT:
-        ESP_LOGI(TAG, "  Column '%s': int=%lld", col->name, val->data.int_val);
-        break;
-      case TIMESERIES_FIELD_TYPE_BOOL:
-        ESP_LOGI(TAG, "  Column '%s': bool=%s", col->name,
-                 val->data.bool_val ? "true" : "false");
-        break;
-      case TIMESERIES_FIELD_TYPE_STRING:
-        ESP_LOGI(TAG, "  Column '%s': string=%s", col->name,
-                 val->data.string_val.str);
-        break;
-      default:
-        ESP_LOGI(TAG, "  Column '%s': unknown/unsupported type %d", col->name,
-                 (int)val->type);
-        break;
-      }
-    }
-  }
-
-  // Finally, free the result memory
-  timeseries_query_free_result(&result);
+// Get midnight of a given timestamp (rounds down to start of day)
+static uint64_t get_midnight_ms(uint64_t timestamp_ms) {
+    uint64_t ms_per_day = 24ULL * 60ULL * 60ULL * 1000ULL;
+    return (timestamp_ms / ms_per_day) * ms_per_day;
 }
 
 void app_main(void) {
@@ -109,138 +59,217 @@ void app_main(void) {
     return;
   }
 
-  // example_query_weather_data();
-  // return;
+  ESP_LOGI(TAG, "=== Solar Data Timeseries Example ===");
 
-  // Common tags & field definitions
-  const char *tags_keys[] = {"suburb", "city"};
-  const char *tags_values[] = {"beldon", "perth"};
+  // Tags for solar system
+  const char *tags_keys[] = {"location", "system_id"};
+  const char *tags_values[] = {"home", "solar_001"};
   size_t num_tags = 2;
 
-  const char *field_names[] = {"temperature", "status", "device_id"};
-  size_t num_fields = 3;
+  // ---------------------------------------------------------
+  // Generate and insert 14 days of solar data at 5-min intervals
+  // ---------------------------------------------------------
+
+  // Use timestamps aligned to midnight (ESP32 clock may not be set)
+  // Pick day 20390 as the end day (Oct 28, 2025 at midnight UTC)
+  uint64_t ms_per_day = 24ULL * 60ULL * 60ULL * 1000ULL;
+  uint64_t end_time = 20390ULL * ms_per_day; // 1761696000000 ms = Oct 28, 2025 00:00:00 UTC
+  uint64_t start_time = end_time - (14ULL * ms_per_day); // 14 days earlier at midnight
+
+  ESP_LOGI(TAG, "Generating %d days of solar data (%u points at 5-min intervals)...",
+           DAYS_TO_GENERATE, TOTAL_POINTS);
+  ESP_LOGI(TAG, "Start time: %llu", (unsigned long long)start_time);
+  ESP_LOGI(TAG, "End time: %llu", (unsigned long long)end_time);
+
+  // Allocate arrays for timestamps and field values
+  uint64_t *timestamps = malloc(TOTAL_POINTS * sizeof(uint64_t));
+  timeseries_field_value_t *field_values = malloc(NUM_SOLAR_FIELDS * TOTAL_POINTS * sizeof(timeseries_field_value_t));
+
+  if (!timestamps || !field_values) {
+    ESP_LOGE(TAG, "Failed to allocate memory for data!");
+    return;
+  }
+
+  // Generate data
+  for (size_t i = 0; i < TOTAL_POINTS; i++) {
+    // Aligned timestamp at 5-minute intervals
+    timestamps[i] = start_time + (i * MS_PER_5MIN);
+
+    // Calculate hour of day for solar simulation (0-23)
+    uint64_t day_ms = timestamps[i] % (24ULL * 60ULL * 60ULL * 1000ULL);
+    float hour_of_day = (float)day_ms / (60.0f * 60.0f * 1000.0f);
+
+    // Simulate solar production (peaks at noon)
+    float solar_factor = (hour_of_day >= 6.0f && hour_of_day <= 18.0f) ?
+                         sinf((hour_of_day - 6.0f) * 3.14159f / 12.0f) : 0.0f;
+
+    // Field 0: grid_import_w
+    size_t idx = 0 * TOTAL_POINTS + i;
+    field_values[idx].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    field_values[idx].data.float_val = rand_float(0.0f, 500.0f) * (1.0f - solar_factor * 0.8f);
+
+    // Field 1: grid_export_w
+    idx = 1 * TOTAL_POINTS + i;
+    field_values[idx].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    field_values[idx].data.float_val = rand_float(1000.0f, 3000.0f) * solar_factor;
+
+    // Field 2: solar_w
+    idx = 2 * TOTAL_POINTS + i;
+    field_values[idx].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    field_values[idx].data.float_val = rand_float(3000.0f, 10000.0f) * solar_factor;
+
+    // Field 3: battery_charge_w
+    idx = 3 * TOTAL_POINTS + i;
+    field_values[idx].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    field_values[idx].data.float_val = rand_float(0.0f, 5000.0f) * solar_factor;
+
+    // Field 4: battery_discharge_w
+    idx = 4 * TOTAL_POINTS + i;
+    field_values[idx].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    field_values[idx].data.float_val = rand_float(0.0f, 2000.0f) * (1.0f - solar_factor);
+
+    // Field 5: house_w
+    idx = 5 * TOTAL_POINTS + i;
+    field_values[idx].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    field_values[idx].data.float_val = rand_float(1000.0f, 5000.0f);
+  }
+
+  // Insert all data
+  timeseries_insert_data_t insert_data = {
+      .measurement_name = "solar",
+      .tag_keys = tags_keys,
+      .tag_values = tags_values,
+      .num_tags = num_tags,
+      .field_names = solar_fields,
+      .field_values = field_values,
+      .num_fields = NUM_SOLAR_FIELDS,
+      .timestamps_ms = timestamps,
+      .num_points = TOTAL_POINTS,
+  };
+
+  int64_t insert_start = esp_timer_get_time();
+  if (!timeseries_insert(&insert_data)) {
+    ESP_LOGE(TAG, "Failed to insert solar data!");
+    free(timestamps);
+    free(field_values);
+    return;
+  }
+  int64_t insert_end = esp_timer_get_time();
+
+  ESP_LOGI(TAG, "Inserted %u points in %lld ms",
+           TOTAL_POINTS, (insert_end - insert_start) / 1000);
+
+  // Compact the data
+  ESP_LOGI(TAG, "Starting compaction...");
+  int64_t compact_start = esp_timer_get_time();
+  if (!timeseries_compact()) {
+    ESP_LOGE(TAG, "Compaction failed!");
+  } else {
+    int64_t compact_end = esp_timer_get_time();
+    ESP_LOGI(TAG, "Compaction completed in %lld ms",
+             (compact_end - compact_start) / 1000);
+  }
 
   // ---------------------------------------------------------
-  // First batch of data (10 points) inserted just once
+  // Query each day and measure performance
   // ---------------------------------------------------------
-  {
-    const size_t NUM_POINTS_1 = 10;
-    uint64_t timestamps1[NUM_POINTS_1];
-    // We need 'num_fields * NUM_POINTS_1' field values, in row-major form:
-    // field_values[ field_index * num_points + point_index ]
-    timeseries_field_value_t field_values1[num_fields * NUM_POINTS_1];
 
-    // Fill the arrays for i in [0..9]
-    for (size_t i = 0; i < NUM_POINTS_1; i++) {
-      timestamps1[i] = 1737381864000ULL + i; // some fake epoch ms
+  ESP_LOGI(TAG, "\n=== Querying 14 days of data ===");
 
-      // Field 0: "temperature" (float)
-      size_t idx_temp = 0 * NUM_POINTS_1 + i;
-      field_values1[idx_temp].type = TIMESERIES_FIELD_TYPE_FLOAT;
-      field_values1[idx_temp].data.float_val = 1.23f * (float)i;
+  int64_t query_times[DAYS_TO_GENERATE];
 
-      // Field 1: "status" (bool)
-      size_t idx_status = 1 * NUM_POINTS_1 + i;
-      field_values1[idx_status].type = TIMESERIES_FIELD_TYPE_BOOL;
-      field_values1[idx_status].data.bool_val = ((int)i % 2 == 0);
+  // Get the midnight at the start of the data range
+  uint64_t first_midnight = get_midnight_ms(start_time);
 
-      // Field 2: "device_id" (int)
-      size_t idx_device = 2 * NUM_POINTS_1 + i;
-      field_values1[idx_device].type = TIMESERIES_FIELD_TYPE_INT;
-      field_values1[idx_device].data.int_val = (int)i * 4;
-    }
+  ESP_LOGI(TAG, "Data range: %llu to %llu",
+           (unsigned long long)start_time,
+           (unsigned long long)end_time);
+  ESP_LOGI(TAG, "First midnight: %llu", (unsigned long long)first_midnight);
 
-    // Prepare the insert descriptor
-    timeseries_insert_data_t insert_data1 = {
-        .measurement_name = "weather",
-        .tag_keys = tags_keys,
-        .tag_values = tags_values,
-        .num_tags = num_tags,
+  // Query each day starting from the most recent day
+  for (int day = 0; day < DAYS_TO_GENERATE; day++) {
+    // Calculate the day index from the end (most recent = 0)
+    int day_index = DAYS_TO_GENERATE - 1 - day;
 
-        .field_names = field_names,
-        .field_values = field_values1,
-        .num_fields = num_fields,
+    // Calculate day boundaries
+    uint64_t day_start = first_midnight + (day_index * ms_per_day);
+    uint64_t day_end = day_start + ms_per_day - 1;
 
-        .timestamps_ms = timestamps1,
-        .num_points = NUM_POINTS_1,
-    };
+    // Build query
+    timeseries_query_t query;
+    memset(&query, 0, sizeof(query));
+    query.measurement_name = "solar";
+    query.tag_keys = tags_keys;
+    query.tag_values = tags_values;
+    query.num_tags = num_tags;
+    query.field_names = solar_fields;
+    query.num_fields = NUM_SOLAR_FIELDS;
+    query.start_ms = day_start;
+    query.end_ms = day_end;
+    query.limit = 0; // No limit
 
-    if (!timeseries_insert(&insert_data1)) {
-      ESP_LOGE(TAG, "First multi-point insert failed!");
-      return;
-    }
-    ESP_LOGI(TAG, "First batch of 10 data points inserted successfully.");
+    // Execute query
+    timeseries_query_result_t result;
+    memset(&result, 0, sizeof(result));
 
-    // Optionally do a compaction pass here
-    ESP_LOGI(TAG, "Starting initial compaction...");
-    if (!timeseries_compact()) {
-      ESP_LOGE(TAG, "Timeseries compaction failed!");
+    int64_t q_start = esp_timer_get_time();
+    bool success = timeseries_query(&query, &result);
+    int64_t q_end = esp_timer_get_time();
+
+    query_times[day] = q_end - q_start;
+
+    if (!success) {
+      ESP_LOGE(TAG, "Day %d query failed!", day);
+      query_times[day] = -1;
     } else {
-      ESP_LOGI(TAG, "Initial compaction finished successfully.");
+      ESP_LOGI(TAG, "Day %d (day_index=%d): %llu to %llu -> %u points in %lld ms",
+               day,
+               day_index,
+               (unsigned long long)day_start,
+               (unsigned long long)day_end,
+               (unsigned)result.num_points,
+               query_times[day] / 1000);
+      timeseries_query_free_result(&result);
     }
   }
 
   // ---------------------------------------------------------
-  // 2) Continuously write new data points every 30 seconds
+  // Calculate and display statistics
   // ---------------------------------------------------------
-  ESP_LOGI(TAG, "Now continuously writing new points every 30 seconds...");
 
-  // We'll keep an incrementing index to vary the data
-  uint64_t base_ts = 1737381865000ULL; // arbitrary start
-  size_t i = 0;
+  ESP_LOGI(TAG, "\n=== Query Performance Statistics ===");
 
-  for (;;) {
-    // Wait 30 seconds between each write
-    vTaskDelay(pdMS_TO_TICKS(1));
+  int64_t sum = 0;
+  int64_t min_time = LLONG_MAX;
+  int64_t max_time = LLONG_MIN;
+  int valid_queries = 0;
 
-    // Build a single point (timestamp + 3 fields)
-    unsigned int random_increment = (rand() % 10000) + 50000;
-    base_ts += random_increment;
-
-    timeseries_field_value_t single_point_fields[3];
-
-    // Field 0: temperature
-    single_point_fields[0].type = TIMESERIES_FIELD_TYPE_FLOAT;
-    single_point_fields[0].data.float_val = 0.5f * i;
-
-    // Field 1: status (bool)
-    single_point_fields[1].type = TIMESERIES_FIELD_TYPE_BOOL;
-    single_point_fields[1].data.bool_val = (i % 2 == 0);
-
-    // Field 2: device_id (int)
-    single_point_fields[2].type = TIMESERIES_FIELD_TYPE_INT;
-    single_point_fields[2].data.int_val = (int)(100 + random_increment);
-
-    // Prepare insert descriptor for 1 point
-    timeseries_insert_data_t insert_data = {
-        .measurement_name = "weather",
-        .tag_keys = tags_keys,
-        .tag_values = tags_values,
-        .num_tags = num_tags,
-
-        .field_names = field_names,
-        .field_values = single_point_fields,
-        .num_fields = num_fields,
-
-        .timestamps_ms = &base_ts,
-        .num_points = 1, // single point
-    };
-
-    if (!timeseries_insert(&insert_data)) {
-      ESP_LOGE(TAG, "Failed to insert single-point data (i=%u)!", (unsigned)i);
-
-      while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-      }
+  for (int day = 0; day < DAYS_TO_GENERATE; day++) {
+    if (query_times[day] >= 0) {
+      sum += query_times[day];
+      if (query_times[day] < min_time) min_time = query_times[day];
+      if (query_times[day] > max_time) max_time = query_times[day];
+      valid_queries++;
     }
+  }
 
-    if (i % 100 == 0) {
-      ESP_LOGE(TAG, "Inserted point #%u at time=%llu ms", (unsigned)i,
-               (unsigned long long)base_ts);
+  if (valid_queries > 0) {
+    int64_t avg_time = sum / valid_queries;
+    ESP_LOGI(TAG, "Average query time: %lld ms", avg_time / 1000);
+    ESP_LOGI(TAG, "Minimum query time: %lld ms", min_time / 1000);
+    ESP_LOGI(TAG, "Maximum query time: %lld ms", max_time / 1000);
+  } else {
+    ESP_LOGE(TAG, "No valid queries to calculate statistics!");
+  }
 
-      timeseries_expire();
-    }
+  // Clean up
+  free(timestamps);
+  free(field_values);
 
-    i++;
+  ESP_LOGI(TAG, "\n=== Example complete ===");
+
+  // Keep running
+  while (1) {
+    vTaskDelay(pdMS_TO_TICKS(10000));
   }
 }

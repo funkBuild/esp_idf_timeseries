@@ -149,7 +149,6 @@ bool tsdb_find_measurement_id(timeseries_db_t* db, const char* measurement_name,
     return false;
   }
 
-  // We'll scan all active METADATA pages to look for a matching measurement
   uint32_t meta_offsets[4];
   size_t meta_count = 0;
   if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
@@ -479,6 +478,10 @@ static bool tsdb_create_empty_metadata_page(timeseries_db_t* db, uint32_t page_o
   if (!db) {
     return false;
   }
+
+  // Invalidate metadata page cache since we're creating a new page
+  db->cached_metadata_valid = false;
+
   ESP_LOGV(TAG, "Creating empty metadata page at offset=0x%08" PRIx32 "...", page_offset);
 
   // Erase 8 KB from page_offset
@@ -571,8 +574,8 @@ static bool tsdb_insert_measurement_entry(timeseries_db_t* db, uint32_t page_off
 /**
  * @brief Finds all offsets in the partition that are active METADATA pages.
  *
- * The new page iterator returns (header, offset, size). We check if
- * page_type==METADATA && state==ACTIVE, then store `offset`.
+ * Uses a cache to avoid repeated full page scans. The cache is populated
+ * on the first call and reused until invalidated.
  */
 static bool tsdb_find_metadata_pages(timeseries_db_t* db, uint32_t* out_offsets, size_t max_pages,
                                      size_t* found_count) {
@@ -581,6 +584,17 @@ static bool tsdb_find_metadata_pages(timeseries_db_t* db, uint32_t* out_offsets,
   }
   *found_count = 0;
 
+  // Check cache first
+  if (db->cached_metadata_valid && db->cached_metadata_count > 0) {
+    size_t copy_count = (db->cached_metadata_count < max_pages) ? db->cached_metadata_count : max_pages;
+    for (size_t i = 0; i < copy_count; i++) {
+      out_offsets[i] = db->cached_metadata_offsets[i];
+    }
+    *found_count = copy_count;
+    return true;
+  }
+
+  // Cache miss - do full scan
   timeseries_page_cache_iterator_t page_iter;
   if (!timeseries_page_cache_iterator_init(db, &page_iter)) {
     return false;
@@ -600,6 +614,16 @@ static bool tsdb_find_metadata_pages(timeseries_db_t* db, uint32_t* out_offsets,
         break;
       }
     }
+  }
+
+  // Update cache with results
+  if (*found_count > 0) {
+    size_t cache_count = (*found_count < 4) ? *found_count : 4;
+    for (size_t i = 0; i < cache_count; i++) {
+      db->cached_metadata_offsets[i] = out_offsets[i];
+    }
+    db->cached_metadata_count = cache_count;
+    db->cached_metadata_valid = true;
   }
 
   return (*found_count > 0);

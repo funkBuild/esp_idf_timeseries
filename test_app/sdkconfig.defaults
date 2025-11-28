@@ -1,0 +1,29 @@
+# ESP IDF Timeseries Test Configuration
+# Enables all features for comprehensive testing
+
+# Series ID Cache Configuration
+CONFIG_TIMESERIES_USE_SERIES_ID_CACHE=y
+CONFIG_TIMESERIES_SERIES_ID_CACHE_SIZE=64
+CONFIG_TIMESERIES_CACHE_USE_LRU=y
+CONFIG_TIMESERIES_ENABLE_CACHE_STATS=y
+
+# Chunk Buffer Configuration
+CONFIG_TIMESERIES_CHUNK_BUFFER_SIZE=16
+
+# Flash Configuration - 4MB needed for partitions
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Partition Table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Heap tracing for memory leak detection
+CONFIG_HEAP_TRACING_STANDALONE=y
+
+# Unity test framework
+CONFIG_UNITY_ENABLE_FLOAT=y
+CONFIG_UNITY_ENABLE_DOUBLE=y
+CONFIG_UNITY_ENABLE_IDF_TEST_RUNNER=y
+
+# Compiler Optimization - Use O2 for performance testing
+CONFIG_COMPILER_OPTIMIZATION_PERF=y

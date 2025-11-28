@@ -315,6 +315,10 @@ bool timeseries_clear_all() {
   s_tsdb.last_l0_page_offset = 0;
   s_tsdb.last_l0_used_offset = 0;
 
+  // Reset metadata page cache
+  s_tsdb.cached_metadata_valid = false;
+  s_tsdb.cached_metadata_count = 0;
+
   // Add back the metadata page
   timeseries_metadata_create_page(&s_tsdb);
 

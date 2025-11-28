@@ -218,6 +218,11 @@ typedef struct {
   series_type_cache_entry_t *type_cache;
   size_t type_cache_size;
 
+  // Metadata page offset cache (Priority 1 optimization)
+  uint32_t cached_metadata_offsets[4];  // Cache up to 4 metadata page offsets
+  size_t cached_metadata_count;
+  bool cached_metadata_valid;
+
   // Pre-allocated write buffer for chunks
   uint8_t *write_buffer;
   size_t write_buffer_capacity;

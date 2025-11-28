@@ -1362,3 +1362,64 @@ bool tsdb_find_all_series_ids_for_measurement(timeseries_db_t* db, uint32_t meas
 
   return found_any;
 }
+
+// =============================================================================
+// Series Type Cache (Phase 2 Optimization)
+// =============================================================================
+
+/**
+ * @brief Simple hash function for series_id (use first 4 bytes)
+ */
+static inline size_t hash_series_id(const unsigned char series_id[16], size_t cache_size) {
+  if (cache_size == 0) return 0;
+  uint32_t hash = 0;
+  // Use first 4 bytes of series_id for hash
+  memcpy(&hash, series_id, sizeof(uint32_t));
+  return hash % cache_size;
+}
+
+/**
+ * @brief Look up series type in cache, with fallback to metadata scan
+ * @note This replaces direct calls to tsdb_lookup_series_type_in_metadata
+ */
+bool tsdb_lookup_series_type_cached(timeseries_db_t* db, const unsigned char series_id[16],
+                                     timeseries_field_type_e* out_type) {
+  if (!db || !series_id || !out_type) {
+    return false;
+  }
+
+  // Check cache first if available
+  if (db->type_cache && db->type_cache_size > 0) {
+    size_t idx = hash_series_id(series_id, db->type_cache_size);
+    series_type_cache_entry_t* entry = &db->type_cache[idx];
+
+    if (entry->valid && memcmp(entry->series_id, series_id, 16) == 0) {
+      // Cache hit!
+      *out_type = (timeseries_field_type_e)entry->field_type;
+      return true;
+    }
+  }
+
+  // Cache miss - do the metadata scan
+  bool found = tsdb_lookup_series_type_in_metadata(db, series_id, out_type);
+
+  // If found, cache the result
+  if (found && db->type_cache && db->type_cache_size > 0) {
+    size_t idx = hash_series_id(series_id, db->type_cache_size);
+    series_type_cache_entry_t* entry = &db->type_cache[idx];
+    memcpy(entry->series_id, series_id, 16);
+    entry->field_type = (uint8_t)*out_type;
+    entry->valid = true;
+  }
+
+  return found;
+}
+
+/**
+ * @brief Clear the type cache (called when metadata changes)
+ */
+void tsdb_clear_type_cache(timeseries_db_t* db) {
+  if (db && db->type_cache && db->type_cache_size > 0) {
+    memset(db->type_cache, 0, db->type_cache_size * sizeof(series_type_cache_entry_t));
+  }
+}

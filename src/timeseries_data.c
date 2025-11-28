@@ -135,19 +135,17 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
            "tsdb_append_multiple_points: series=%.2X%.2X%.2X%.2X..., count=%zu",
            series_id[0], series_id[1], series_id[2], series_id[3], count);
 
-  // Maximum points to attempt in a single write (to avoid excessive halving)
-  // With 8KB pages and ~20 bytes per point, we can fit ~300-400 points max
-  // Since we're not compacting during insert, we can be more aggressive
-  const size_t MAX_INITIAL_CHUNK = 300;
+  // Use configurable chunk size from DB context
+  const size_t chunk_size = db->chunk_size;
 
   size_t remaining = count;
   size_t idx = 0;
 
   while (remaining > 0) {
-    size_t npoints_possible = (remaining > MAX_INITIAL_CHUNK) ? MAX_INITIAL_CHUNK : remaining;
+    size_t npoints_possible = (remaining > chunk_size) ? chunk_size : remaining;
 
     // Log progress for large inserts
-    if (count > MAX_INITIAL_CHUNK && remaining % 500 == 0) {
+    if (count > chunk_size && remaining % 500 == 0) {
       ESP_LOGI(TAG, "Insert progress: %zu/%zu points completed",
                count - remaining, count);
     }
@@ -433,10 +431,35 @@ static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
   }
   fhdr.record_length = (uint16_t)total_col_data;
 
-  // 3) Allocate a buffer for [col_hdr + timestamps + values]
-  uint8_t *col_buf = (uint8_t *)malloc(total_col_data);
+  // 3) Use pre-allocated buffer if available, otherwise allocate
+  uint8_t *col_buf = NULL;
+  bool using_preallocated = false;
+
+  if (db->write_buffer && db->write_buffer_capacity >= total_col_data) {
+    // Use pre-allocated buffer
+    col_buf = db->write_buffer;
+    using_preallocated = true;
+    ESP_LOGV(TAG, "Using pre-allocated buffer (%zu bytes needed, %zu available)",
+             total_col_data, db->write_buffer_capacity);
+  } else if (db->write_buffer && total_col_data <= 64 * 1024) { // Don't grow beyond 64KB
+    // Try to grow the pre-allocated buffer
+    uint8_t *new_buffer = (uint8_t *)realloc(db->write_buffer, total_col_data);
+    if (new_buffer) {
+      db->write_buffer = new_buffer;
+      db->write_buffer_capacity = total_col_data;
+      col_buf = db->write_buffer;
+      using_preallocated = true;
+      ESP_LOGV(TAG, "Grew pre-allocated buffer to %zu bytes", total_col_data);
+    }
+  }
+
   if (!col_buf) {
-    return false;
+    // Fall back to malloc for very large writes or if no pre-allocated buffer
+    col_buf = (uint8_t *)malloc(total_col_data);
+    if (!col_buf) {
+      return false;
+    }
+    ESP_LOGV(TAG, "Using malloc for buffer (%zu bytes)", total_col_data);
   }
 
   // 4) Fill col_buf
@@ -457,13 +480,19 @@ static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
   esp_err_t err =
       esp_partition_write(db->partition, write_addr, &fhdr, sizeof(fhdr));
   if (err != ESP_OK) {
-    free(col_buf);
+    if (!using_preallocated) {
+      free(col_buf);
+    }
     return false;
   }
   write_addr += sizeof(fhdr);
 
   err = esp_partition_write(db->partition, write_addr, col_buf, total_col_data);
-  free(col_buf);
+
+  // Only free if we allocated it (not using pre-allocated buffer)
+  if (!using_preallocated) {
+    free(col_buf);
+  }
 
   if (err != ESP_OK) {
     return false;

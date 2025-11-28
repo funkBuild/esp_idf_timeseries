@@ -648,15 +648,24 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     return 0;
   }
 
+  // Profiling timers for Phase 3 optimization
+  uint64_t prof_start, prof_end;
+
   // --------------------------------------------------------------------------
   // PART A: Single pass to gather the record_info linked-lists for each series
   // --------------------------------------------------------------------------
+  prof_start = esp_timer_get_time();
 
   series_lookup_t srl_tbl = {0};
   if (!series_lookup_build(fields_array, num_fields, &srl_tbl)) {
     ESP_LOGE(TAG, "OOM building series-id lookup table");
     return 0;
   }
+
+  prof_end = esp_timer_get_time();
+  ESP_LOGI(TAG, "[PROFILE] Lookup table build: %.3f ms", (prof_end - prof_start) / 1000.0);
+
+  prof_start = esp_timer_get_time();
 
   timeseries_page_cache_iterator_t page_iter;
   if (!timeseries_page_cache_iterator_init(db, &page_iter)) {
@@ -707,20 +716,38 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
       series_record_list_t *srl = series_lookup_find(&srl_tbl, fdh.series_id);
       if (srl) {
         records_found++;
-        if (field_record_list_append(&srl->records_head, &fdh, absolute_offset,
-                                     query->limit)) {
-          field_record_list_prune(&srl->records_head, query->limit);
-        }
+        field_record_list_append(&srl->records_head, &fdh, absolute_offset,
+                                 query->limit);
       }
     } // end while fielddata_iterator
   } // end while page_iterator
 
-  ESP_LOGI(TAG, "Page scan complete: %d pages, %d field_data pages, %d matching records",
-           pages_processed, field_data_pages, records_found);
+  prof_end = esp_timer_get_time();
+  ESP_LOGI(TAG, "[PROFILE] Page scanning: %.3f ms (%d pages, %d field_data pages, %d records)",
+           (prof_end - prof_start) / 1000.0, pages_processed, field_data_pages, records_found);
+
+  // Optimization #1: Prune once per series after all records collected (instead of after each append)
+  prof_start = esp_timer_get_time();
+  for (size_t f = 0; f < num_fields; f++) {
+    for (size_t s = 0; s < fields_array[f].num_series; s++) {
+      field_record_list_prune(&fields_array[f].series_lists[s].records_head, query->limit);
+    }
+  }
+  prof_end = esp_timer_get_time();
+  ESP_LOGI(TAG, "[PROFILE] Prune lists: %.3f ms", (prof_end - prof_start) / 1000.0);
 
   // --------------------------------------------------------------------------
   // PART B: Verify that all series in each field share the same type
   // --------------------------------------------------------------------------
+  prof_start = esp_timer_get_time();
+
+  // Fine-grained profiling for Phase 3
+  uint64_t prof_type_verify = 0;
+  uint64_t prof_iter_create = 0;
+  uint64_t prof_decompress = 0;
+  uint64_t prof_result_build = 0;
+  uint64_t prof_temp;
+
   size_t total_points_aggregated = 0;
 
   // Example aggregator settings. In real usage, these might come from the
@@ -728,6 +755,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
   timeseries_aggregation_method_e agg_method = TSDB_AGGREGATION_AVG;
 
   for (size_t f = 0; f < num_fields; f++) {
+    prof_temp = esp_timer_get_time();
     field_info_t *fld = &fields_array[f];
     if (fld->num_series == 0) {
       continue;
@@ -740,7 +768,8 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
 
     for (size_t s = 0; s < fld->num_series; s++) {
       timeseries_field_type_e series_type;
-      bool found_type = tsdb_lookup_series_type_in_metadata(
+      // Use cached lookup (Phase 2 optimization)
+      bool found_type = tsdb_lookup_series_type_cached(
           db, fld->series_lists[s].series_id.bytes, &series_type);
       if (!found_type) {
         ESP_LOGW(TAG,
@@ -772,11 +801,14 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
       continue;
     }
 
+    prof_type_verify += (esp_timer_get_time() - prof_temp);
+
     // ----------------------------------------------------------------------
     // PART C: Build multi_points_iterator per series, unify via
     // multi_series_iterator
     //         and store the aggregator results in the `result` struct.
     // ----------------------------------------------------------------------
+    prof_temp = esp_timer_get_time();
 
     // We'll create a column in `result` for this field (if not already
     // present). This is the column we'll store all aggregated points into.
@@ -831,8 +863,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
       rec = srl->records_head;
       size_t idx = 0;
       while (rec) {
-        timeseries_points_iterator_t *pit =
-            calloc(1, sizeof(timeseries_points_iterator_t));
+        timeseries_points_iterator_t *pit = calloc(1, sizeof(timeseries_points_iterator_t));
         if (!pit) {
           ESP_LOGW(TAG, "OOM creating sub-iterator for '%s'", fld->field_name);
           rec = rec->next;
@@ -884,6 +915,8 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     } // end for each series in field
 
     // Use multi_series_iterator to aggregate across all series in the field
+    prof_iter_create += (esp_timer_get_time() - prof_temp);
+
     timeseries_multi_series_iterator_t ms_iter;
     if (!timeseries_multi_series_iterator_init(
             series_multi_iters, fld->num_series, query->rollup_interval,
@@ -893,13 +926,18 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
       // We'll pull aggregated points until exhausted, or until limit/time-range
       // reached
       while (true) {
+        prof_temp = esp_timer_get_time();
         uint64_t rollup_ts = 0;
         timeseries_field_value_t val_agg;
         bool got_data = timeseries_multi_series_iterator_next(
             &ms_iter, &rollup_ts, &val_agg);
+        prof_decompress += (esp_timer_get_time() - prof_temp);
+
         if (!got_data) {
           break; // no more data
         }
+
+        prof_temp = esp_timer_get_time();
 
         // Optional time-range filtering (if requested)
         if (query->start_ms != 0 && rollup_ts < query->start_ms) {
@@ -934,6 +972,8 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
         inserted_for_this_field++;
         total_points_aggregated++;
 
+        prof_result_build += (esp_timer_get_time() - prof_temp);
+
       } // end while aggregator
       timeseries_multi_series_iterator_deinit(&ms_iter);
     }
@@ -958,6 +998,13 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     }
     free(series_multi_iters);
   } // end for each field
+
+  prof_end = esp_timer_get_time();
+  ESP_LOGI(TAG, "[PROFILE] Type verification + iteration + aggregation: %.3f ms",
+           (prof_end - prof_start) / 1000.0);
+  ESP_LOGI(TAG, "[PROFILE DETAIL] Type verify: %.3f ms, Iter create: %.3f ms, Decompress: %.3f ms, Result build: %.3f ms",
+           prof_type_verify / 1000.0, prof_iter_create / 1000.0,
+           prof_decompress / 1000.0, prof_result_build / 1000.0);
 
   series_lookup_free(&srl_tbl);
 

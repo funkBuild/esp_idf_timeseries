@@ -1,6 +1,7 @@
 #include "timeseries_points_iterator.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "gorilla/gorilla_stream_decoder.h"
 #include "timeseries_compression.h"
 #include "timeseries_data.h"
@@ -63,6 +64,15 @@ bool timeseries_points_iterator_init(
     return false;
   }
 
+  // Profiling for Phase 3 investigation
+  uint64_t prof_start, prof_end;
+  uint64_t prof_hdr_read = 0;
+  uint64_t prof_ts_malloc = 0;
+  uint64_t prof_ts_read = 0;
+  uint64_t prof_val_malloc = 0;
+  uint64_t prof_val_read = 0;
+  uint64_t prof_decoder_init = 0;
+
   // 1) Read col_data_header
   if (record_length < sizeof(timeseries_col_data_header_t)) {
     ESP_LOGE(TAG, "record_length too small for col_header: %u < %zu",
@@ -71,9 +81,13 @@ bool timeseries_points_iterator_init(
     return false;
   }
 
+  prof_start = esp_timer_get_time();
   timeseries_col_data_header_t col_hdr;
   esp_err_t err = esp_partition_read(db->partition, record_data_offset,
                                      &col_hdr, sizeof(col_hdr));
+  prof_end = esp_timer_get_time();
+  prof_hdr_read = prof_end - prof_start;
+
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed reading col_header at 0x%08X (err=0x%x)",
              (unsigned)record_data_offset, err);
@@ -95,15 +109,25 @@ bool timeseries_points_iterator_init(
   // 2) If compressed => load Gorilla blocks into memory
   if (compressed) {
     iter->ts_comp_len = col_hdr.ts_len;
+
+    prof_start = esp_timer_get_time();
     iter->ts_comp_buf = (uint8_t *)malloc(col_hdr.ts_len);
+    prof_end = esp_timer_get_time();
+    prof_ts_malloc = prof_end - prof_start;
+
     if (!iter->ts_comp_buf) {
       ESP_LOGE(TAG, "OOM for timestamp buffer of size %u",
                (unsigned)col_hdr.ts_len);
       iter->valid = false;
       return false;
     }
+
+    prof_start = esp_timer_get_time();
     err = esp_partition_read(db->partition, ts_offset, iter->ts_comp_buf,
                              col_hdr.ts_len);
+    prof_end = esp_timer_get_time();
+    prof_ts_read = prof_end - prof_start;
+
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed reading timestamp block (err=0x%x)", err);
       free(iter->ts_comp_buf);
@@ -113,7 +137,12 @@ bool timeseries_points_iterator_init(
     }
 
     iter->val_comp_len = col_hdr.val_len;
+
+    prof_start = esp_timer_get_time();
     iter->val_comp_buf = (uint8_t *)malloc(col_hdr.val_len);
+    prof_end = esp_timer_get_time();
+    prof_val_malloc = prof_end - prof_start;
+
     if (!iter->val_comp_buf) {
       ESP_LOGE(TAG, "OOM for value buffer of size %u",
                (unsigned)col_hdr.val_len);
@@ -122,8 +151,13 @@ bool timeseries_points_iterator_init(
       iter->valid = false;
       return false;
     }
+
+    prof_start = esp_timer_get_time();
     err = esp_partition_read(db->partition, val_offset, iter->val_comp_buf,
                              col_hdr.val_len);
+    prof_end = esp_timer_get_time();
+    prof_val_read = prof_end - prof_start;
+
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed reading value block (err=0x%x)", err);
       free(iter->ts_comp_buf);
@@ -135,6 +169,8 @@ bool timeseries_points_iterator_init(
     }
 
     // Now initialize Gorilla decoders (timestamps + values)
+    prof_start = esp_timer_get_time();
+
     iter->ts_cb_storage.data = iter->ts_comp_buf;
     iter->ts_cb_storage.size = iter->ts_comp_len;
     iter->ts_cb_storage.capacity = iter->ts_comp_len;
@@ -190,6 +226,23 @@ bool timeseries_points_iterator_init(
       iter->valid = false;
       return false;
     }
+
+    prof_end = esp_timer_get_time();
+    prof_decoder_init = prof_end - prof_start;
+
+    // Log detailed profiling breakdown
+    uint64_t total_time = prof_hdr_read + prof_ts_malloc + prof_ts_read +
+                          prof_val_malloc + prof_val_read + prof_decoder_init;
+    ESP_LOGI(TAG, "[ITER INIT] Total: %.3f ms (hdr: %.3f, ts_malloc: %.3f, ts_read: %.3f, val_malloc: %.3f, val_read: %.3f, decoder: %.3f) [ts_len=%u, val_len=%u]",
+             total_time / 1000.0,
+             prof_hdr_read / 1000.0,
+             prof_ts_malloc / 1000.0,
+             prof_ts_read / 1000.0,
+             prof_val_malloc / 1000.0,
+             prof_val_read / 1000.0,
+             prof_decoder_init / 1000.0,
+             (unsigned)col_hdr.ts_len,
+             (unsigned)col_hdr.val_len);
 
     ESP_LOGV(TAG, "Iterator init: compressed, record_count=%u", record_count);
   } else {

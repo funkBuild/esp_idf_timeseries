@@ -173,6 +173,11 @@ void timeseries_query_free_result(timeseries_query_result_t* result);
 
 bool timeseries_clear_all();
 
+/**
+ * @brief Set the chunk size for large inserts
+ */
+void timeseries_set_chunk_size(size_t chunk_size);
+
 #ifdef __cplusplus
 }
 #endif

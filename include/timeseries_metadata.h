@@ -83,6 +83,19 @@ bool tsdb_lookup_series_type_in_metadata(timeseries_db_t *db,
                                          timeseries_field_type_e *out_type);
 
 /**
+ * @brief Look up series type with cache (Phase 2 optimization)
+ * @note Uses cache first, falls back to metadata scan. Caches result on miss.
+ */
+bool tsdb_lookup_series_type_cached(timeseries_db_t *db,
+                                     const unsigned char series_id[16],
+                                     timeseries_field_type_e *out_type);
+
+/**
+ * @brief Clear the series type cache
+ */
+void tsdb_clear_type_cache(timeseries_db_t *db);
+
+/**
  * @brief Ensure the metadata has an entry for this series_id and field type.
  *        If it does not exist, creates it. If it exists with a conflicting
  *        type, returns false.

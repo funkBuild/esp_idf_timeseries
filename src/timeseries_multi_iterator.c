@@ -108,6 +108,17 @@ bool timeseries_multi_points_iterator_init(timeseries_points_iterator_t** sub_it
     return false;
   }
 
+  // Pre-allocate deduplication buffer (Fix #1.4)
+  out_iter->dedup_buffer = (size_t*)malloc(sub_count * sizeof(size_t));
+  if (!out_iter->dedup_buffer) {
+    free(out_iter->heap);
+    free(out_iter->subs);
+    out_iter->heap = NULL;
+    out_iter->subs = NULL;
+    return false;
+  }
+  out_iter->dedup_buffer_cap = sub_count;
+
   out_iter->sub_count = sub_count;
   out_iter->heap_size = 0;
   out_iter->valid = true;
@@ -167,11 +178,8 @@ bool timeseries_multi_points_iterator_next(timeseries_multi_points_iterator_t* m
   // We'll pop from the heap each sub-iterator that has the same timestamp
   // keep them in a temporary list
   size_t same_ts_pop_count = 0;
-  size_t* popped = (size_t*)malloc(sizeof(size_t) * multi_iter->heap_size);
-  if (!popped) {
-    // Not enough memory for pop buffer => fail or just handle them one by one
-    return false;
-  }
+  // Use pre-allocated deduplication buffer (Fix #1.4)
+  size_t* popped = multi_iter->dedup_buffer;
 
   // Repeatedly pop while the top has same_ts
   while (multi_iter->heap_size > 0) {
@@ -232,7 +240,7 @@ bool timeseries_multi_points_iterator_next(timeseries_multi_points_iterator_t* m
       }
     }
   }
-  free(popped);
+  // No free needed - using pre-allocated buffer (Fix #1.4)
 
   return true;
 }
@@ -258,6 +266,10 @@ void timeseries_multi_points_iterator_deinit(timeseries_multi_points_iterator_t*
   if (multi_iter->heap) {
     free(multi_iter->heap);
     multi_iter->heap = NULL;
+  }
+  if (multi_iter->dedup_buffer) {
+    free(multi_iter->dedup_buffer);
+    multi_iter->dedup_buffer = NULL;
   }
   memset(multi_iter, 0, sizeof(*multi_iter));
 }

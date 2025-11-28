@@ -1,0 +1,52 @@
+menu "ESP IDF Timeseries Configuration"
+
+    config TIMESERIES_USE_SERIES_ID_CACHE
+        bool "Enable Series ID Cache"
+        default y
+        help
+            Enable the in-memory series ID cache to speed up repeated inserts
+            to the same series. This significantly improves performance for
+            workloads that repeatedly write to the same measurement/field
+            combinations. Disable this to save memory if you have many
+            unique series.
+
+    config TIMESERIES_SERIES_ID_CACHE_SIZE
+        int "Series ID Cache Size"
+        depends on TIMESERIES_USE_SERIES_ID_CACHE
+        range 8 256
+        default 64
+        help
+            Number of series IDs to cache in memory. Each entry uses approximately
+            150 bytes of RAM. Larger values improve cache hit rate but use more memory.
+            Recommended values:
+            - 16-32 for memory-constrained systems
+            - 64 for typical use cases
+            - 128-256 for systems with many series
+
+    config TIMESERIES_CACHE_USE_LRU
+        bool "Use LRU eviction policy"
+        depends on TIMESERIES_USE_SERIES_ID_CACHE
+        default y
+        help
+            Use Least Recently Used (LRU) eviction policy for the series ID cache.
+            When disabled, uses a simple round-robin replacement policy which is
+            faster but less effective.
+
+    config TIMESERIES_ENABLE_CACHE_STATS
+        bool "Enable cache statistics"
+        depends on TIMESERIES_USE_SERIES_ID_CACHE
+        default n
+        help
+            Track and log cache hit/miss statistics. Useful for tuning cache size
+            and monitoring performance. Adds minimal overhead.
+
+    config TIMESERIES_CHUNK_BUFFER_SIZE
+        int "Initial chunk write buffer size (KB)"
+        range 4 64
+        default 16
+        help
+            Initial size of the pre-allocated buffer for chunk writes.
+            This buffer will grow as needed but starts at this size.
+            Larger values reduce reallocations but use more memory.
+
+endmenu

@@ -59,6 +59,12 @@ void app_main(void) {
     return;
   }
 
+  // Clear all data before benchmark to prevent flash fragmentation
+  ESP_LOGI(TAG, "Clearing flash data...");
+  if (!timeseries_clear_all()) {
+    ESP_LOGW(TAG, "Failed to clear data (continuing anyway)");
+  }
+
   ESP_LOGI(TAG, "=== Solar Data Timeseries Example ===");
 
   // Tags for solar system

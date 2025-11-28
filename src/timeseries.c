@@ -1,6 +1,7 @@
 #include "timeseries.h"
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "timeseries_cache.h"
 #include "timeseries_compaction.h"
 #include "timeseries_data.h"
 #include "timeseries_expiration.h"
@@ -8,6 +9,7 @@
 #include "timeseries_iterator.h"
 #include "timeseries_metadata.h"
 #include "timeseries_page_cache.h"
+#include "timeseries_points_iterator.h"
 #include "timeseries_query.h"
 
 #include "esp_timer.h"
@@ -48,6 +50,41 @@ bool timeseries_init(void) {
   s_tsdb.last_l0_cache_valid = false;
   s_tsdb.last_l0_page_offset = 0;
   s_tsdb.last_l0_used_offset = 0;
+
+  // Initialize series ID cache
+  if (!tsdb_cache_init(&s_tsdb)) {
+    ESP_LOGW(TAG, "Failed to initialize series ID cache (continuing without cache)");
+  }
+
+  // Pre-allocate write buffer
+#ifdef CONFIG_TIMESERIES_CHUNK_BUFFER_SIZE
+  size_t initial_buffer_size = CONFIG_TIMESERIES_CHUNK_BUFFER_SIZE * 1024;
+#else
+  size_t initial_buffer_size = 16 * 1024; // Default 16KB
+#endif
+  s_tsdb.write_buffer = (uint8_t *)malloc(initial_buffer_size);
+  if (s_tsdb.write_buffer) {
+    s_tsdb.write_buffer_capacity = initial_buffer_size;
+    ESP_LOGI(TAG, "Allocated %zu KB write buffer", initial_buffer_size / 1024);
+  } else {
+    s_tsdb.write_buffer_capacity = 0;
+    ESP_LOGW(TAG, "Failed to pre-allocate write buffer (will use malloc per write)");
+  }
+
+  // Initialize chunk size (default 500 points - optimal from performance testing)
+  s_tsdb.chunk_size = 500;
+
+  // Initialize series type cache (Phase 2 optimization)
+  s_tsdb.type_cache_size = 128;  // Simple fixed-size cache
+  s_tsdb.type_cache = (series_type_cache_entry_t*)calloc(s_tsdb.type_cache_size,
+                                                          sizeof(series_type_cache_entry_t));
+  if (s_tsdb.type_cache) {
+    ESP_LOGI(TAG, "Initialized series type cache with %zu entries", s_tsdb.type_cache_size);
+  } else {
+    ESP_LOGW(TAG, "Failed to allocate type cache (will use direct metadata lookups)");
+    s_tsdb.type_cache_size = 0;
+  }
+
   s_tsdb.initialized = true;
 
   ESP_LOGI(TAG, "Timeseries DB initialized successfully.");
@@ -84,50 +121,64 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
              data->num_points, data->num_fields, data->num_points * data->num_fields);
   }
 
+  // Pre-compute the common prefix (measurement + tags) for MD5 optimization
+  char prefix_buffer[192];
+  size_t prefix_len = snprintf(prefix_buffer, sizeof(prefix_buffer), "%s", data->measurement_name);
+  for (size_t t = 0; t < data->num_tags; t++) {
+    prefix_len += snprintf(prefix_buffer + prefix_len, sizeof(prefix_buffer) - prefix_len,
+                          ":%s:%s", data->tag_keys[t], data->tag_values[t]);
+    if (prefix_len >= sizeof(prefix_buffer)) {
+      ESP_LOGE(TAG, "Prefix buffer overflow");
+      return false;
+    }
+  }
+
   // For each field i => build the series_id => store all points in one shot
   for (size_t i = 0; i < data->num_fields; i++) {
-    // Build MD5 input =>
-    // "<measurementName>:<tagKey1>:<tagValue1>:...:<fieldName>" same approach
-    // as before
-    char buffer[256];
-    memset(buffer, 0, sizeof(buffer));
-    size_t offset = 0;
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%s", data->measurement_name);
-    for (size_t t = 0; t < data->num_tags; t++) {
-      offset += snprintf(buffer + offset, sizeof(buffer) - offset, ":%s:%s", data->tag_keys[t], data->tag_values[t]);
-      if (offset >= sizeof(buffer)) {
-        ESP_LOGE(TAG, "MD5 input buffer overflow for field '%s'", data->field_names[i]);
+    // Build the cache key string
+    char cache_key[256];
+    size_t key_len = snprintf(cache_key, sizeof(cache_key), "%s:%s",
+                              prefix_buffer, data->field_names[i]);
+    if (key_len >= sizeof(cache_key)) {
+      ESP_LOGE(TAG, "Cache key buffer overflow for field '%s'", data->field_names[i]);
+      return false;
+    }
+
+    unsigned char series_id[16];
+    bool found_in_cache = false;
+
+    // Try to get series_id from cache first
+    if (tsdb_cache_lookup_series_id(&s_tsdb, cache_key, series_id)) {
+      found_in_cache = true;
+      ESP_LOGI(TAG, "Cache HIT for field '%s' - skipping metadata operations", data->field_names[i]);
+    } else {
+      // Cache miss - compute MD5
+      mbedtls_md5((const unsigned char*)cache_key, key_len, series_id);
+      ESP_LOGI(TAG, "Cache MISS for field '%s' - performing metadata operations", data->field_names[i]);
+    }
+
+    // Only do metadata operations if not found in cache
+    if (!found_in_cache) {
+      // Ensure the field name to series_id mapping is in metadata
+      if (!tsdb_index_field_for_series(&s_tsdb, measurement_id, data->field_names[i], series_id)) {
+        ESP_LOGE(TAG, "Failed to index field '%s'", data->field_names[i]);
         return false;
       }
-    }
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ":%s", data->field_names[i]);
-    if (offset >= sizeof(buffer)) {
-      ESP_LOGE(TAG, "MD5 buffer overflow (field_name too long?)");
-      return false;
-    }
 
-    // MD5 => series_id
-    unsigned char series_id[16];
-    mbedtls_md5((const unsigned char*)buffer, strlen(buffer), series_id);
+      // Ensure field type in metadata
+      const timeseries_field_value_t* first_val = &data->field_values[i * data->num_points + 0];
+      if (!tsdb_ensure_series_type_in_metadata(&s_tsdb, series_id, first_val->type)) {
+        return false;
+      }
 
-    // Ensure the field name to series_id mapping is in metadata
-    if (!tsdb_index_field_for_series(&s_tsdb, measurement_id, data->field_names[i], series_id)) {
-      ESP_LOGE(TAG, "Failed to index field '%s'", data->field_names[i]);
-      return false;
-    }
+      // Index tags
+      if (!tsdb_index_tags_for_series(&s_tsdb, measurement_id, data->tag_keys, data->tag_values, data->num_tags,
+                                      series_id)) {
+        return false;
+      }
 
-    // Ensure field type in metadata
-    // We'll assume all data points in this field are the same type,
-    // so we check the first one
-    const timeseries_field_value_t* first_val = &data->field_values[i * data->num_points + 0];
-    if (!tsdb_ensure_series_type_in_metadata(&s_tsdb, series_id, first_val->type)) {
-      return false;
-    }
-
-    // Index tags
-    if (!tsdb_index_tags_for_series(&s_tsdb, measurement_id, data->tag_keys, data->tag_values, data->num_tags,
-                                    series_id)) {
-      return false;
+      // Successfully indexed - add to cache for next time
+      tsdb_cache_insert_series_id(&s_tsdb, cache_key, series_id);
     }
 
     // Gather the array of values for this field
@@ -268,4 +319,17 @@ bool timeseries_clear_all() {
   timeseries_metadata_create_page(&s_tsdb);
 
   return true;
+}
+
+void timeseries_set_chunk_size(size_t chunk_size) {
+  if (!s_tsdb.initialized) {
+    ESP_LOGW(TAG, "Cannot set chunk size before initialization");
+    return;
+  }
+  if (chunk_size == 0) {
+    ESP_LOGW(TAG, "Invalid chunk size (0), keeping current value");
+    return;
+  }
+  s_tsdb.chunk_size = chunk_size;
+  ESP_LOGI(TAG, "Chunk size set to %zu points", chunk_size);
 }

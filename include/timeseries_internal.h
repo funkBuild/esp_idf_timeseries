@@ -154,6 +154,36 @@ typedef struct {
 // DB Context
 // -----------------------------------------------------------------------------
 
+// Series ID cache for fast lookup
+#ifdef CONFIG_TIMESERIES_USE_SERIES_ID_CACHE
+  #define SERIES_ID_CACHE_SIZE CONFIG_TIMESERIES_SERIES_ID_CACHE_SIZE
+#else
+  #define SERIES_ID_CACHE_SIZE 0
+#endif
+
+typedef struct {
+  char key[128];                // measurement+tags+field string
+  unsigned char series_id[16];  // Cached series ID
+  uint32_t last_access;          // For LRU eviction (if CONFIG_TIMESERIES_CACHE_USE_LRU)
+  bool valid;                    // Is this entry valid?
+} series_id_cache_entry_t;
+
+#ifdef CONFIG_TIMESERIES_ENABLE_CACHE_STATS
+typedef struct {
+  uint32_t hits;
+  uint32_t misses;
+  uint32_t evictions;
+  uint32_t insertions;
+} series_cache_stats_t;
+#endif
+
+// Series type cache for query optimization (Phase 2)
+typedef struct {
+  unsigned char series_id[16];  // Series ID key
+  uint8_t field_type;            // Cached field type (timeseries_field_type_e)
+  bool valid;                    // Is this entry valid?
+} series_type_cache_entry_t;
+
 typedef struct {
   uint32_t offset;
   timeseries_page_header_t header;
@@ -174,6 +204,26 @@ typedef struct {
   bool last_l0_cache_valid;
   uint32_t last_l0_page_offset;
   uint32_t last_l0_used_offset;
+
+#ifdef CONFIG_TIMESERIES_USE_SERIES_ID_CACHE
+  // Series ID cache
+  series_id_cache_entry_t *series_cache;
+  uint32_t cache_access_counter;  // For LRU tracking
+  #ifdef CONFIG_TIMESERIES_ENABLE_CACHE_STATS
+  series_cache_stats_t cache_stats;
+  #endif
+#endif
+
+  // Series type cache for query optimization (Phase 2)
+  series_type_cache_entry_t *type_cache;
+  size_t type_cache_size;
+
+  // Pre-allocated write buffer for chunks
+  uint8_t *write_buffer;
+  size_t write_buffer_capacity;
+
+  // Chunk size for large inserts (default 300)
+  size_t chunk_size;
 } timeseries_db_t;
 
 typedef struct {

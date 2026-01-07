@@ -598,9 +598,13 @@ void intersect_series_id_lists(timeseries_series_id_list_t* out, const timeserie
   /* Sort both lists in-place (16 B keys; qsort is fine for ≤1k) */
   qsort(out->ids, out->count, sizeof(timeseries_series_id_t), cmp_series_id_asc);
 
-  /* We must not modify 'other'; make a scratch copy small enough
-     for stack usage (uses VLA – OK on ESP32) or malloc if preferred */
-  timeseries_series_id_t* tmp = alloca(other->count * sizeof(timeseries_series_id_t));
+  /* We must not modify 'other'; make a scratch copy on the heap
+     to avoid stack overflow with large series counts */
+  timeseries_series_id_t* tmp = malloc(other->count * sizeof(timeseries_series_id_t));
+  if (tmp == NULL) {
+    ESP_LOGE(TAG, "Failed to allocate memory for series ID intersection");
+    return;
+  }
   memcpy(tmp, other->ids, other->count * sizeof(timeseries_series_id_t));
   qsort(tmp, other->count, sizeof(timeseries_series_id_t), cmp_series_id_asc);
 
@@ -621,6 +625,9 @@ void intersect_series_id_lists(timeseries_series_id_list_t* out, const timeserie
       ++j;
     }
   }
+
+  /* Clean up temporary buffer */
+  free(tmp);
 
   /* Replace 'out' with the intersection */
   tsdb_series_id_list_clear(out);

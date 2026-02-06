@@ -17,7 +17,7 @@ typedef struct entry {
   /* --- bookkeeping --- */
   uint32_t hash;
   key_kind_e kind;
-  uint32_t last_access_ms;
+  int64_t last_access_us;
 
   /* --- key --- */
   char* str_key;    /* dup’ed or NULL   */
@@ -36,7 +36,7 @@ struct ts_cache {
   size_t entry_cap;
   size_t mem_cap;
 
-  uint32_t ttl_ms;
+  int64_t ttl_us;
 
   size_t entry_cnt;
   size_t mem_used;
@@ -103,7 +103,7 @@ ts_cache_t* ts_cache_create(size_t max_entries, size_t max_mem, uint32_t ttl_ms)
   c->bucket_cnt = buckets;
   c->entry_cap = max_entries;
   c->mem_cap = max_mem;
-  c->ttl_ms = ttl_ms;
+  c->ttl_us = (int64_t)ttl_ms * 1000LL;
 
   lru_list_init(&c->lru);
   return c;
@@ -151,9 +151,9 @@ static entry_t* find_entry(ts_cache_t* c, key_kind_e kind, const char* str_key, 
 
 /* ---------- expiry helper --------------------------------------------- */
 static bool expired(const ts_cache_t* c, const entry_t* e) {
-  if (!c->ttl_ms) return false;
-  uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
-  return now - e->last_access_ms > c->ttl_ms;
+  if (!c->ttl_us) return false;
+  int64_t now = esp_timer_get_time();
+  return (now - e->last_access_us) > c->ttl_us;
 }
 
 /* ---------- u32 API ---------------------------------------------------- */
@@ -186,7 +186,7 @@ bool ts_cache_lookup_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, ui
   }
 
   *out_val = e->u32;
-  e->last_access_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+  e->last_access_us = esp_timer_get_time();
   lru_move_front(&c->lru, &e->lru);
   c->st.hits++;
   return true;
@@ -200,7 +200,7 @@ bool ts_cache_insert_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, ui
   if (e) {
     /* update in place */
     e->u32 = val;
-    e->last_access_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    e->last_access_us = esp_timer_get_time();
     lru_move_front(&c->lru, &e->lru);
     c->st.updates++;
     return true;
@@ -222,7 +222,7 @@ bool ts_cache_insert_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, ui
   e->kind = kind;
   e->meas_id = meas_id;
   e->hash = h;
-  e->last_access_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+  e->last_access_us = esp_timer_get_time();
 
   size_t b = bucket_of(h, c->bucket_cnt);
   e->next = c->buckets[b];
@@ -273,7 +273,7 @@ bool ts_cache_lookup_blob(ts_cache_t* c, key_kind_e kind, const char* str_key, u
 
   *out_data = copy;
   *out_sz = e->blob_sz;
-  e->last_access_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+  e->last_access_us = esp_timer_get_time();
   lru_move_front(&c->lru, &e->lru);
   c->st.hits++;
   return true;
@@ -295,7 +295,7 @@ bool ts_cache_insert_blob(ts_cache_t* c, key_kind_e kind, const char* str_key, u
       e->blob_sz = size;
     }
     memcpy(e->blob, data, size);
-    e->last_access_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    e->last_access_us = esp_timer_get_time();
     lru_move_front(&c->lru, &e->lru);
     c->st.updates++;
     return true;
@@ -325,7 +325,7 @@ bool ts_cache_insert_blob(ts_cache_t* c, key_kind_e kind, const char* str_key, u
   e->kind = kind;
   e->meas_id = meas_id;
   e->hash = h;
-  e->last_access_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+  e->last_access_us = esp_timer_get_time();
 
   size_t b = bucket_of(h, c->bucket_cnt);
   e->next = c->buckets[b];

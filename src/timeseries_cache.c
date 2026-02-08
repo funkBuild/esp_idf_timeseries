@@ -2,6 +2,7 @@
 #include "esp_log.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 #ifdef CONFIG_TIMESERIES_USE_SERIES_ID_CACHE
 
@@ -117,6 +118,11 @@ void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
       ESP_LOGV(TAG, "Cache UPDATE for key: %.32s... (index=%u)", key, index);
       return;
     }
+
+    // If we hit an empty slot, key doesn't exist in cache - stop searching
+    if (!entry->valid) {
+      break;
+    }
   }
 
   // Not found, need to insert new entry
@@ -146,25 +152,40 @@ void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
 
   // No empty slots, need to evict
 #ifdef CONFIG_TIMESERIES_CACHE_USE_LRU
-  // Find least recently used entry in the probe sequence
-  uint32_t lru_index = start_index;
-  uint32_t lru_access = db->series_cache[start_index].last_access;
+  // Find least recently used entry among VALID entries only
+  uint32_t lru_index = SERIES_ID_CACHE_SIZE;  // Sentinel value
+  uint32_t lru_access = UINT32_MAX;           // Start with max
 
-  for (size_t i = 1; i < SERIES_ID_CACHE_SIZE && i < 8; i++) { // Check up to 8 slots
-    uint32_t index = (start_index + i) % SERIES_ID_CACHE_SIZE;
-    if (db->series_cache[index].last_access < lru_access) {
-      lru_index = index;
-      lru_access = db->series_cache[index].last_access;
+  // Find the least recently used VALID entry
+  for (size_t i = 0; i < SERIES_ID_CACHE_SIZE; i++) {
+    if (db->series_cache[i].valid && db->series_cache[i].last_access < lru_access) {
+      lru_index = i;
+      lru_access = db->series_cache[i].last_access;
     }
+  }
+
+  // Safety check: if no valid entries found, use start_index as fallback
+  if (lru_index == SERIES_ID_CACHE_SIZE) {
+    ESP_LOGW(TAG, "No valid entries for LRU eviction, using start index %u", start_index);
+    lru_index = start_index;
   }
 #else
   // Simple replacement at hash position
   uint32_t lru_index = start_index;
 #endif
 
+  // Sanity check to prevent heap corruption
+  if (lru_index >= SERIES_ID_CACHE_SIZE) {
+    ESP_LOGE(TAG, "ERROR: Invalid lru_index %lu (size %d), aborting insert",
+             (unsigned long)lru_index, SERIES_ID_CACHE_SIZE);
+    return;
+  }
+
   // Evict and replace
   series_id_cache_entry_t *entry = &db->series_cache[lru_index];
-  ESP_LOGV(TAG, "Cache EVICT key: %.32s... from index=%u", entry->key, lru_index);
+  if (entry->valid) {
+    ESP_LOGV(TAG, "Cache EVICT key: %.32s... from index=%u", entry->key, lru_index);
+  }
 
   strncpy(entry->key, key, sizeof(entry->key) - 1);
   entry->key[sizeof(entry->key) - 1] = '\0';
@@ -187,10 +208,9 @@ void tsdb_cache_clear(timeseries_db_t *db) {
     return;
   }
 
-  for (size_t i = 0; i < SERIES_ID_CACHE_SIZE; i++) {
-    db->series_cache[i].valid = false;
-    db->series_cache[i].last_access = 0;
-  }
+  // Zero ALL entry data to prevent stale data from being used
+  // Use single memset for efficiency
+  memset(db->series_cache, 0, SERIES_ID_CACHE_SIZE * sizeof(series_id_cache_entry_t));
 
   db->cache_access_counter = 0;
 
@@ -207,6 +227,7 @@ void tsdb_cache_free(timeseries_db_t *db) {
   }
 
 #ifdef CONFIG_TIMESERIES_ENABLE_CACHE_STATS
+  // Log final cache stats before freeing
   tsdb_cache_log_stats(db);
 #endif
 

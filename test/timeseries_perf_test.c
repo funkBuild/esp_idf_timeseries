@@ -1344,7 +1344,7 @@ TEST_CASE("perf: stress test - large dataset", "[perf][e2e][stress]") {
 
     // 14 days of 5-minute interval data (same as example)
     const size_t POINTS_PER_DAY = 288;
-    const size_t NUM_DAYS = 7;  // Reduced for faster test runs
+    const size_t NUM_DAYS = 3;  // Reduced for QEMU memory constraints
     const size_t NUM_POINTS = POINTS_PER_DAY * NUM_DAYS;
     const size_t NUM_FIELDS = 6;
 

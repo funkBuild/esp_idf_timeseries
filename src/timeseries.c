@@ -309,6 +309,8 @@ bool timeseries_clear_all() {
 
   // Clear out any cached data
   tsdb_pagecache_clear(&s_tsdb);
+  tsdb_cache_clear(&s_tsdb);      // Clear series ID cache
+  tsdb_clear_type_cache(&s_tsdb); // Clear series type cache
 
   // Reset the last L0 cache
   s_tsdb.last_l0_cache_valid = false;
@@ -336,4 +338,11 @@ void timeseries_set_chunk_size(size_t chunk_size) {
   }
   s_tsdb.chunk_size = chunk_size;
   ESP_LOGI(TAG, "Chunk size set to %zu points", chunk_size);
+}
+
+timeseries_db_t* timeseries_get_db_handle(void) {
+  if (!s_tsdb.initialized) {
+    return NULL;
+  }
+  return &s_tsdb;
 }

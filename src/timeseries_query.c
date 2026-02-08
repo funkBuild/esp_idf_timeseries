@@ -252,6 +252,16 @@ bool timeseries_query_execute(timeseries_db_t *db,
 
     bool got = tsdb_find_series_ids_for_field(db, measurement_id, fname,
                                               &field_series);
+    ESP_LOGI(TAG, "Field '%s' (meas_id=%" PRIu32 "): found %zu series_ids (got=%d)",
+             fname, measurement_id, field_series.count, (int)got);
+    for (size_t si = 0; si < field_series.count && si < 3; si++) {
+      ESP_LOGI(TAG, "  series_id[%zu]: %02X%02X%02X%02X%02X%02X%02X%02X...",
+               si,
+               field_series.ids[si].bytes[0], field_series.ids[si].bytes[1],
+               field_series.ids[si].bytes[2], field_series.ids[si].bytes[3],
+               field_series.ids[si].bytes[4], field_series.ids[si].bytes[5],
+               field_series.ids[si].bytes[6], field_series.ids[si].bytes[7]);
+    }
     if (!got || field_series.count == 0) {
       tsdb_series_id_list_free(&field_series);
       continue;
@@ -288,6 +298,23 @@ bool timeseries_query_execute(timeseries_db_t *db,
   if (actual_fields_count == 0) {
     ok = true; /* nothing to do  */
     goto cleanup;
+  }
+
+  // Log which series_ids we're looking for
+  for (size_t f = 0; f < actual_fields_count; ++f) {
+    ESP_LOGI(TAG, "Looking for field '%s' with %zu series:", fields_array[f].field_name, fields_array[f].num_series);
+    for (size_t s = 0; s < fields_array[f].num_series; ++s) {
+      ESP_LOGI(TAG, "  Series %zu: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+               s,
+               fields_array[f].series_lists[s].series_id.bytes[0], fields_array[f].series_lists[s].series_id.bytes[1],
+               fields_array[f].series_lists[s].series_id.bytes[2], fields_array[f].series_lists[s].series_id.bytes[3],
+               fields_array[f].series_lists[s].series_id.bytes[4], fields_array[f].series_lists[s].series_id.bytes[5],
+               fields_array[f].series_lists[s].series_id.bytes[6], fields_array[f].series_lists[s].series_id.bytes[7],
+               fields_array[f].series_lists[s].series_id.bytes[8], fields_array[f].series_lists[s].series_id.bytes[9],
+               fields_array[f].series_lists[s].series_id.bytes[10], fields_array[f].series_lists[s].series_id.bytes[11],
+               fields_array[f].series_lists[s].series_id.bytes[12], fields_array[f].series_lists[s].series_id.bytes[13],
+               fields_array[f].series_lists[s].series_id.bytes[14], fields_array[f].series_lists[s].series_id.bytes[15]);
+    }
   }
 
   end_time = esp_timer_get_time();
@@ -686,9 +713,13 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     pages_processed++;
     // Only process FIELD_DATA pages
     if (hdr.page_type != TIMESERIES_PAGE_TYPE_FIELD_DATA) {
+      ESP_LOGV(TAG, "Skipping non-field-data page @0x%08X type=%u state=%u",
+               (unsigned int)page_offset, hdr.page_type, hdr.page_state);
       continue;
     }
     field_data_pages++;
+    ESP_LOGI(TAG, "Scanning FIELD_DATA page @0x%08X size=%u level=%u state=%u",
+             (unsigned int)page_offset, (unsigned int)page_size, hdr.field_data_level, hdr.page_state);
 
     timeseries_fielddata_iterator_t fdata_iter;
     if (!timeseries_fielddata_iterator_init(db, page_offset, page_size,
@@ -699,11 +730,14 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     }
 
     timeseries_field_data_header_t fdh;
+    int page_records = 0;
+    int page_records_matched = 0;
     while (timeseries_fielddata_iterator_next(&fdata_iter, &fdh)) {
+      page_records++;
       // Skip if flagged as deleted
       if ((fdh.flags & TSDB_FIELDDATA_FLAG_DELETED) == 0) {
-        ESP_LOGV(TAG, "Skipping deleted record @0x%08X",
-                 (unsigned int)fdata_iter.current_record_offset);
+        ESP_LOGD(TAG, "Skipping deleted record @0x%08X flags=0x%02X",
+                 (unsigned int)fdata_iter.current_record_offset, fdh.flags);
         continue;
       }
 
@@ -716,10 +750,24 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
       series_record_list_t *srl = series_lookup_find(&srl_tbl, fdh.series_id);
       if (srl) {
         records_found++;
+        page_records_matched++;
+        bool is_compressed = (fdh.flags & TSDB_FIELDDATA_FLAG_COMPRESSED) == 0;
+        ESP_LOGI(TAG, "MATCH: series %02X%02X%02X%02X... @0x%08X count=%u len=%u compressed=%d",
+                 fdh.series_id[0], fdh.series_id[1], fdh.series_id[2], fdh.series_id[3],
+                 (unsigned int)absolute_offset, fdh.record_count, fdh.record_length, is_compressed);
         field_record_list_append(&srl->records_head, &fdh, absolute_offset,
                                  query->limit);
+      } else {
+        ESP_LOGI(TAG, "No match for series %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X (flags=0x%02X, records=%u)",
+                 fdh.series_id[0], fdh.series_id[1], fdh.series_id[2], fdh.series_id[3],
+                 fdh.series_id[4], fdh.series_id[5], fdh.series_id[6], fdh.series_id[7],
+                 fdh.series_id[8], fdh.series_id[9], fdh.series_id[10], fdh.series_id[11],
+                 fdh.series_id[12], fdh.series_id[13], fdh.series_id[14], fdh.series_id[15],
+                 fdh.flags, fdh.record_count);
       }
     } // end while fielddata_iterator
+    ESP_LOGI(TAG, "Page @0x%08X: %d records scanned, %d matched",
+             (unsigned int)page_offset, page_records, page_records_matched);
   } // end while page_iterator
 
   prof_end = esp_timer_get_time();

@@ -175,6 +175,9 @@ static bool gather_unique_series_ids(timeseries_db_t* db, const tsdb_level_page_
         continue;
       }
       // Add the series_id to out_ids if not present
+      ESP_LOGD(TAG, "Found series_id %02X%02X%02X%02X... flags=0x%02X records=%u in page @0x%08" PRIx32,
+               fd_hdr.series_id[0], fd_hdr.series_id[1], fd_hdr.series_id[2], fd_hdr.series_id[3],
+               fd_hdr.flags, fd_hdr.record_count, pg->offset);
       append_if_not_found_in_list(&out_ids->list, &out_ids->count, &out_ids->capacity, fd_hdr.series_id);
     }
   }
@@ -383,22 +386,35 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       }
 
       // PASS #1: Write timestamps
-      for (size_t j = 0; j < pts_used; j++) {
+      bool write_failed = false;
+      for (size_t j = 0; j < pts_used && !write_failed; j++) {
         uint64_t ts = pts[j].timestamp;
         if (!timeseries_page_stream_writer_write_timestamp(&sw, ts)) {
           ESP_LOGE(TAG, "Failed writing timestamp for j=%zu", j);
-          // you could break or bail out entirely
+          write_failed = true;
         }
+      }
+
+      if (write_failed) {
+        ESP_LOGE(TAG, "Timestamp write failed for series %zu, skipping", i);
+        // Free strings if needed before continuing
+        if (ftype == TIMESERIES_FIELD_TYPE_STRING) {
+          for (size_t j = 0; j < pts_used; j++) {
+            free(pts[j].field_val.data.string_val.str);
+          }
+        }
+        free(pts);
+        continue;  // Skip this series, try next one
       }
 
       // finalize timestamps
       timeseries_page_stream_writer_finalize_timestamp(&sw);
 
       // PASS #2: Write values
-      for (size_t j = 0; j < pts_used; j++) {
+      for (size_t j = 0; j < pts_used && !write_failed; j++) {
         if (!timeseries_page_stream_writer_write_value(&sw, &pts[j].field_val)) {
           ESP_LOGE(TAG, "Failed writing value for j=%zu", j);
-          // break or bail
+          write_failed = true;
         }
 
         // If we have a string, free the allocated memory
@@ -407,13 +423,24 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
         }
       }
 
+      // If value write failed, skip end_series to avoid writing corrupt data
+      if (write_failed) {
+        ESP_LOGE(TAG, "Value write failed for series %zu, skipping end_series", i);
+        free(pts);
+        continue;
+      }
+
       // end this series
-      timeseries_page_stream_writer_end_series(&sw);
+      if (!timeseries_page_stream_writer_end_series(&sw)) {
+        ESP_LOGE(TAG, "Failed to end_series for i=%zu with %zu points", i, pts_used);
+        free(pts);
+        break;
+      }
 
       free(pts);
 
       end_time = esp_timer_get_time();
-      ESP_LOGI(TAG, "Wrote series with %zu points in %.3f ms", i + 1, (end_time - start_time) / 1000.0);
+      ESP_LOGI(TAG, "Wrote series %zu with %zu points in %.3f ms", i, pts_used, (end_time - start_time) / 1000.0);
     }
 
     free(uniq_ids.list);
@@ -423,6 +450,15 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       ESP_LOGE(TAG, "Failed finalizing new L1 page via stream-writer.");
       free(pages);
       return false;
+    }
+
+    // Debug: Log the cache state after finalize
+    ESP_LOGI(TAG, "After finalize - Page cache state (%zu entries):", db->page_cache_count);
+    for (size_t ci = 0; ci < db->page_cache_count; ci++) {
+      timeseries_cached_page_t* ce = &db->page_cache[ci];
+      ESP_LOGI(TAG, "  [%zu] offset=0x%08" PRIx32 " type=%u state=%u level=%u size=%" PRIu32,
+               ci, ce->offset, ce->header.page_type, ce->header.page_state,
+               ce->header.field_data_level, ce->header.page_size);
     }
 
     success = true;
@@ -515,9 +551,12 @@ static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t sour
     return false;
   }
 
+  ESP_LOGI(TAG, "Marking %zu old level-%u pages as obsolete (cache count before: %zu)",
+           page_count, source_level, db->page_cache_count);
+
   for (size_t i = 0; i < page_count; i++) {
     uint32_t pofs = pages[i].offset;
-    ESP_LOGV(TAG, "Marking level-%u page @0x%08" PRIx32 " as obsolete.", source_level, pofs);
+    ESP_LOGI(TAG, "Marking level-%u page @0x%08" PRIx32 " as obsolete.", source_level, pofs);
 
     // 1) Read the existing page header
     timeseries_page_header_t hdr;
@@ -543,12 +582,13 @@ static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t sour
       // Remove from cache
       tsdb_pagecache_remove_entry(db, pofs);
 
-      ESP_LOGV(TAG, "Obsolete mark success for page @0x%08" PRIx32, pofs);
+      ESP_LOGI(TAG, "Removed page @0x%08" PRIx32 " from cache", pofs);
     } else {
       ESP_LOGW(TAG, "Skipping page @0x%08" PRIx32 " (not an active level-%u field-data page).", pofs, source_level);
     }
   }
 
+  ESP_LOGI(TAG, "After marking obsolete: cache count = %zu", db->page_cache_count);
   return true;
 }
 

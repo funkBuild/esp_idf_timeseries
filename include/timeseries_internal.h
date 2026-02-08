@@ -7,10 +7,13 @@
 
 // -----------------------------------------------------------------------------
 // Page State Constants
+// These values are flash-friendly: transitions only require clearing bits (1->0)
+// FREE (0xFF) -> ACTIVE (0x01): clear bits 7-1
+// ACTIVE (0x01) -> OBSOLETE (0x00): clear bit 0
 // -----------------------------------------------------------------------------
 #define TIMESERIES_PAGE_STATE_FREE 0xFF
 #define TIMESERIES_PAGE_STATE_ACTIVE 0x01
-#define TIMESERIES_PAGE_STATE_OBSOLETE 0x02
+#define TIMESERIES_PAGE_STATE_OBSOLETE 0x00
 
 // -----------------------------------------------------------------------------
 // Page Type Constants
@@ -166,6 +169,7 @@ typedef struct {
   unsigned char series_id[16];  // Cached series ID
   uint32_t last_access;          // For LRU eviction (if CONFIG_TIMESERIES_CACHE_USE_LRU)
   bool valid;                    // Is this entry valid?
+  uint8_t padding[3];           // Explicit padding to 4-byte boundary
 } series_id_cache_entry_t;
 
 #ifdef CONFIG_TIMESERIES_ENABLE_CACHE_STATS
@@ -188,6 +192,17 @@ typedef struct {
   uint32_t offset;
   timeseries_page_header_t header;
 } timeseries_cached_page_t;
+
+// Metadata mmap entry for caching mapped metadata pages
+typedef struct {
+  uint32_t page_offset;           // Flash offset of the mapped page
+  const void *mapped_ptr;          // Pointer to mapped memory region
+  esp_partition_mmap_handle_t handle;  // Handle for unmapping
+  bool valid;                       // Is this entry valid/mapped?
+} metadata_mmap_entry_t;
+
+// Maximum number of metadata pages we can map simultaneously
+#define METADATA_MMAP_CACHE_SIZE 4
 
 typedef struct {
   bool initialized;
@@ -229,6 +244,10 @@ typedef struct {
 
   // Chunk size for large inserts (default 300)
   size_t chunk_size;
+
+  // Metadata mmap cache for fast read access
+  metadata_mmap_entry_t metadata_mmap_cache[METADATA_MMAP_CACHE_SIZE];
+  bool metadata_mmap_enabled;  // Set to true if mmap is supported
 } timeseries_db_t;
 
 typedef struct {

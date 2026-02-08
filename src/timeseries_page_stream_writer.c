@@ -111,11 +111,17 @@ static bool ensure_capacity(timeseries_page_stream_writer_t* writer, size_t need
   uint32_t new_size = old_size + 4096;
   uint32_t new_offset = 0;
 
-  ESP_LOGV(TAG, "Growing region from %u => %u (relocation)...", (unsigned int)old_size, (unsigned int)new_size);
+  ESP_LOGV(TAG, "Relocation needed: old=0x%08" PRIx32 " size %u => %u",
+           old_offset, (unsigned int)old_size, (unsigned int)new_size);
 
   if (!relocate_region(writer->db, old_offset, old_size, new_size, &new_offset)) {
     return false;
   }
+
+  ESP_LOGV(TAG, "Relocated: 0x%08" PRIx32 " => 0x%08" PRIx32, old_offset, new_offset);
+
+  // Update page cache: remove old entry, add new entry
+  tsdb_pagecache_remove_entry(writer->db, old_offset);
 
   // Adjust writer pointers by the offset difference
   uint32_t diff = new_offset - old_offset;
@@ -123,7 +129,21 @@ static bool ensure_capacity(timeseries_page_stream_writer_t* writer, size_t need
   writer->write_ptr += diff;
   writer->fd_hdr_offset += diff;
   writer->col_hdr_offset += diff;
+  // Also adjust ts_end_offset if it has been set (after finalize_timestamp)
+  if (writer->ts_end_offset != 0) {
+    writer->ts_end_offset += diff;
+  }
   writer->capacity = new_size;
+
+  // Verify header was preserved at new location
+  timeseries_page_header_t verify_hdr;
+  if (esp_partition_read(writer->db->partition, writer->base_offset, &verify_hdr, sizeof(verify_hdr)) == ESP_OK) {
+    ESP_LOGV(TAG, "After relocation: type=%u state=%u level=%u",
+             verify_hdr.page_type, verify_hdr.page_state, verify_hdr.field_data_level);
+    // Add to cache with new offset and updated size
+    verify_hdr.page_size = new_size;
+    tsdb_pagecache_add_entry(writer->db, new_offset, &verify_hdr);
+  }
 
   // Check again
   end_needed = writer->write_ptr + needed_bytes;
@@ -222,10 +242,27 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
   hdr.sequence_num = ++db->sequence_num;
   hdr.field_data_level = to_level;
 
+  ESP_LOGV(TAG, "Init: Writing header @0x%08" PRIx32 " type=%u state=%u level=%u",
+           region_ofs, hdr.page_type, hdr.page_state, to_level);
+
   if (esp_partition_write(db->partition, region_ofs, &hdr, sizeof(hdr)) != ESP_OK) {
     ESP_LOGE(TAG, "Failed writing initial page header");
     return false;
   }
+
+  // Verify the write by reading back
+  timeseries_page_header_t verify_hdr;
+  if (esp_partition_read(db->partition, region_ofs, &verify_hdr, sizeof(verify_hdr)) == ESP_OK) {
+    ESP_LOGV(TAG, "Init verify: type=%u state=%u level=%u",
+             verify_hdr.page_type, verify_hdr.page_state, verify_hdr.field_data_level);
+  }
+
+  // IMPORTANT: Add the page to the cache immediately to prevent the blank iterator
+  // from returning this region during subsequent relocations.
+  // Set page_size to initial_size for now (will be updated in finalize).
+  hdr.page_size = initial_size;
+  tsdb_pagecache_add_entry(db, region_ofs, &hdr);
+  ESP_LOGV(TAG, "Added initial page to cache @0x%08" PRIx32, region_ofs);
 
   writer->base_offset = region_ofs;
   writer->write_ptr = region_ofs + sizeof(timeseries_page_header_t);
@@ -324,14 +361,14 @@ bool timeseries_page_stream_writer_write_timestamp(timeseries_page_stream_writer
     writer->fd_hdr.end_time = ts;
   }
 
-  // Each time we add a timestamp, we count it as a new record
-  writer->fd_hdr.record_count++;
-
   // Add timestamp to the Gorilla TS stream
   if (!gorilla_stream_add_timestamp(&writer->ts_stream, ts)) {
     ESP_LOGE(TAG, "Failed adding timestamp to gorilla ts_stream");
     return false;
   }
+
+  // Increment record count AFTER successful write
+  writer->fd_hdr.record_count++;
 
   return true;
 }
@@ -488,19 +525,20 @@ bool timeseries_page_stream_writer_end_series(timeseries_page_stream_writer_t* w
   // 6) The "record_length" is total space for col_hdr + TS + VAL
   uint32_t total_col_bytes = sizeof(col_hdr) + ts_len + val_len;
   if (total_col_bytes > 0xFFFF) {
-    ESP_LOGV(TAG, "Series chunk = %u bytes, exceeds 16-bit limit!", (unsigned int)total_col_bytes);
+    ESP_LOGE(TAG, "Series chunk = %u bytes (ts=%u, val=%u), exceeds 16-bit limit!",
+             (unsigned int)total_col_bytes, (unsigned int)ts_len, (unsigned int)val_len);
     return false;
   }
   writer->fd_hdr.record_length = (uint16_t)total_col_bytes;
 
-  ESP_LOGV(TAG, "Series %02X%02X%02X%02X...: total=%u bytes", writer->fd_hdr.series_id[0], writer->fd_hdr.series_id[1],
-           writer->fd_hdr.series_id[2], writer->fd_hdr.series_id[3], (unsigned int)writer->fd_hdr.record_length);
+  ESP_LOGI(TAG, "Series %02X%02X%02X%02X: record_count=%u, record_length=%u bytes (ts=%u, val=%u), times=[%" PRIu64 "-%" PRIu64 "]",
+           writer->fd_hdr.series_id[0], writer->fd_hdr.series_id[1],
+           writer->fd_hdr.series_id[2], writer->fd_hdr.series_id[3],
+           (unsigned int)writer->fd_hdr.record_count, (unsigned int)writer->fd_hdr.record_length,
+           (unsigned int)ts_len, (unsigned int)val_len,
+           writer->fd_hdr.start_time, writer->fd_hdr.end_time);
 
   ESP_LOGV(TAG, "Header offset=0x%08" PRIx32 ", col_hdr=0x%08" PRIx32, writer->fd_hdr_offset, writer->col_hdr_offset);
-
-  ESP_LOGV(TAG, "Total records count: %u", (unsigned int)writer->fd_hdr.record_count);
-
-  ESP_LOGV(TAG, "Start time: %" PRIu64 ", End time: %" PRIu64, writer->fd_hdr.start_time, writer->fd_hdr.end_time);
 
   // 7) Patch the field_data_header with the updated metadata
   if (esp_partition_write(writer->db->partition, writer->fd_hdr_offset, &writer->fd_hdr, sizeof(writer->fd_hdr)) !=
@@ -538,14 +576,19 @@ bool timeseries_page_stream_writer_finalize(timeseries_page_stream_writer_t* wri
     return false;
   }
 
-  ESP_LOGV(TAG, "Page created @0x%08" PRIx32 " => size=%" PRIu32, writer->base_offset, final_size);
+  ESP_LOGI(TAG, "Finalize: Page @0x%08" PRIx32 " size=%" PRIu32 " type=%u state=%u level=%u",
+           writer->base_offset, final_size, hdr.page_type, hdr.page_state, hdr.field_data_level);
 
   float page_utilization = (float)used_bytes / final_size;
-  ESP_LOGD(TAG, "Page utilization: %.2f%%. page_size=%u level=%u", page_utilization * 100.0, (unsigned int)final_size,
+  ESP_LOGI(TAG, "Page utilization: %.2f%%. page_size=%u level=%u", page_utilization * 100.0, (unsigned int)final_size,
            (unsigned int)hdr.field_data_level);
 
-  // Optionally add to page cache
+  // Update page cache entry with final size (page was added in init, just update size)
+  // Remove old entry and add updated one to refresh the cached header
+  tsdb_pagecache_remove_entry(writer->db, writer->base_offset);
   tsdb_pagecache_add_entry(writer->db, writer->base_offset, &hdr);
+  ESP_LOGI(TAG, "Updated page cache entry @0x%08" PRIx32 " (total cache count: %zu)",
+           writer->base_offset, writer->db->page_cache_count);
 
   return true;
 }

@@ -6,6 +6,7 @@
 #include "gorilla/gorilla_stream_decoder.h"
 #include "timeseries_compression.h"
 #include "timeseries_data.h"
+#include "timeseries_page_cache_snapshot.h"
 
 #include <inttypes.h>
 #include <math.h>
@@ -387,15 +388,53 @@ bool timeseries_blank_iterator_init(timeseries_db_t* db, timeseries_blank_iterat
   iter->run_start = 0;
   iter->run_length = 0;
 
+  // Acquire current snapshot for consistent iteration
+  iter->snapshot = tsdb_snapshot_acquire_current(db);
+  iter->owns_snapshot = true;
+
   return true;
 }
 
-bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t* out_offset, uint32_t* out_size) {
-  if (!iter || !iter->valid) {
+bool timeseries_blank_iterator_init_with_snapshot(timeseries_db_t* db, timeseries_blank_iterator_t* iter,
+                                                   uint32_t min_size, tsdb_page_cache_snapshot_t* snapshot) {
+  if (!db || !iter || !db->partition) {
     return false;
   }
 
-  timeseries_db_t* db = iter->db;
+  iter->db = db;
+  iter->partition = db->partition;
+  iter->min_size = min_size;
+  iter->valid = true;
+  iter->current_offset = 0;
+  iter->current_index = 0;
+
+  iter->in_blank_run = false;
+  iter->run_start = 0;
+  iter->run_length = 0;
+
+  // Use the provided snapshot without acquiring (caller owns it)
+  iter->snapshot = snapshot;
+  iter->owns_snapshot = false;
+
+  return true;
+}
+
+void timeseries_blank_iterator_deinit(timeseries_blank_iterator_t* iter) {
+  if (!iter) {
+    return;
+  }
+  if (iter->owns_snapshot && iter->snapshot) {
+    tsdb_snapshot_release(iter->snapshot);
+    iter->snapshot = NULL;
+  }
+}
+
+bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t* out_offset, uint32_t* out_size) {
+  if (!iter || !iter->valid || !iter->snapshot) {
+    return false;
+  }
+
+  tsdb_page_cache_snapshot_t* snap = iter->snapshot;
   const esp_partition_t* part = iter->partition;
   uint32_t part_size = part->size;
 
@@ -422,7 +461,7 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t*
     }
 
     // 1) If we've consumed all cached pages, the rest of the partition is free
-    if (iter->current_index >= db->page_cache_count) {
+    if (iter->current_index >= snap->count) {
       // The entire region from current_offset..end is free
       if (iter->current_offset >= part_size) {
         // no more space left
@@ -481,7 +520,7 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t*
     }
 
     // 2) Get the next cached page
-    timeseries_cached_page_t* entry = &db->page_cache[iter->current_index];
+    timeseries_cached_page_t* entry = &snap->entries[iter->current_index];
     uint32_t page_offset = entry->offset;
     uint32_t page_size = entry->header.page_size;
     uint8_t page_state = entry->header.page_state;
@@ -586,15 +625,16 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t*
 
 /**
  * @brief Initialize the page cache iterator.
+ * Acquires the current snapshot for consistent iteration.
  */
 bool timeseries_page_cache_iterator_init(timeseries_db_t* db, timeseries_page_cache_iterator_t* iter) {
   if (!db || !iter) {
     return false;
   }
-  iter->db = db;
+  iter->snapshot = tsdb_snapshot_acquire_current(db);
   iter->index = 0;
-  iter->valid = true;
-  return true;
+  iter->valid = (iter->snapshot != NULL);
+  return iter->valid;
 }
 
 /**
@@ -602,13 +642,12 @@ bool timeseries_page_cache_iterator_init(timeseries_db_t* db, timeseries_page_ca
  */
 bool timeseries_page_cache_iterator_next(timeseries_page_cache_iterator_t* iter, timeseries_page_header_t* out_header,
                                          uint32_t* out_offset, uint32_t* out_size) {
-  if (!iter || !iter->valid) {
+  if (!iter || !iter->valid || !iter->snapshot) {
     return false;
   }
-  timeseries_db_t* db = iter->db;
 
-  while (iter->index < db->page_cache_count) {
-    timeseries_cached_page_t* entry = &db->page_cache[iter->index++];
+  while (iter->index < iter->snapshot->count) {
+    timeseries_cached_page_t* entry = &iter->snapshot->entries[iter->index++];
     if (entry->header.page_state == TIMESERIES_PAGE_STATE_ACTIVE) {
       // Return it
       if (out_header) {
@@ -625,4 +664,14 @@ bool timeseries_page_cache_iterator_next(timeseries_page_cache_iterator_t* iter,
   }
   iter->valid = false;
   return false;
+}
+
+void timeseries_page_cache_iterator_deinit(timeseries_page_cache_iterator_t* iter) {
+  if (!iter) {
+    return;
+  }
+  if (iter->snapshot) {
+    tsdb_snapshot_release(iter->snapshot);
+    iter->snapshot = NULL;
+  }
 }

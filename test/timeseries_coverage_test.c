@@ -112,7 +112,7 @@ TEST_CASE("coverage: large insert 1000 points data integrity", "[coverage][integ
 
     // Compact the data
     ESP_LOGI(TAG, "Compacting...");
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query all data back
     timeseries_query_result_t result;
@@ -149,7 +149,7 @@ TEST_CASE("coverage: page cache sync after compaction", "[coverage][integrity]")
     TEST_ASSERT_TRUE(insert_float_points("cache_test", "temp", 500, 1000, 1000));
 
     // Compact (this modifies page offsets)
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query to verify data is accessible
     timeseries_query_result_t result1;
@@ -161,7 +161,7 @@ TEST_CASE("coverage: page cache sync after compaction", "[coverage][integrity]")
     TEST_ASSERT_TRUE(insert_float_points("cache_test", "temp", 500, 501000, 1000));
 
     // Compact again
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query ALL data (old + new)
     timeseries_query_result_t result2;
@@ -191,7 +191,7 @@ TEST_CASE("coverage: multiple sequential compactions", "[coverage][integrity]") 
     // Round 1: Insert and compact
     TEST_ASSERT_TRUE(insert_float_points("multi_compact", "val", 500, 0, 1000));
     total_points += 500;
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     timeseries_query_result_t r1;
     TEST_ASSERT_TRUE(query_all_points("multi_compact", &r1));
@@ -201,7 +201,7 @@ TEST_CASE("coverage: multiple sequential compactions", "[coverage][integrity]") 
     // Round 2: Insert more and compact again
     TEST_ASSERT_TRUE(insert_float_points("multi_compact", "val", 500, 500000, 1000));
     total_points += 500;
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     timeseries_query_result_t r2;
     TEST_ASSERT_TRUE(query_all_points("multi_compact", &r2));
@@ -211,7 +211,7 @@ TEST_CASE("coverage: multiple sequential compactions", "[coverage][integrity]") 
     // Round 3: Insert even more and compact
     TEST_ASSERT_TRUE(insert_float_points("multi_compact", "val", 500, 1000000, 1000));
     total_points += 500;
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     timeseries_query_result_t r3;
     TEST_ASSERT_TRUE(query_all_points("multi_compact", &r3));
@@ -239,7 +239,7 @@ TEST_CASE("coverage: query page ordering after compaction", "[coverage][integrit
     TEST_ASSERT_TRUE(insert_float_points("page_order", "sensor", 200, 40000, 100));
 
     // Compact
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query and verify ordering
     timeseries_query_result_t result;
@@ -438,7 +438,7 @@ TEST_CASE("coverage: empty database operations", "[coverage][boundary]") {
     timeseries_query_free_result(&result);
 
     // Compact empty database (should not crash)
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Expire empty database (should not crash)
     TEST_ASSERT_TRUE(timeseries_expire());
@@ -637,7 +637,7 @@ TEST_CASE("coverage: multiple measurements isolation", "[coverage][isolation]") 
     timeseries_query_free_result(&result_d);
 
     // Compact and verify isolation maintained
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     TEST_ASSERT_TRUE(query_all_points("sensor_a", &result_a));
     TEST_ASSERT_EQUAL(100, result_a.num_points);
@@ -749,7 +749,7 @@ TEST_CASE("coverage: complete database lifecycle", "[coverage][lifecycle]") {
 
     // Phase 3: Compact
     ESP_LOGI(TAG, "Phase 3: Compaction");
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     timeseries_query_result_t r3;
     TEST_ASSERT_TRUE(query_all_points("lifecycle", &r3));
@@ -767,7 +767,7 @@ TEST_CASE("coverage: complete database lifecycle", "[coverage][lifecycle]") {
 
     // Phase 5: Second compaction
     ESP_LOGI(TAG, "Phase 5: Second compaction");
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     timeseries_query_result_t r5;
     TEST_ASSERT_TRUE(query_all_points("lifecycle", &r5));

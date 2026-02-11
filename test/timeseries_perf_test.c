@@ -358,7 +358,7 @@ static void populate_for_query_tests(size_t num_points, size_t num_fields) {
     };
 
     TEST_ASSERT_TRUE(timeseries_insert(&insert_data));
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     free(timestamps);
     free(field_values);
@@ -590,7 +590,7 @@ TEST_CASE("perf: compaction 500 points", "[perf][compaction]") {
     TEST_ASSERT_TRUE(timeseries_insert(&insert_data));
 
     int64_t start = esp_timer_get_time();
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
     int64_t end = esp_timer_get_time();
 
     int64_t elapsed = get_elapsed_us(start, end);
@@ -637,7 +637,7 @@ TEST_CASE("perf: compaction 2000 points", "[perf][compaction]") {
     TEST_ASSERT_TRUE(timeseries_insert(&insert_data));
 
     int64_t start = esp_timer_get_time();
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
     int64_t end = esp_timer_get_time();
 
     int64_t elapsed = get_elapsed_us(start, end);
@@ -692,7 +692,7 @@ TEST_CASE("perf: incremental compaction", "[perf][compaction]") {
         total_insert_time += get_elapsed_us(insert_start, insert_end);
 
         int64_t compact_start = esp_timer_get_time();
-        TEST_ASSERT_TRUE(timeseries_compact());
+        TEST_ASSERT_TRUE(timeseries_compact_sync());
         int64_t compact_end = esp_timer_get_time();
         total_compact_time += get_elapsed_us(compact_start, compact_end);
 
@@ -763,7 +763,7 @@ TEST_CASE("perf: compaction 20 series", "[perf][compaction][multiseries]") {
 
     // Now compact
     int64_t compact_start = esp_timer_get_time();
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
     int64_t compact_end = esp_timer_get_time();
 
     int64_t compact_time = get_elapsed_us(compact_start, compact_end);
@@ -1290,7 +1290,7 @@ TEST_CASE("perf: full workflow - insert, compact, query", "[perf][e2e]") {
 
     // Measure compaction time
     int64_t compact_start = esp_timer_get_time();
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
     int64_t compact_end = esp_timer_get_time();
     int64_t compact_time = get_elapsed_us(compact_start, compact_end);
 
@@ -1395,7 +1395,7 @@ TEST_CASE("perf: stress test - large dataset", "[perf][e2e][stress]") {
 
     // Measure compaction
     int64_t compact_start = esp_timer_get_time();
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
     int64_t compact_end = esp_timer_get_time();
     int64_t compact_time = get_elapsed_us(compact_start, compact_end);
 

@@ -10,11 +10,12 @@
 
 #include "esp_timer.h"
 #include "gorilla/gorilla_stream_encoder.h"  // Gorilla streaming interface
-#include "timeseries_data.h"                 // timeseries_blank_iterator_*
+#include "timeseries_data.h"                 // for tsdb_reserve_blank_region, timeseries_blank_iterator_*
 #include "timeseries_internal.h"             // definition of timeseries_db_t, etc.
 #include "timeseries_iterator.h"             // for timeseries_blank_iterator_t
 
 #include "timeseries_page_cache.h"  // for tsdb_pagecache_add_entry()
+#include "timeseries_page_cache_snapshot.h"
 
 static const char* TAG = "PAGE_STREAM_WRITER";
 
@@ -22,6 +23,71 @@ static const char* TAG = "PAGE_STREAM_WRITER";
 static uint32_t round_up_4k(uint32_t x) {
   const uint32_t align = 4096;
   return ((x + align - 1) / align) * align;
+}
+
+/**
+ * Safely rewrite a page header with an updated page_size field.
+ *
+ * On NOR flash, writes can only clear bits (1->0). If the new page_size has
+ * bits set that are clear in the old page_size, a plain write would silently
+ * corrupt the value (hardware ANDs old & new). This function detects that case
+ * and falls back to erase-and-rewrite of the first 4K sector.
+ */
+static bool safe_rewrite_page_header(const esp_partition_t *part,
+                                     uint32_t page_offset,
+                                     timeseries_page_header_t *hdr,
+                                     uint32_t old_page_size) {
+  uint32_t new_page_size = hdr->page_size;
+
+  // Check NOR flash constraint: can we reach new_page_size by only clearing bits?
+  if ((old_page_size & new_page_size) == new_page_size) {
+    // Safe: all bits in new value are already set in old value
+    return esp_partition_write(part, page_offset, hdr, sizeof(*hdr)) == ESP_OK;
+  }
+
+  // Bit-flip violation: must erase first sector and rewrite
+  ESP_LOGW(TAG, "page_size 0x%" PRIx32 "->0x%" PRIx32 " requires sector erase @0x%" PRIx32,
+           old_page_size, new_page_size, page_offset);
+
+  uint8_t *sector_buf = malloc(4096);
+  if (!sector_buf) {
+    ESP_LOGE(TAG, "OOM allocating sector buffer for header rewrite");
+    return false;
+  }
+
+  // Read the entire first sector
+  if (esp_partition_read(part, page_offset, sector_buf, 4096) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed reading sector for header rewrite");
+    free(sector_buf);
+    return false;
+  }
+
+  // Patch the header in the buffer
+  memcpy(sector_buf, hdr, sizeof(*hdr));
+
+  // Erase the first sector
+  if (esp_partition_erase_range(part, page_offset, 4096) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed erasing sector for header rewrite");
+    free(sector_buf);
+    return false;
+  }
+
+  // Write the sector back -- retry on failure since data is lost if we don't
+  esp_err_t err = ESP_FAIL;
+  for (int retry = 0; retry < 3; retry++) {
+    err = esp_partition_write(part, page_offset, sector_buf, 4096);
+    if (err == ESP_OK) {
+      break;
+    }
+    ESP_LOGE(TAG, "Failed rewriting sector after erase (attempt %d/3)", retry + 1);
+  }
+  free(sector_buf);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "CRITICAL: sector data lost after erase @0x%" PRIx32, page_offset);
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -59,23 +125,17 @@ static bool copy_flash_block(const esp_partition_t* part, uint32_t src_offset, u
  * Relocate the page region from old_offset to a new blank region of size
  * new_size. Copies old_size bytes of data.
  */
-static bool relocate_region(timeseries_db_t* db, uint32_t old_offset, uint32_t old_size, uint32_t new_size,
+static bool relocate_region(timeseries_page_stream_writer_t* writer_ctx, uint32_t old_offset, uint32_t old_size, uint32_t new_size,
                             uint32_t* out_new_offset) {
+  timeseries_db_t* db = writer_ctx->db;
   if (!db || !db->partition) {
     return false;
   }
 
-  // 1) Find/erase new blank region
-  timeseries_blank_iterator_t iter;
-  timeseries_blank_iterator_init(db, &iter, new_size);
-
+  // 1) Reserve a new blank region (mutex-protected)
   uint32_t found_ofs = 0, found_sz = 0;
-  if (!timeseries_blank_iterator_next(&iter, &found_ofs, &found_sz)) {
+  if (!tsdb_reserve_blank_region(db, new_size, writer_ctx->batch_snapshot, &found_ofs, &found_sz)) {
     ESP_LOGE(TAG, "Failed to find blank region for size=%u", (unsigned int)new_size);
-    return false;
-  }
-  if (esp_partition_erase_range(db->partition, found_ofs, new_size) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to erase new region @0x%08" PRIx32, found_ofs);
     return false;
   }
 
@@ -114,14 +174,26 @@ static bool ensure_capacity(timeseries_page_stream_writer_t* writer, size_t need
   ESP_LOGV(TAG, "Relocation needed: old=0x%08" PRIx32 " size %u => %u",
            old_offset, (unsigned int)old_size, (unsigned int)new_size);
 
-  if (!relocate_region(writer->db, old_offset, old_size, new_size, &new_offset)) {
+  if (!relocate_region(writer, old_offset, old_size, new_size, &new_offset)) {
     return false;
   }
 
   ESP_LOGV(TAG, "Relocated: 0x%08" PRIx32 " => 0x%08" PRIx32, old_offset, new_offset);
 
+  // Mark old page as OBSOLETE on flash so it won't be found after reboot
+  // (ACTIVE=0x01 -> OBSOLETE=0x00 is bit-clearing, safe on NOR flash)
+  timeseries_page_header_t old_hdr;
+  if (esp_partition_read(writer->db->partition, old_offset, &old_hdr, sizeof(old_hdr)) == ESP_OK) {
+    old_hdr.page_state = TIMESERIES_PAGE_STATE_OBSOLETE;
+    esp_partition_write(writer->db->partition, old_offset, &old_hdr, sizeof(old_hdr));
+  }
+
   // Update page cache: remove old entry, add new entry
-  tsdb_pagecache_remove_entry(writer->db, old_offset);
+  if (writer->batch_snapshot) {
+    tsdb_pagecache_batch_remove(writer->batch_snapshot, old_offset);
+  } else {
+    tsdb_pagecache_remove_entry(writer->db, old_offset);
+  }
 
   // Adjust writer pointers by the offset difference
   uint32_t diff = new_offset - old_offset;
@@ -142,7 +214,11 @@ static bool ensure_capacity(timeseries_page_stream_writer_t* writer, size_t need
              verify_hdr.page_type, verify_hdr.page_state, verify_hdr.field_data_level);
     // Add to cache with new offset and updated size
     verify_hdr.page_size = new_size;
-    tsdb_pagecache_add_entry(writer->db, new_offset, &verify_hdr);
+    if (writer->batch_snapshot) {
+      tsdb_pagecache_batch_add(writer->batch_snapshot, new_offset, &verify_hdr);
+    } else {
+      tsdb_pagecache_add_entry(writer->db, new_offset, &verify_hdr);
+    }
   }
 
   // Check again
@@ -193,47 +269,28 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
   if (!db || !writer) {
     return false;
   }
+  // Preserve batch_snapshot that may have been set before init
+  tsdb_page_cache_snapshot_t *saved_batch = writer->batch_snapshot;
   memset(writer, 0, sizeof(*writer));
+  writer->batch_snapshot = saved_batch;
   writer->db = db;
 
   int64_t start_time = esp_timer_get_time();
 
-  // 1) Allocate a suitable blank region, total size of previous compressed data
-  // rounded up to 4k
+  // 1) Reserve a blank region (mutex-protected, registers placeholder in both snapshots)
   uint32_t initial_size = round_up_4k(prev_data_size);
   uint32_t region_ofs = 0;
-  timeseries_blank_iterator_t blank_iter;
-  timeseries_blank_iterator_init(db, &blank_iter, initial_size);
-
   uint32_t found_page_size = 0;
 
-  if (!timeseries_blank_iterator_next(&blank_iter, &region_ofs, &found_page_size)) {
+  if (!tsdb_reserve_blank_region(db, initial_size, writer->batch_snapshot, &region_ofs, &found_page_size)) {
     ESP_LOGE(TAG, "Failed to find blank region (size=%u)", (unsigned int)initial_size);
     return false;
   }
 
-  if (found_page_size < initial_size) {
-    ESP_LOGE(TAG, "Found blank region size=%u is smaller than requested %u", (unsigned int)found_page_size,
-             (unsigned int)initial_size);
-    return false;
-  }
-
   int64_t end_time = esp_timer_get_time();
-  ESP_LOGI(TAG, "Found blank region  in %.3f ms", (end_time - start_time) / 1000.0);
+  ESP_LOGI(TAG, "Reserved blank region in %.3f ms", (end_time - start_time) / 1000.0);
 
-  start_time = esp_timer_get_time();
-
-  // 2) Erase that region
-  ESP_LOGI(TAG, "Erasing region size=%lu", initial_size);
-  if (esp_partition_erase_range(db->partition, region_ofs, initial_size) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to erase region @0x%08" PRIx32, region_ofs);
-    return false;
-  }
-
-  end_time = esp_timer_get_time();
-  ESP_LOGI(TAG, "Erased region in %.3f ms", (end_time - start_time) / 1000.0);
-
-  // 3) Write a placeholder page header
+  // 2) Write proper page header (replaces placeholder written by reserve)
   timeseries_page_header_t hdr;
   memset(&hdr, 0xFF, sizeof(hdr));
   hdr.magic_number = TIMESERIES_MAGIC_NUM;
@@ -241,6 +298,7 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
   hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
   hdr.sequence_num = ++db->sequence_num;
   hdr.field_data_level = to_level;
+  hdr.page_size = initial_size;
 
   ESP_LOGV(TAG, "Init: Writing header @0x%08" PRIx32 " type=%u state=%u level=%u",
            region_ofs, hdr.page_type, hdr.page_state, to_level);
@@ -257,11 +315,6 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
              verify_hdr.page_type, verify_hdr.page_state, verify_hdr.field_data_level);
   }
 
-  // IMPORTANT: Add the page to the cache immediately to prevent the blank iterator
-  // from returning this region during subsequent relocations.
-  // Set page_size to initial_size for now (will be updated in finalize).
-  hdr.page_size = initial_size;
-  tsdb_pagecache_add_entry(db, region_ofs, &hdr);
   ESP_LOGV(TAG, "Added initial page to cache @0x%08" PRIx32, region_ofs);
 
   writer->base_offset = region_ofs;
@@ -567,11 +620,11 @@ bool timeseries_page_stream_writer_finalize(timeseries_page_stream_writer_t* wri
     return false;
   }
 
-  // Patch page_size
+  // Patch page_size using NOR-flash-safe rewrite
+  uint32_t old_page_size = hdr.page_size;
   hdr.page_size = final_size;
 
-  // Rewrite header
-  if (esp_partition_write(writer->db->partition, writer->base_offset, &hdr, sizeof(hdr)) != ESP_OK) {
+  if (!safe_rewrite_page_header(writer->db->partition, writer->base_offset, &hdr, old_page_size)) {
     ESP_LOGE(TAG, "Failed patching final page header");
     return false;
   }
@@ -583,12 +636,17 @@ bool timeseries_page_stream_writer_finalize(timeseries_page_stream_writer_t* wri
   ESP_LOGI(TAG, "Page utilization: %.2f%%. page_size=%u level=%u", page_utilization * 100.0, (unsigned int)final_size,
            (unsigned int)hdr.field_data_level);
 
-  // Update page cache entry with final size (page was added in init, just update size)
-  // Remove old entry and add updated one to refresh the cached header
-  tsdb_pagecache_remove_entry(writer->db, writer->base_offset);
-  tsdb_pagecache_add_entry(writer->db, writer->base_offset, &hdr);
-  ESP_LOGI(TAG, "Updated page cache entry @0x%08" PRIx32 " (total cache count: %zu)",
-           writer->base_offset, writer->db->page_cache_count);
+  // Update page cache entry with final header (batch_add updates in-place if offset exists)
+  if (writer->batch_snapshot) {
+    tsdb_pagecache_batch_add(writer->batch_snapshot, writer->base_offset, &hdr);
+    tsdb_pagecache_batch_sort(writer->batch_snapshot);
+    ESP_LOGI(TAG, "Updated batch page cache entry @0x%08" PRIx32,
+             writer->base_offset);
+  } else {
+    tsdb_pagecache_add_entry(writer->db, writer->base_offset, &hdr);
+    ESP_LOGI(TAG, "Updated page cache entry @0x%08" PRIx32,
+             writer->base_offset);
+  }
 
   return true;
 }

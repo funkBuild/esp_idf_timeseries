@@ -2,6 +2,10 @@
 #define TIMESERIES_INTERNAL_H
 
 #include "esp_partition.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -204,16 +208,33 @@ typedef struct {
 // Maximum number of metadata pages we can map simultaneously
 #define METADATA_MMAP_CACHE_SIZE 4
 
+// Forward declaration of snapshot type
+typedef struct tsdb_page_cache_snapshot tsdb_page_cache_snapshot_t;
+
 typedef struct {
   bool initialized;
   uint32_t next_measurement_id;
-  uint32_t sequence_num;
+  _Atomic uint32_t sequence_num;
   const esp_partition_t *partition; // pointer to the 'storage' partition
 
-  // Page cache
-  timeseries_cached_page_t *page_cache; // dynamic array
-  size_t page_cache_count;
-  size_t page_cache_capacity;
+  // Page cache (snapshot-based, reference-counted)
+  tsdb_page_cache_snapshot_t *current_snapshot;
+  SemaphoreHandle_t snapshot_mutex;
+  SemaphoreHandle_t flash_write_mutex;
+  SemaphoreHandle_t region_alloc_mutex;       // Serializes blank-region allocation
+  tsdb_page_cache_snapshot_t *active_batch;   // Points to compaction's batch snapshot while active; NULL otherwise
+
+  // Compaction claim set (prevents inserts into pages being compacted)
+#define TSDB_MAX_COMPACTION_CLAIMED_PAGES 32
+  uint32_t compaction_claimed_pages[TSDB_MAX_COMPACTION_CLAIMED_PAGES];
+  size_t compaction_claimed_count;
+
+  // Background compaction
+  TaskHandle_t compaction_task_handle;
+  SemaphoreHandle_t compaction_trigger;
+  bool compaction_running;
+  _Atomic bool compaction_in_progress;
+  _Atomic uint32_t compaction_generation;  // Incremented after each compaction run
 
   // Last used L0 page/offset
   bool last_l0_cache_valid;

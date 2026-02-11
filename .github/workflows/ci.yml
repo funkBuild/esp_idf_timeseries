@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: "ESP-IDF ${{ matrix.idf_version }}"
+    runs-on: ubuntu-latest
+    container:
+      image: "espressif/idf:${{ matrix.idf_version }}"
+    continue-on-error: ${{ matrix.allow_failure }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - idf_version: v5.5.2
+            allow_failure: false
+          - idf_version: release-v6.0
+            allow_failure: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install QEMU
+        run: |
+          python $IDF_PATH/tools/idf_tools.py install qemu-xtensa
+          eval "$(python $IDF_PATH/tools/idf_tools.py export)"
+          # Verify QEMU is available
+          qemu-system-xtensa --version
+
+      - name: Build test app
+        working-directory: test_app
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py build
+
+      - name: Create flash image
+        working-directory: test_app
+        run: |
+          . $IDF_PATH/export.sh
+          esptool.py --chip esp32 merge_bin -o build/flash_image.bin \
+            --flash_mode dio \
+            --flash_size 4MB \
+            --fill-flash-size 4MB \
+            0x1000 build/bootloader/bootloader.bin \
+            0x8000 build/partition_table/partition-table.bin \
+            0x10000 build/unit_test_test.bin
+
+      - name: Run tests in QEMU
+        working-directory: test_app
+        run: |
+          eval "$(python $IDF_PATH/tools/idf_tools.py export)"
+
+          # Run QEMU with timeout, capture output
+          timeout 600 qemu-system-xtensa \
+            -nographic \
+            -machine esp32 \
+            -drive file=build/flash_image.bin,if=mtd,format=raw \
+            -serial mon:stdio \
+            2>&1 | tee test_output.log &
+          QEMU_PID=$!
+
+          # Wait for Unity summary line or QEMU exit
+          while kill -0 $QEMU_PID 2>/dev/null; do
+            if grep -q "^[0-9]* Tests [0-9]* Failures [0-9]* Ignored" test_output.log 2>/dev/null; then
+              # Give a moment for any trailing output
+              sleep 2
+              kill $QEMU_PID 2>/dev/null || true
+              break
+            fi
+            sleep 5
+          done
+
+          wait $QEMU_PID 2>/dev/null || true
+
+          echo ""
+          echo "=== Test Results ==="
+          PASS_COUNT=$(grep -c ":PASS" test_output.log || true)
+          FAIL_COUNT=$(grep -c ":FAIL" test_output.log || true)
+          echo "Passed: $PASS_COUNT"
+          echo "Failed: $FAIL_COUNT"
+
+          # Show any failures
+          if [ "$FAIL_COUNT" -gt 0 ]; then
+            echo ""
+            echo "=== Failed Tests ==="
+            grep ":FAIL" test_output.log
+          fi
+
+          # Show Unity summary if present
+          echo ""
+          grep -E "^[0-9]* Tests [0-9]* Failures [0-9]* Ignored" test_output.log || true
+
+          # Fail if any test failed or no tests passed
+          if [ "$FAIL_COUNT" -gt 0 ]; then
+            echo "ERROR: $FAIL_COUNT test(s) failed"
+            exit 1
+          fi
+          if [ "$PASS_COUNT" -eq 0 ]; then
+            echo "ERROR: No tests passed (test execution may have failed)"
+            exit 1
+          fi
+
+          echo "All $PASS_COUNT tests passed."
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "test-log-${{ matrix.idf_version }}"
+          path: test_app/test_output.log
+          retention-days: 30

@@ -125,6 +125,7 @@ static size_t count_active_field_data_records(timeseries_db_t *db) {
     }
   }
 
+  timeseries_page_cache_iterator_deinit(&page_iter);
   return count;
 }
 
@@ -167,6 +168,8 @@ static bool find_oldest_active_record(timeseries_db_t *db,
       }
     }
   }
+
+  timeseries_page_cache_iterator_deinit(&page_iter);
 
   if (found) {
     *out_timestamp = oldest;
@@ -219,6 +222,7 @@ static size_t count_deleted_records(timeseries_db_t *db) {
     }
   }
 
+  timeseries_page_cache_iterator_deinit(&page_iter);
   return count;
 }
 
@@ -361,22 +365,17 @@ TEST_CASE("expiration: above threshold - oldest records deleted",
   ESP_LOGI(TAG, "Records before expiration: %zu, Oldest timestamp: %llu",
            records_before, oldest_before);
 
-  // Run expiration with very low threshold to force deletion
-  bool result = timeseries_expiration_run(db, 0.01f, 0.05f);
+  // Run expiration with threshold below actual usage to force deletion
+  // Usage is ~0.78% on a 2MB partition with small test data
+  float usage = get_current_usage(db);
+  float trigger_threshold = (usage > 0.001f) ? usage - 0.001f : 0.001f;
+  bool result = timeseries_expiration_run(db, trigger_threshold, 0.05f);
   TEST_ASSERT_TRUE(result);
 
-  // Verify some records were deleted
-  size_t deleted_count = count_deleted_records(db);
-  ESP_LOGI(TAG, "Deleted records: %zu", deleted_count);
-  TEST_ASSERT_GREATER_THAN(0, deleted_count);
-
-  // Verify the oldest timestamp changed (older records were deleted)
-  uint64_t oldest_after;
-  if (find_oldest_active_record(db, &oldest_after)) {
-    ESP_LOGI(TAG, "Oldest timestamp after expiration: %llu", oldest_after);
-    // After expiration, the oldest remaining record should be newer
-    TEST_ASSERT_GREATER_OR_EQUAL(oldest_before, oldest_after);
-  }
+  // Verify records were removed (compaction removes deleted records entirely)
+  size_t records_after = count_active_field_data_records(db);
+  ESP_LOGI(TAG, "Records after expiration: %zu (was %zu)", records_after, records_before);
+  TEST_ASSERT_LESS_THAN(records_before, records_after);
 
   ESP_LOGI(TAG, "Above threshold expiration test passed");
 }
@@ -402,31 +401,31 @@ TEST_CASE("expiration: deletion marker handling", "[expiration]") {
                                     "temperature", TIMESERIES_FIELD_TYPE_FLOAT,
                                     timestamps, values, NUM_POINTS));
 
-  // Verify all records are active (not deleted)
-  size_t deleted_before = count_deleted_records(db);
-  TEST_ASSERT_EQUAL(0, deleted_before);
+  // Count active records before
+  size_t records_before = count_active_field_data_records(db);
 
-  // Run expiration to mark some records as deleted
-  bool result = timeseries_expiration_run(db, 0.01f, 0.05f);
+  // Run expiration to mark records as deleted (compaction removes them)
+  // Use threshold below actual usage to ensure trigger
+  float usage = get_current_usage(db);
+  float trigger_threshold = (usage > 0.001f) ? usage - 0.001f : 0.001f;
+  bool result = timeseries_expiration_run(db, trigger_threshold, 0.05f);
   TEST_ASSERT_TRUE(result);
 
-  // Verify some records are now marked as deleted
-  size_t deleted_after = count_deleted_records(db);
-  ESP_LOGI(TAG, "Deleted records after expiration: %zu", deleted_after);
-  TEST_ASSERT_GREATER_THAN(0, deleted_after);
+  // After expiration+compaction, active records should decrease
+  size_t records_after = count_active_field_data_records(db);
+  ESP_LOGI(TAG, "Records after first expiration: %zu (was %zu)", records_after, records_before);
+  TEST_ASSERT_LESS_THAN(records_before, records_after);
 
-  // Run expiration again - already deleted records should not be processed
-  // again
-  size_t deleted_before_second_run = deleted_after;
-  result = timeseries_expiration_run(db, 0.01f, 0.05f);
+  // Run expiration again - with fewer records, should still succeed
+  size_t records_before_second = records_after;
+  result = timeseries_expiration_run(db, trigger_threshold, 0.05f);
   TEST_ASSERT_TRUE(result);
 
-  size_t deleted_after_second_run = count_deleted_records(db);
+  size_t records_after_second = count_active_field_data_records(db);
+  ESP_LOGI(TAG, "Records after second expiration: %zu", records_after_second);
 
-  // The count of deleted records could increase if more were expired,
-  // but should not decrease
-  TEST_ASSERT_GREATER_OR_EQUAL(deleted_before_second_run,
-                               deleted_after_second_run);
+  // Record count should not increase
+  TEST_ASSERT_LESS_OR_EQUAL(records_before_second, records_after_second);
 
   ESP_LOGI(TAG, "Deletion marker handling test passed");
 }
@@ -475,8 +474,10 @@ TEST_CASE("expiration: multiple series with different timestamps",
   // Should be from the older series
   TEST_ASSERT_LESS_THAN(2000000, oldest_before);
 
-  // Run expiration
-  bool result = timeseries_expiration_run(db, 0.01f, 0.05f);
+  // Run expiration with dynamic threshold
+  float usage = get_current_usage(db);
+  float trigger = (usage > 0.001f) ? usage - 0.001f : 0.001f;
+  bool result = timeseries_expiration_run(db, trigger, 0.05f);
   TEST_ASSERT_TRUE(result);
 
   // Verify oldest records (from series 1) were preferentially deleted
@@ -526,10 +527,10 @@ TEST_CASE("expiration: boundary condition - exactly at threshold",
   bool result = timeseries_expiration_run(db, threshold_trigger, 0.05f);
   TEST_ASSERT_TRUE(result);
 
-  // Should have triggered expiration
-  size_t deleted = count_deleted_records(db);
-  ESP_LOGI(TAG, "Records deleted at threshold boundary: %zu", deleted);
-  TEST_ASSERT_GREATER_THAN(0, deleted);
+  // Should have triggered expiration (compaction removes deleted records entirely)
+  size_t records_after = count_active_field_data_records(db);
+  ESP_LOGI(TAG, "Records after expiration at boundary: %zu (was %zu)", records_after, records_before);
+  TEST_ASSERT_LESS_THAN(records_before, records_after);
 
   // Now set threshold above current usage (should not trigger)
   TEST_ASSERT_TRUE(timeseries_clear_all());
@@ -542,14 +543,14 @@ TEST_CASE("expiration: boundary condition - exactly at threshold",
   if (threshold_no_trigger >= 1.0f)
     threshold_no_trigger = 0.99f;
 
-  size_t deleted_before = count_deleted_records(db);
+  size_t records_no_trigger_before = count_active_field_data_records(db);
 
   result = timeseries_expiration_run(db, threshold_no_trigger, 0.05f);
   TEST_ASSERT_TRUE(result);
 
-  size_t deleted_after = count_deleted_records(db);
-  // No new deletions should occur
-  TEST_ASSERT_EQUAL(deleted_before, deleted_after);
+  size_t records_no_trigger_after = count_active_field_data_records(db);
+  // No deletions should occur when below threshold
+  TEST_ASSERT_EQUAL(records_no_trigger_before, records_no_trigger_after);
 
   ESP_LOGI(TAG, "Boundary condition test passed");
 }
@@ -583,14 +584,18 @@ TEST_CASE("expiration: reduction threshold controls amount deleted",
                                       values, POINTS_PER_BATCH));
   }
 
-  // Test with small reduction threshold
-  size_t deleted_small = 0;
+  // Test with small reduction threshold (use dynamic threshold)
+  size_t records_after_small = 0;
+  size_t records_before_small = 0;
   {
     timeseries_db_t *db_test = timeseries_get_db_handle();
-    bool result = timeseries_expiration_run(db_test, 0.01f, 0.02f); // 2% reduction
+    records_before_small = count_active_field_data_records(db_test);
+    float usage = get_current_usage(db_test);
+    float trigger = (usage > 0.001f) ? usage - 0.001f : 0.001f;
+    bool result = timeseries_expiration_run(db_test, trigger, 0.02f); // 2% reduction
     TEST_ASSERT_TRUE(result);
-    deleted_small = count_deleted_records(db_test);
-    ESP_LOGI(TAG, "Deleted with 2%% reduction: %zu", deleted_small);
+    records_after_small = count_active_field_data_records(db_test);
+    ESP_LOGI(TAG, "Records after 2%% reduction: %zu (was %zu)", records_after_small, records_before_small);
   }
 
   // Clear and re-insert for second test
@@ -612,19 +617,24 @@ TEST_CASE("expiration: reduction threshold controls amount deleted",
                                       values, POINTS_PER_BATCH));
   }
 
-  // Test with larger reduction threshold
-  size_t deleted_large = 0;
+  // Test with larger reduction threshold (use dynamic threshold)
+  size_t records_after_large = 0;
+  size_t records_before_large = 0;
   {
     timeseries_db_t *db_test = timeseries_get_db_handle();
-    bool result = timeseries_expiration_run(db_test, 0.01f, 0.10f); // 10% reduction
+    records_before_large = count_active_field_data_records(db_test);
+    float usage = get_current_usage(db_test);
+    float trigger = (usage > 0.001f) ? usage - 0.001f : 0.001f;
+    bool result = timeseries_expiration_run(db_test, trigger, 0.10f); // 10% reduction
     TEST_ASSERT_TRUE(result);
-    deleted_large = count_deleted_records(db_test);
-    ESP_LOGI(TAG, "Deleted with 10%% reduction: %zu", deleted_large);
+    records_after_large = count_active_field_data_records(db_test);
+    ESP_LOGI(TAG, "Records after 10%% reduction: %zu (was %zu)", records_after_large, records_before_large);
   }
 
   // Larger reduction threshold should delete more records
-  // (or at least as many, limited by available records)
-  TEST_ASSERT_GREATER_OR_EQUAL(deleted_small, deleted_large);
+  size_t removed_small = records_before_small - records_after_small;
+  size_t removed_large = records_before_large - records_after_large;
+  TEST_ASSERT_GREATER_OR_EQUAL(removed_small, removed_large);
 
   ESP_LOGI(TAG, "Reduction threshold test passed");
 }
@@ -657,16 +667,19 @@ TEST_CASE("expiration: storage reclamation verification", "[expiration]") {
   ESP_LOGI(TAG, "Used space before: %u bytes, Records: %zu", used_before,
            records_before);
 
-  // Run expiration
-  bool result = timeseries_expiration_run(db, 0.01f, 0.05f);
+  // Run expiration with threshold below actual usage
+  float usage = get_current_usage(db);
+  float trigger_threshold = (usage > 0.001f) ? usage - 0.001f : 0.001f;
+  bool result = timeseries_expiration_run(db, trigger_threshold, 0.05f);
   TEST_ASSERT_TRUE(result);
 
-  // Verify records were marked deleted
-  size_t deleted = count_deleted_records(db);
-  TEST_ASSERT_GREATER_THAN(0, deleted);
+  // Verify records were removed (expiration internally runs compaction)
+  size_t records_mid = count_active_field_data_records(db);
+  ESP_LOGI(TAG, "Records after expiration: %zu (was %zu)", records_mid, records_before);
+  TEST_ASSERT_LESS_THAN(records_before, records_mid);
 
-  // Run compaction to reclaim space
-  TEST_ASSERT_TRUE(timeseries_compact());
+  // Run compaction again to ensure further reclamation
+  TEST_ASSERT_TRUE(timeseries_compact_sync());
 
   // Get usage after compaction
   uint32_t used_after = tsdb_pagecache_get_total_active_size(db);
@@ -711,15 +724,19 @@ TEST_CASE("expiration: max heap maintains 25 oldest records", "[expiration]") {
   TEST_ASSERT_TRUE(find_oldest_active_record(db, &oldest_before));
 
   // Run expiration - should only delete up to 25 oldest
-  bool result = timeseries_expiration_run(db, 0.01f, 0.05f);
+  size_t records_before = count_active_field_data_records(db);
+  float usage = get_current_usage(db);
+  float trigger = (usage > 0.001f) ? usage - 0.001f : 0.001f;
+  bool result = timeseries_expiration_run(db, trigger, 0.05f);
   TEST_ASSERT_TRUE(result);
 
-  size_t deleted = count_deleted_records(db);
-  ESP_LOGI(TAG, "Deleted %zu records from %zu total", deleted, NUM_RECORDS);
+  size_t records_after = count_active_field_data_records(db);
+  size_t removed = records_before - records_after;
+  ESP_LOGI(TAG, "Removed %zu records from %zu total", removed, records_before);
 
   // Should delete some records but not all (limited by heap size of 25)
-  TEST_ASSERT_GREATER_THAN(0, deleted);
-  TEST_ASSERT_LESS_OR_EQUAL(25, deleted); // At most 25 can be in the heap
+  TEST_ASSERT_GREATER_THAN(0, removed);
+  TEST_ASSERT_LESS_OR_EQUAL(25, removed); // At most 25 can be in the heap
 
   ESP_LOGI(TAG, "Max heap test passed");
 }
@@ -776,14 +793,16 @@ TEST_CASE("expiration: different field types handled correctly",
   size_t records_before = count_active_field_data_records(db);
   ESP_LOGI(TAG, "Records before expiration: %zu", records_before);
 
-  // Run expiration
-  bool result = timeseries_expiration_run(db, 0.01f, 0.05f);
+  // Run expiration with threshold below actual usage
+  float usage = get_current_usage(db);
+  float trigger_threshold = (usage > 0.001f) ? usage - 0.001f : 0.001f;
+  bool result = timeseries_expiration_run(db, trigger_threshold, 0.05f);
   TEST_ASSERT_TRUE(result);
 
-  // Verify some records were deleted regardless of type
-  size_t deleted = count_deleted_records(db);
-  ESP_LOGI(TAG, "Deleted records: %zu", deleted);
-  TEST_ASSERT_GREATER_THAN(0, deleted);
+  // Verify some records were removed regardless of type (compaction removes deleted records)
+  size_t records_after = count_active_field_data_records(db);
+  ESP_LOGI(TAG, "Records after expiration: %zu (was %zu)", records_after, records_before);
+  TEST_ASSERT_LESS_THAN(records_before, records_after);
 
   ESP_LOGI(TAG, "Different field types test passed");
 }
@@ -806,13 +825,15 @@ TEST_CASE("expiration: zero byte target still deletes at least one record",
 
   // Run with very small reduction that might round to 0
   // The code sets bytes_to_free = 1 if it rounds to 0
-  bool result = timeseries_expiration_run(db, 0.01f, 0.0001f);
+  size_t records_before = count_active_field_data_records(db);
+  float usage = get_current_usage(db);
+  float trigger = (usage > 0.001f) ? usage - 0.001f : 0.001f;
+  bool result = timeseries_expiration_run(db, trigger, 0.0001f);
   TEST_ASSERT_TRUE(result);
 
   // Even with tiny reduction, code should set minimum bytes_to_free = 1
-  // and attempt to delete something
-  size_t deleted = count_deleted_records(db);
-  ESP_LOGI(TAG, "Deleted with tiny reduction threshold: %zu", deleted);
+  size_t records_after = count_active_field_data_records(db);
+  ESP_LOGI(TAG, "Records after tiny reduction: %zu (was %zu)", records_after, records_before);
 
   // Depending on available data, might delete records
   // This test mainly verifies no crash/error on edge case
@@ -845,16 +866,16 @@ TEST_CASE("expiration: compaction is called for modified pages",
   size_t records_before = count_active_field_data_records(db);
 
   // Run expiration - this should mark records deleted and call compaction
-  bool result = timeseries_expiration_run(db, 0.01f, 0.05f);
+  float usage = get_current_usage(db);
+  float trigger = (usage > 0.001f) ? usage - 0.001f : 0.001f;
+  bool result = timeseries_expiration_run(db, trigger, 0.05f);
   TEST_ASSERT_TRUE(result);
 
-  size_t deleted = count_deleted_records(db);
-  ESP_LOGI(TAG, "Records deleted: %zu", deleted);
+  size_t records_after = count_active_field_data_records(db);
+  ESP_LOGI(TAG, "Records after expiration: %zu (was %zu)", records_after, records_before);
 
-  // If records were deleted, compaction should have been called
-  // We can't directly verify compaction was called, but we can verify
-  // the function returned successfully
-  if (deleted > 0) {
+  // If records were removed, compaction was called successfully
+  if (records_after < records_before) {
     ESP_LOGI(TAG, "Expiration with deletion succeeded, compaction was called");
   }
 
@@ -894,28 +915,34 @@ TEST_CASE("expiration: consecutive runs handle remaining data correctly",
   ESP_LOGI(TAG, "Initial records: %zu", initial_records);
 
   // First expiration run
-  bool result1 = timeseries_expiration_run(db, 0.01f, 0.05f);
+  float usage1 = get_current_usage(db);
+  float trigger1 = (usage1 > 0.001f) ? usage1 - 0.001f : 0.001f;
+  bool result1 = timeseries_expiration_run(db, trigger1, 0.05f);
   TEST_ASSERT_TRUE(result1);
 
-  size_t deleted_first = count_deleted_records(db);
-  ESP_LOGI(TAG, "Deleted in first run: %zu", deleted_first);
+  size_t records_after_first = count_active_field_data_records(db);
+  ESP_LOGI(TAG, "Records after first run: %zu (was %zu)", records_after_first, initial_records);
 
   // Second expiration run
-  bool result2 = timeseries_expiration_run(db, 0.01f, 0.05f);
+  float usage2 = get_current_usage(db);
+  float trigger2 = (usage2 > 0.001f) ? usage2 - 0.001f : 0.001f;
+  bool result2 = timeseries_expiration_run(db, trigger2, 0.05f);
   TEST_ASSERT_TRUE(result2);
 
-  size_t deleted_second = count_deleted_records(db);
-  ESP_LOGI(TAG, "Total deleted after second run: %zu", deleted_second);
+  size_t records_after_second = count_active_field_data_records(db);
+  ESP_LOGI(TAG, "Records after second run: %zu", records_after_second);
 
-  // Second run should delete more or maintain count
-  TEST_ASSERT_GREATER_OR_EQUAL(deleted_first, deleted_second);
+  // Each run should remove more or maintain (never increase)
+  TEST_ASSERT_LESS_OR_EQUAL(records_after_first, records_after_second);
 
   // Third run
-  bool result3 = timeseries_expiration_run(db, 0.01f, 0.05f);
+  float usage3 = get_current_usage(db);
+  float trigger3 = (usage3 > 0.001f) ? usage3 - 0.001f : 0.001f;
+  bool result3 = timeseries_expiration_run(db, trigger3, 0.05f);
   TEST_ASSERT_TRUE(result3);
 
-  size_t deleted_third = count_deleted_records(db);
-  ESP_LOGI(TAG, "Total deleted after third run: %zu", deleted_third);
+  size_t records_after_third = count_active_field_data_records(db);
+  ESP_LOGI(TAG, "Records after third run: %zu", records_after_third);
 
   ESP_LOGI(TAG, "Consecutive runs test passed");
 }

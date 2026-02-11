@@ -9,6 +9,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "timeseries_page_cache_snapshot.h"
 #include "mbedtls/md5.h"
 
 #include <inttypes.h>
@@ -31,6 +32,7 @@ static const char* TAG = "TimeseriesMetadata";
 // -----------------------------------------------------------------------------
 
 static bool tsdb_create_empty_metadata_page(timeseries_db_t* db, uint32_t page_offset);
+static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_offset);
 static bool tsdb_insert_measurement_entry(timeseries_db_t* db, uint32_t page_offset, const char* measurement_name,
                                           uint32_t id);
 static bool tsdb_find_metadata_pages(timeseries_db_t* db,
@@ -69,6 +71,7 @@ bool timeseries_metadata_create_page(timeseries_db_t* db) {
 
   uint32_t blank_offset = 0, blank_length = 0;
   bool found_blank = timeseries_blank_iterator_next(&blank_iter, &blank_offset, &blank_length);
+  timeseries_blank_iterator_deinit(&blank_iter);
 
   if (!found_blank) {
     ESP_LOGE(TAG, "No blank region found to create metadata page!");
@@ -97,7 +100,8 @@ bool tsdb_load_pages_into_memory(timeseries_db_t* db) {
     return false;
   }
 
-  ESP_LOGV(TAG, "Page cache built => %u total entries", (unsigned)db->page_cache_count);
+  ESP_LOGV(TAG, "Page cache built => %u total entries",
+           (unsigned)(db->current_snapshot ? db->current_snapshot->count : 0));
 
   // 1) Use the page iterator to check if a metadata page exists
   timeseries_page_cache_iterator_t page_iter;
@@ -228,13 +232,73 @@ bool tsdb_create_measurement_id(timeseries_db_t* db, const char* measurement_nam
     return false;
   }
 
-  // Insert the measurement into the first page offset
-  if (!tsdb_insert_measurement_entry(db, meta_offsets[0], measurement_name, new_id)) {
+  // Try each metadata page, create new one if all are full
+  bool inserted = false;
+  for (int attempt = 0; attempt < 2 && !inserted; attempt++) {
+    for (size_t p = 0; p < meta_count && !inserted; p++) {
+      inserted = tsdb_insert_measurement_entry(db, meta_offsets[p], measurement_name, new_id);
+    }
+    if (!inserted && attempt == 0) {
+      if (!timeseries_metadata_create_page(db)) {
+        break;
+      }
+      meta_count = 0;
+      if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count) || meta_count == 0) {
+        break;
+      }
+    }
+  }
+  if (!inserted) {
     ESP_LOGE(TAG, "Failed to insert measurement entry for '%s'!", measurement_name);
     return false;
   }
 
   ESP_LOGV(TAG, "Created measurement '%s' with ID=%" PRIu32, measurement_name, new_id);
+  return true;
+}
+
+bool tsdb_find_max_measurement_id(timeseries_db_t *db, uint32_t *out_max) {
+  if (!db || !out_max) {
+    return false;
+  }
+  *out_max = 0;
+
+  uint32_t meta_offsets[4];
+  size_t meta_count = 0;
+  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
+    return true; // No metadata pages, max is 0
+  }
+
+  for (size_t i = 0; i < meta_count; i++) {
+    uint32_t page_offset = meta_offsets[i];
+    uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
+
+    timeseries_entity_iterator_t ent_iter;
+    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+      continue;
+    }
+
+    timeseries_entry_header_t e_hdr;
+    while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
+      if (e_hdr.key_type != TIMESERIES_KEYTYPE_MEASUREMENT) {
+        continue;
+      }
+      if (e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
+        continue;
+      }
+      // Read the measurement ID (stored as the value)
+      char key_buf[64];
+      uint32_t val = 0;
+      if (e_hdr.key_len < sizeof(key_buf) &&
+          timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key_buf, &val)) {
+        if (val > *out_max) {
+          *out_max = val;
+        }
+      }
+    }
+    timeseries_entity_iterator_deinit(&ent_iter);
+  }
+
   return true;
 }
 
@@ -250,19 +314,26 @@ bool tsdb_insert_single_field(timeseries_db_t* db, uint32_t measurement_id, cons
   memset(buffer, 0, sizeof(buffer));
 
   size_t offset = 0;
-  offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%s", measurement_name);
+  int ret = snprintf(buffer + offset, sizeof(buffer) - offset, "%s", measurement_name);
+  if (ret < 0 || (size_t)ret >= sizeof(buffer) - offset) {
+    ESP_LOGE(TAG, "MD5 input buffer overflow (measurement_name too long)");
+    return false;
+  }
+  offset += (size_t)ret;
   for (size_t i = 0; i < num_tags; i++) {
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ":%s:%s", tag_keys[i], tag_values[i]);
-    if (offset >= sizeof(buffer)) {
+    ret = snprintf(buffer + offset, sizeof(buffer) - offset, ":%s:%s", tag_keys[i], tag_values[i]);
+    if (ret < 0 || (size_t)ret >= sizeof(buffer) - offset) {
       ESP_LOGE(TAG, "MD5 input buffer overflow");
       return false;
     }
+    offset += (size_t)ret;
   }
-  offset += snprintf(buffer + offset, sizeof(buffer) - offset, ":%s", field_name);
-  if (offset >= sizeof(buffer)) {
+  ret = snprintf(buffer + offset, sizeof(buffer) - offset, ":%s", field_name);
+  if (ret < 0 || (size_t)ret >= sizeof(buffer) - offset) {
     ESP_LOGE(TAG, "MD5 input buffer overflow (field_name too long?)");
     return false;
   }
+  offset += (size_t)ret;
 
   ESP_LOGV(TAG, "Series ID calc string: '%s'", buffer);
 
@@ -373,7 +444,7 @@ bool tsdb_ensure_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
     return true;
   }
 
-  // 2) Not found => create new entry in first meta page
+  // 2) Not found => create new entry, trying each metadata page
   uint32_t meta_offsets[4];
   size_t meta_count = 0;
   if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count) || meta_count == 0) {
@@ -381,58 +452,90 @@ bool tsdb_ensure_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
     return false;
   }
 
-  // pick first meta page
-  uint32_t page_offset = meta_offsets[0];
-  uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
+  // Try each metadata page until one has space
+  for (int attempt = 0; attempt < 2; attempt++) {
+    for (size_t p = 0; p < meta_count; p++) {
+      uint32_t page_offset = meta_offsets[p];
+      uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
 
-  timeseries_entity_iterator_t ent_iter;
-  if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-    return false;
+      timeseries_entity_iterator_t ent_iter;
+      if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+        continue;
+      }
+
+      uint32_t last_offset = ent_iter.offset;
+      timeseries_entry_header_t e_hdr;
+      while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
+        last_offset = ent_iter.offset;
+      }
+      timeseries_entity_iterator_deinit(&ent_iter);
+
+      uint32_t entry_offset = page_offset + last_offset;
+
+      timeseries_entry_header_t new_hdr;
+      memset(&new_hdr, 0, sizeof(new_hdr));
+      new_hdr.delete_marker = TIMESERIES_DELETE_MARKER_VALID;
+      new_hdr.key_type = TIMESERIES_KEYTYPE_FIELDINDEX;
+      new_hdr.key_len = 16;
+      new_hdr.value_len = 1;
+
+      uint32_t total_entry_size = sizeof(new_hdr) + new_hdr.key_len + new_hdr.value_len;
+      if (entry_offset + total_entry_size > page_offset + page_size) {
+        uint32_t reclaimed = tsdb_compact_metadata_page(db, page_offset);
+        if (reclaimed > 0) {
+          timeseries_entity_iterator_t retry_iter;
+          if (timeseries_entity_iterator_init(db, page_offset, page_size, &retry_iter)) {
+            last_offset = retry_iter.offset;
+            while (timeseries_entity_iterator_next(&retry_iter, &e_hdr)) {
+              last_offset = retry_iter.offset;
+            }
+            timeseries_entity_iterator_deinit(&retry_iter);
+            entry_offset = page_offset + last_offset;
+          }
+        }
+        if (entry_offset + total_entry_size > page_offset + page_size) {
+          continue;  // Still full, try next page
+        }
+      }
+
+      esp_err_t err = esp_partition_write(db->partition, entry_offset, &new_hdr, sizeof(new_hdr));
+      if (err != ESP_OK) {
+        return false;
+      }
+      entry_offset += sizeof(new_hdr);
+
+      err = esp_partition_write(db->partition, entry_offset, series_id, 16);
+      if (err != ESP_OK) {
+        return false;
+      }
+      entry_offset += 16;
+
+      uint8_t stored_type = (uint8_t)field_type;
+      err = esp_partition_write(db->partition, entry_offset, &stored_type, 1);
+      if (err != ESP_OK) {
+        return false;
+      }
+
+      ESP_LOGV(TAG, "Created new fieldindex for series=%.2X%.2X%.2X%.2X..., type=%d", series_id[0], series_id[1],
+               series_id[2], series_id[3], (int)field_type);
+      return true;
+    }
+
+    // All pages full on first attempt - create a new metadata page and retry
+    if (attempt == 0) {
+      if (!timeseries_metadata_create_page(db)) {
+        ESP_LOGE(TAG, "Failed to create new metadata page for field index");
+        return false;
+      }
+      meta_count = 0;
+      if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count) || meta_count == 0) {
+        return false;
+      }
+    }
   }
 
-  // find end offset
-  uint32_t last_offset = ent_iter.offset;
-  timeseries_entry_header_t e_hdr;
-  while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-    last_offset = ent_iter.offset;
-  }
-
-  timeseries_entity_iterator_deinit(&ent_iter);
-
-  uint32_t entry_offset = page_offset + last_offset;
-
-  // build new header
-  timeseries_entry_header_t new_hdr;
-  memset(&new_hdr, 0, sizeof(new_hdr));
-  new_hdr.delete_marker = TIMESERIES_DELETE_MARKER_VALID;
-  new_hdr.key_type = TIMESERIES_KEYTYPE_FIELDINDEX;
-  new_hdr.key_len = 16;
-  new_hdr.value_len = 1;
-
-  esp_err_t err = esp_partition_write(db->partition, entry_offset, &new_hdr, sizeof(new_hdr));
-  if (err != ESP_OK) {
-    return false;
-  }
-  entry_offset += sizeof(new_hdr);
-
-  // write 16-byte series_id
-  err = esp_partition_write(db->partition, entry_offset, series_id, 16);
-  if (err != ESP_OK) {
-    return false;
-  }
-  entry_offset += 16;
-
-  // write 1 byte type
-  uint8_t stored_type = (uint8_t)field_type;
-  err = esp_partition_write(db->partition, entry_offset, &stored_type, 1);
-  if (err != ESP_OK) {
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Created new fieldindex for series=%.2X%.2X%.2X%.2X..., type=%d", series_id[0], series_id[1],
-           series_id[2], series_id[3], (int)field_type);
-
-  return true;
+  ESP_LOGE(TAG, "All metadata pages full for field index entry");
+  return false;
 }
 
 bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, const char** tag_keys,
@@ -473,6 +576,114 @@ bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, co
 // -----------------------------------------------------------------------------
 // Private (static) Helpers
 // -----------------------------------------------------------------------------
+
+/**
+ * @brief Compact a metadata page by removing soft-deleted entries.
+ *
+ * Reads all live entries into a buffer, erases the page, and rewrites
+ * the header + live entries. Returns the amount of free space reclaimed,
+ * or 0 if compaction is not possible or not worthwhile.
+ */
+static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_offset) {
+  if (!db || !db->partition) {
+    return 0;
+  }
+
+  uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
+
+  // First pass: count live vs deleted entries and total live data size
+  timeseries_entity_iterator_t ent_iter;
+  if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+    return 0;
+  }
+
+  size_t live_data_size = 0;
+  size_t deleted_data_size = 0;
+  timeseries_entry_header_t e_hdr;
+  while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
+    size_t entry_size = sizeof(e_hdr) + e_hdr.key_len + e_hdr.value_len;
+    if (e_hdr.delete_marker == TIMESERIES_DELETE_MARKER_VALID) {
+      live_data_size += entry_size;
+    } else {
+      deleted_data_size += entry_size;
+    }
+  }
+  timeseries_entity_iterator_deinit(&ent_iter);
+
+  if (deleted_data_size == 0) {
+    return 0;  // Nothing to compact
+  }
+
+  ESP_LOGI(TAG, "Compacting metadata page @0x%08" PRIx32 ": %zu bytes live, %zu bytes deleted",
+           page_offset, live_data_size, deleted_data_size);
+
+  // Allocate buffer for all live entries
+  uint8_t *live_buf = malloc(live_data_size);
+  if (!live_buf) {
+    ESP_LOGE(TAG, "OOM allocating buffer for metadata compaction");
+    return 0;
+  }
+
+  // Second pass: copy live entries into buffer
+  if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+    free(live_buf);
+    return 0;
+  }
+
+  size_t buf_offset = 0;
+  while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
+    if (e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
+      continue;
+    }
+    size_t entry_size = sizeof(e_hdr) + e_hdr.key_len + e_hdr.value_len;
+
+    // Read the full entry (header + key + value) from flash
+    uint32_t entry_flash_offset = page_offset + ent_iter.current_entry_offset;
+    if (esp_partition_read(db->partition, entry_flash_offset, live_buf + buf_offset, entry_size) != ESP_OK) {
+      ESP_LOGE(TAG, "Failed reading entry during metadata compaction");
+      free(live_buf);
+      timeseries_entity_iterator_deinit(&ent_iter);
+      return 0;
+    }
+    buf_offset += entry_size;
+  }
+  timeseries_entity_iterator_deinit(&ent_iter);
+
+  // Read the existing page header
+  timeseries_page_header_t page_hdr;
+  if (esp_partition_read(db->partition, page_offset, &page_hdr, sizeof(page_hdr)) != ESP_OK) {
+    free(live_buf);
+    return 0;
+  }
+
+  // Erase the page
+  if (esp_partition_erase_range(db->partition, page_offset, page_size) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed erasing metadata page during compaction");
+    free(live_buf);
+    return 0;
+  }
+
+  // Rewrite the page header
+  if (esp_partition_write(db->partition, page_offset, &page_hdr, sizeof(page_hdr)) != ESP_OK) {
+    ESP_LOGE(TAG, "CRITICAL: Failed rewriting header after erase during compaction");
+    free(live_buf);
+    return 0;
+  }
+
+  // Rewrite all live entries
+  uint32_t write_offset = page_offset + sizeof(page_hdr);
+  if (buf_offset > 0) {
+    if (esp_partition_write(db->partition, write_offset, live_buf, buf_offset) != ESP_OK) {
+      ESP_LOGE(TAG, "CRITICAL: Failed rewriting entries after erase during compaction");
+      free(live_buf);
+      return 0;
+    }
+  }
+
+  free(live_buf);
+  ESP_LOGI(TAG, "Metadata page compaction reclaimed %zu bytes", deleted_data_size);
+  return (uint32_t)deleted_data_size;
+}
 
 static bool tsdb_create_empty_metadata_page(timeseries_db_t* db, uint32_t page_offset) {
   if (!db) {
@@ -545,6 +756,27 @@ static bool tsdb_insert_measurement_entry(timeseries_db_t* db, uint32_t page_off
   new_hdr.key_type = TIMESERIES_KEYTYPE_MEASUREMENT;
   new_hdr.key_len = (uint16_t)strlen(measurement_name);
   new_hdr.value_len = sizeof(uint32_t);
+
+  // Bounds check: ensure entry fits within the metadata page
+  uint32_t total_entry_size = sizeof(new_hdr) + new_hdr.key_len + new_hdr.value_len;
+  if (entry_offset + total_entry_size > page_offset + page_size) {
+    uint32_t reclaimed = tsdb_compact_metadata_page(db, page_offset);
+    if (reclaimed > 0) {
+      if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+        return false;
+      }
+      last_offset = ent_iter.offset;
+      while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
+        last_offset = ent_iter.offset;
+      }
+      timeseries_entity_iterator_deinit(&ent_iter);
+      entry_offset = page_offset + last_offset;
+    }
+    if (entry_offset + total_entry_size > page_offset + page_size) {
+      ESP_LOGW(TAG, "Metadata page full: cannot insert measurement '%s'", measurement_name);
+      return false;
+    }
+  }
 
   esp_err_t err = esp_partition_write(db->partition, entry_offset, &new_hdr, sizeof(new_hdr));
   if (err != ESP_OK) {
@@ -678,6 +910,29 @@ static bool tsdb_create_new_index_entry(timeseries_db_t* db, uint32_t page_offse
   new_hdr.key_type = key_type;
   new_hdr.key_len = (uint16_t)strlen(key_str);
   new_hdr.value_len = (uint16_t)series_ids_len;
+
+  // Bounds check: ensure entry fits within the metadata page
+  uint32_t total_entry_size = sizeof(new_hdr) + new_hdr.key_len + new_hdr.value_len;
+  if (entry_offset + total_entry_size > page_offset + page_size) {
+    // Try compacting the page to reclaim space from deleted entries
+    uint32_t reclaimed = tsdb_compact_metadata_page(db, page_offset);
+    if (reclaimed > 0) {
+      // Re-find end offset after compaction
+      if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+        return false;
+      }
+      last_offset = ent_iter.offset;
+      while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
+        last_offset = ent_iter.offset;
+      }
+      timeseries_entity_iterator_deinit(&ent_iter);
+      entry_offset = page_offset + last_offset;
+    }
+    if (entry_offset + total_entry_size > page_offset + page_size) {
+      ESP_LOGW(TAG, "Metadata page full (even after compaction): cannot insert index entry for '%s'", key_str);
+      return false;
+    }
+  }
 
   // Write header
   esp_err_t err = esp_partition_write(db->partition, entry_offset, &new_hdr, sizeof(new_hdr));
@@ -931,13 +1186,33 @@ static bool tsdb_upsert_seriesid_list_entry(timeseries_db_t* db, timeseries_keyt
             memcpy(new_ids, all_series_ids, series_count * 16);
             memcpy(new_ids + series_count * 16, series_id, 16);
 
-            // Create new entry with new_size
-            if (!tsdb_create_new_index_entry(db, page_offset, target_key_type, key_str, new_ids, new_size)) {
-              free(new_ids);
-              free(all_series_ids);
-              timeseries_entity_iterator_deinit(&ent_iter);
-
-              return false;
+            // Create new entry with new_size - try same page first, then others
+            bool entry_created = tsdb_create_new_index_entry(db, page_offset, target_key_type, key_str, new_ids, new_size);
+            if (!entry_created) {
+              // Same page is full - try other pages
+              for (size_t q = 0; q < meta_count && !entry_created; q++) {
+                if (meta_offsets[q] != page_offset) {
+                  entry_created = tsdb_create_new_index_entry(db, meta_offsets[q], target_key_type, key_str, new_ids, new_size);
+                }
+              }
+              if (!entry_created) {
+                // All pages full - create a new metadata page
+                if (timeseries_metadata_create_page(db)) {
+                  uint32_t new_offsets[4];
+                  size_t new_count = 0;
+                  if (tsdb_find_metadata_pages(db, new_offsets, 4, &new_count)) {
+                    for (size_t q = 0; q < new_count && !entry_created; q++) {
+                      entry_created = tsdb_create_new_index_entry(db, new_offsets[q], target_key_type, key_str, new_ids, new_size);
+                    }
+                  }
+                }
+              }
+              if (!entry_created) {
+                free(new_ids);
+                free(all_series_ids);
+                timeseries_entity_iterator_deinit(&ent_iter);
+                return false;
+              }
             }
             free(new_ids);
 
@@ -964,11 +1239,27 @@ static bool tsdb_upsert_seriesid_list_entry(timeseries_db_t* db, timeseries_keyt
 
   }  // for meta_count
 
-  // If we never found an existing entry, create a brand-new one in the first
-  // page
+  // If we never found an existing entry, create a brand-new one
   if (!found_existing && meta_count > 0) {
-    if (!tsdb_create_new_index_entry(db, meta_offsets[0], target_key_type, key_str, series_id, 16)) {
-      return false;
+    bool created = false;
+    for (size_t p = 0; p < meta_count && !created; p++) {
+      created = tsdb_create_new_index_entry(db, meta_offsets[p], target_key_type, key_str, series_id, 16);
+    }
+    if (!created) {
+      // All existing pages full - create a new metadata page and retry
+      if (timeseries_metadata_create_page(db)) {
+        uint32_t new_offsets[4];
+        size_t new_count = 0;
+        if (tsdb_find_metadata_pages(db, new_offsets, 4, &new_count)) {
+          for (size_t p = 0; p < new_count && !created; p++) {
+            created = tsdb_create_new_index_entry(db, new_offsets[p], target_key_type, key_str, series_id, 16);
+          }
+        }
+      }
+      if (!created) {
+        ESP_LOGE(TAG, "Failed to create index entry for '%s' - all metadata pages full", key_str);
+        return false;
+      }
     }
     ESP_LOGD(TAG, "Created new index entry (type=%u) for '%s' w/ single series_id", (unsigned)target_key_type, key_str);
   }

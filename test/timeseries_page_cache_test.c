@@ -450,7 +450,7 @@ TEST_CASE("page_cache: cache consistent after compaction", "[page_cache][integra
     ESP_LOGI(TAG, "Size before compaction: %" PRIu32, size_before);
 
     // Compact
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     uint32_t size_after = tsdb_pagecache_get_total_active_size(db);
     ESP_LOGI(TAG, "Size after compaction: %" PRIu32, size_after);

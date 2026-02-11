@@ -209,7 +209,7 @@ TEST_CASE("compaction: empty database compaction", "[compaction][boundary]") {
     setup_database();
 
     // Compact empty database - should succeed but do nothing
-    bool result = timeseries_compact();
+    bool result = timeseries_compact_sync();
     TEST_ASSERT_TRUE_MESSAGE(result, "Compaction of empty DB should succeed");
 
     ESP_LOGI(TAG, "Empty database compaction succeeded");
@@ -226,7 +226,7 @@ TEST_CASE("compaction: below threshold pages", "[compaction][boundary]") {
     TEST_ASSERT_TRUE(insert_float_points("threshold_test", "value", 100, 1000, 1000));
 
     // Compaction should skip because we don't have enough pages
-    bool result = timeseries_compact();
+    bool result = timeseries_compact_sync();
     TEST_ASSERT_TRUE_MESSAGE(result, "Compaction below threshold should succeed but skip");
 
     // Verify data is still accessible (not corrupted by skip logic)
@@ -257,7 +257,7 @@ TEST_CASE("compaction: single series L0 to L1", "[compaction][level0]") {
     timeseries_query_free_result(&result_before);
 
     // Compact L0 -> L1
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query after compaction - all data should be preserved
     timeseries_query_result_t result_after;
@@ -304,7 +304,7 @@ TEST_CASE("compaction: multiple series L0 to L1", "[compaction][level0]") {
     }
 
     // Compact
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query each series separately to verify all data preserved
     timeseries_query_t query;
@@ -347,7 +347,7 @@ TEST_CASE("compaction: L1 to L2 compaction", "[compaction][level1]") {
 
     // First compaction: L0 -> L1
     ESP_LOGI(TAG, "First compaction L0->L1");
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Insert more data to create more L0 pages
     for (size_t i = 5; i < 10; i++) {
@@ -356,7 +356,7 @@ TEST_CASE("compaction: L1 to L2 compaction", "[compaction][level1]") {
 
     // Second compaction: L0 -> L1 (creates more L1 pages)
     ESP_LOGI(TAG, "Second compaction L0->L1");
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Insert even more to build up L1 pages
     for (size_t i = 10; i < 15; i++) {
@@ -365,7 +365,7 @@ TEST_CASE("compaction: L1 to L2 compaction", "[compaction][level1]") {
 
     // Third compaction: Should compact L0->L1 and potentially L1->L2
     ESP_LOGI(TAG, "Third compaction (may trigger L1->L2)");
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Verify all data is intact
     timeseries_query_result_t result;
@@ -414,7 +414,7 @@ TEST_CASE("compaction: duplicate timestamps same series", "[compaction][dedup]")
     TEST_ASSERT_TRUE(insert_float_points(measurement, "value", 5, 8000, 1000));
 
     // Compact - should deduplicate timestamps
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query after compaction
     timeseries_query_result_t result;
@@ -455,7 +455,7 @@ TEST_CASE("compaction: duplicate timestamps different series", "[compaction][ded
     }
 
     // Compact
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query each series - both should have all timestamps preserved
     timeseries_query_t query;
@@ -506,7 +506,7 @@ TEST_CASE("compaction: obsolete page marking", "[compaction][cache]") {
     timeseries_query_free_result(&r1);
 
     // Compact - old L0 pages should be marked obsolete
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query after - should still work with new L1 pages
     timeseries_query_result_t r2;
@@ -533,7 +533,7 @@ TEST_CASE("compaction: cache invalidation", "[compaction][cache]") {
     timeseries_query_free_result(&r1);
 
     // Compact - cache entries for old pages should be removed
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Insert new data after compaction
     TEST_ASSERT_TRUE(insert_float_points("cache_inval", "value", 50, 500000, 1000));
@@ -573,7 +573,7 @@ TEST_CASE("compaction: large dataset multiple pages", "[compaction][large]") {
              NUM_BATCHES * POINTS_PER_BATCH, NUM_BATCHES);
 
     // Compact
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Verify all data preserved
     timeseries_query_result_t result;
@@ -608,7 +608,7 @@ TEST_CASE("compaction: mixed field types", "[compaction][types]") {
     }
 
     // Compact
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query and verify each field type
     timeseries_query_result_t result;
@@ -646,7 +646,7 @@ TEST_CASE("compaction: single point per series", "[compaction][boundary]") {
     }
 
     // Compact
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Verify
     timeseries_query_result_t result;
@@ -676,7 +676,7 @@ TEST_CASE("compaction: all levels cascade", "[compaction][levels]") {
         }
 
         // Compact all levels
-        TEST_ASSERT_TRUE(timeseries_compact());
+        TEST_ASSERT_TRUE(timeseries_compact_sync());
     }
 
     // Verify final state
@@ -710,7 +710,7 @@ TEST_CASE("compaction: timestamp ordering preservation", "[compaction][order]") 
     TEST_ASSERT_TRUE(insert_float_points("order_test", "value", 50, 150000, 1000));
 
     // Compact - should sort by timestamp
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query and verify ordering
     timeseries_query_result_t result;
@@ -749,7 +749,7 @@ TEST_CASE("compaction: sequential integrity", "[compaction][integrity]") {
     }
     ts_offset += 5 * 50000;  // Move past Round 1 timestamps
     expected_total += 250;
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     timeseries_query_result_t r1;
     TEST_ASSERT_TRUE(query_all_points("seq_test", &r1));
@@ -763,7 +763,7 @@ TEST_CASE("compaction: sequential integrity", "[compaction][integrity]") {
     }
     ts_offset += 5 * 50000;  // Move past Round 2 timestamps
     expected_total += 250;
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     timeseries_query_result_t r2;
     TEST_ASSERT_TRUE(query_all_points("seq_test", &r2));
@@ -776,7 +776,7 @@ TEST_CASE("compaction: sequential integrity", "[compaction][integrity]") {
                                              ts_offset + batch * 50000, 1000));
     }
     expected_total += 250;
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     timeseries_query_result_t r3;
     TEST_ASSERT_TRUE(query_all_points("seq_test", &r3));
@@ -800,7 +800,7 @@ TEST_CASE("compaction: no valid series after filter", "[compaction][edge]") {
 
     // This test would require inserting then deleting data, or corrupt records
     // For now, we test empty case which is similar
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     ESP_LOGI(TAG, "No valid series test passed");
 }
@@ -821,7 +821,7 @@ TEST_CASE("compaction: max level boundary", "[compaction][boundary]") {
                 TEST_ASSERT_TRUE(insert_float_points("max_level", "value",
                                                     30, base * 1000, 1000));
             }
-            TEST_ASSERT_TRUE(timeseries_compact());
+            TEST_ASSERT_TRUE(timeseries_compact_sync());
         }
     }
 
@@ -877,7 +877,7 @@ TEST_CASE("compaction: integer fields", "[compaction][types]") {
         free(values);
     }
 
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Verify
     timeseries_query_result_t result;
@@ -930,7 +930,7 @@ TEST_CASE("compaction: boolean fields", "[compaction][types]") {
         free(values);
     }
 
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Verify
     timeseries_query_result_t result;
@@ -978,7 +978,7 @@ TEST_CASE("compaction: many series stress test", "[compaction][stress]") {
     ESP_LOGI(TAG, "Inserted data for %zu series", NUM_SERIES);
 
     // Compact
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Verify each series
     timeseries_query_t query;
@@ -1013,7 +1013,7 @@ TEST_CASE("compaction: page size handling", "[compaction][size]") {
     // Insert varying sized data
     TEST_ASSERT_TRUE(create_multiple_l0_pages("size_test", 5));
 
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Verify data accessible
     timeseries_query_result_t result;

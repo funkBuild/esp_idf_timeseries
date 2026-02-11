@@ -220,7 +220,7 @@ TEST_CASE("multi_iterator: query single series after compaction", "[multi_iter][
     }
 
     // Compact to create L1 page with multi-iterator merging
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query to verify data integrity
     timeseries_query_result_t result;
@@ -281,7 +281,7 @@ TEST_CASE("multi_iterator: query multiple series with overlapping timestamps", "
     TEST_ASSERT_TRUE(insert_float_points_tagged("multi_test", "temp", tags1, vals3, 1, val_c, ts_c, 10));
 
     // Compact
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query all series - multi-iterator should merge them
     timeseries_query_t query = {
@@ -320,7 +320,7 @@ TEST_CASE("multi_iterator: deduplication with same timestamps", "[multi_iter][de
     TEST_ASSERT_TRUE(insert_float_points_tagged("dedup_test", "value", NULL, NULL, 0, val2, ts2, 3));
 
     // Compact - should deduplicate
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query
     timeseries_query_t query = {
@@ -366,7 +366,7 @@ TEST_CASE("multi_iterator: one series exhausts before others", "[multi_iter][exh
     TEST_ASSERT_TRUE(insert_float_points_tagged("exhaust_test", "data", tags, vals_long, 1, val_long, ts_long, 20));
 
     // Compact
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query all
     timeseries_query_t query = {
@@ -399,7 +399,7 @@ TEST_CASE("multi_iterator: integer field type", "[multi_iter][types]") {
     TEST_ASSERT_TRUE(insert_int_points("int_test", "count", vals2, ts2, 3));
 
     // Compact
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query
     timeseries_query_t query = {
@@ -428,7 +428,7 @@ TEST_CASE("multi_iterator: boolean field type", "[multi_iter][types]") {
     TEST_ASSERT_TRUE(insert_bool_points("bool_test", "flag", vals2, ts2, 2));
 
     // Compact
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query
     timeseries_query_t query = {
@@ -469,7 +469,7 @@ TEST_CASE("multi_iterator: many series stress test", "[multi_iter][stress]") {
     }
 
     // Compact
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query all
     timeseries_query_t query = {
@@ -514,7 +514,7 @@ TEST_CASE("multi_iterator: overlapping timestamps stress", "[multi_iter][stress]
     }
 
     // Compact - heavy deduplication work
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 
     // Query all
     timeseries_query_t query = {
@@ -524,8 +524,9 @@ TEST_CASE("multi_iterator: overlapping timestamps stress", "[multi_iter][stress]
 
     TEST_ASSERT_TRUE(timeseries_query(&query, &result));
 
-    // Should have all 10 * 100 points since they're different series
-    TEST_ASSERT_EQUAL(1000, result.num_points);
+    // Query result is row-per-timestamp; 10 series share 100 unique timestamps,
+    // so the aggregator collapses them into 100 rows.
+    TEST_ASSERT_EQUAL(100, result.num_points);
 
     timeseries_query_free_result(&result);
     ESP_LOGI(TAG, "Overlapping timestamps stress test passed");

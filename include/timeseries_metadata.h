@@ -185,6 +185,16 @@ bool tsdb_list_fields_for_measurement(timeseries_db_t *db,
 
 bool timeseries_metadata_create_page(timeseries_db_t *db);
 
+/**
+ * @brief Scan all metadata entries to find the maximum measurement ID.
+ *        Used during init to restore next_measurement_id across reboots.
+ *
+ * @param db      Pointer to the database context
+ * @param out_max Pointer to store the maximum measurement ID found (0 if none)
+ * @return true if scan completed, false on error
+ */
+bool tsdb_find_max_measurement_id(timeseries_db_t *db, uint32_t *out_max);
+
 bool tsdb_find_all_series_ids_for_measurement(
     timeseries_db_t *db, uint32_t measurement_id,
     timeseries_series_id_list_t *out_series_list);

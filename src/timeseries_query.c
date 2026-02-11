@@ -5,6 +5,7 @@
 #include "timeseries_iterator.h"
 #include "timeseries_metadata.h" // for tsdb_find_measurement_id, etc.
 #include "timeseries_multi_series_iterator.h"
+#include "timeseries_page_cache_snapshot.h"
 #include "timeseries_points_iterator.h"
 
 #include "esp_log.h"
@@ -464,10 +465,8 @@ static size_t find_or_create_row(timeseries_query_result_t *result,
         realloc(result->columns[c].values,
                 new_count * sizeof(timeseries_field_value_t));
     if (!new_values) {
-      // OOM fallback
       ESP_LOGE(TAG, "Out of memory expanding column=%zu", c);
-      // We won't back out changes for brevity; a real system might roll back
-      continue;
+      return SIZE_MAX;
     }
     result->columns[c].values = new_values;
 
@@ -500,10 +499,14 @@ intersect_series_id_lists(timeseries_series_id_list_t *out,
   qsort(out->ids, out->count, sizeof(timeseries_series_id_t),
         cmp_series_id_asc);
 
-  /* We must not modify 'other'; make a scratch copy small enough
-     for stack usage (uses VLA – OK on ESP32) or malloc if preferred */
+  /* We must not modify 'other'; make a heap copy to sort */
   timeseries_series_id_t *tmp =
-      alloca(other->count * sizeof(timeseries_series_id_t));
+      malloc(other->count * sizeof(timeseries_series_id_t));
+  if (!tmp) {
+    ESP_LOGE(TAG, "OOM in intersect_series_id_lists (%zu entries)", other->count);
+    tsdb_series_id_list_clear(out);
+    return;
+  }
   memcpy(tmp, other->ids, other->count * sizeof(timeseries_series_id_t));
   qsort(tmp, other->count, sizeof(timeseries_series_id_t), cmp_series_id_asc);
 
@@ -524,6 +527,8 @@ intersect_series_id_lists(timeseries_series_id_list_t *out,
       ++j;
     }
   }
+
+  free(tmp);
 
   /* Replace 'out' with the intersection */
   tsdb_series_id_list_clear(out);
@@ -769,6 +774,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     ESP_LOGI(TAG, "Page @0x%08X: %d records scanned, %d matched",
              (unsigned int)page_offset, page_records, page_records_matched);
   } // end while page_iterator
+  timeseries_page_cache_iterator_deinit(&page_iter);
 
   prof_end = esp_timer_get_time();
   ESP_LOGI(TAG, "[PROFILE] Page scanning: %.3f ms (%d pages, %d field_data pages, %d records)",

@@ -100,7 +100,7 @@ static void populate_metadata_test_data(size_t num_series, size_t num_tags, size
     }
 
     // Compact to ensure data is properly stored
-    TEST_ASSERT_TRUE(timeseries_compact());
+    TEST_ASSERT_TRUE(timeseries_compact_sync());
 }
 
 // ============================================================================

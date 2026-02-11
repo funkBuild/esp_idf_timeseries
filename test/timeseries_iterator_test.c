@@ -18,6 +18,7 @@
 #include "esp_partition.h"
 #include "timeseries.h"
 #include "timeseries_data.h"
+#include "timeseries_page_cache_snapshot.h"
 #include "timeseries_internal.h"
 #include "timeseries_iterator.h"
 #include "timeseries_points_iterator.h"
@@ -695,7 +696,7 @@ TEST_CASE("iterator: page cache iterator with data", "[iterator]") {
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
-  ESP_LOGI(TAG, "Page cache count: %zu", db->page_cache_count);
+  ESP_LOGI(TAG, "Page cache count: %zu", db->current_snapshot ? db->current_snapshot->count : 0);
 
   timeseries_page_cache_iterator_t iter;
   TEST_ASSERT_TRUE(timeseries_page_cache_iterator_init(db, &iter));
@@ -735,7 +736,7 @@ TEST_CASE("iterator: points iterator compressed float", "[iterator]") {
       insert_float_points("compressed_test", "temperature", NUM_POINTS, 1000, 1000));
 
   // Compact to compress the data
-  TEST_ASSERT_TRUE(timeseries_compact());
+  TEST_ASSERT_TRUE(timeseries_compact_sync());
 
   ESP_LOGI(TAG, "Inserted and compacted %zu float points", NUM_POINTS);
 
@@ -779,7 +780,7 @@ TEST_CASE("iterator: points iterator compressed int", "[iterator]") {
   TEST_ASSERT_TRUE(
       insert_int_points("int_test", "counter", NUM_POINTS, 2000, 500));
 
-  TEST_ASSERT_TRUE(timeseries_compact());
+  TEST_ASSERT_TRUE(timeseries_compact_sync());
 
   timeseries_query_t query;
   memset(&query, 0, sizeof(query));
@@ -816,7 +817,7 @@ TEST_CASE("iterator: points iterator compressed bool", "[iterator]") {
   TEST_ASSERT_TRUE(
       insert_bool_points("bool_test", "active", NUM_POINTS, 3000, 100));
 
-  TEST_ASSERT_TRUE(timeseries_compact());
+  TEST_ASSERT_TRUE(timeseries_compact_sync());
 
   timeseries_query_t query;
   memset(&query, 0, sizeof(query));

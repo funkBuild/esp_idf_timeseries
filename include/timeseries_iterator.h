@@ -83,12 +83,17 @@ typedef struct {
   // We still store a pointer to db->partition for partition->size
   const esp_partition_t* partition;
   timeseries_db_t* db;
+
+  // Snapshot reference held during iteration
+  tsdb_page_cache_snapshot_t* snapshot;
+  bool owns_snapshot;  // true if we acquired it (and must release)
 } timeseries_blank_iterator_t;
 
 typedef struct {
-  timeseries_db_t* db;
   size_t index;
   bool valid;
+  // Snapshot reference held during iteration
+  tsdb_page_cache_snapshot_t* snapshot;
 } timeseries_page_cache_iterator_t;
 
 /**
@@ -153,6 +158,17 @@ bool timeseries_page_cache_iterator_init(timeseries_db_t* db, timeseries_page_ca
 
 bool timeseries_page_cache_iterator_next(timeseries_page_cache_iterator_t* iter, timeseries_page_header_t* out_header,
                                          uint32_t* out_offset, uint32_t* out_size);
+
+void timeseries_page_cache_iterator_deinit(timeseries_page_cache_iterator_t* iter);
+
+/**
+ * @brief Initialize a blank iterator using an externally-provided snapshot.
+ * The snapshot is NOT acquired (caller owns the reference).
+ */
+bool timeseries_blank_iterator_init_with_snapshot(timeseries_db_t* db, timeseries_blank_iterator_t* iter,
+                                                   uint32_t min_size, tsdb_page_cache_snapshot_t* snapshot);
+
+void timeseries_blank_iterator_deinit(timeseries_blank_iterator_t* iter);
 
 #ifdef __cplusplus
 }

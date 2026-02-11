@@ -45,6 +45,9 @@ typedef struct timeseries_page_stream_writer {
   gorilla_flush_ctx_t ts_flush_ctx;
   gorilla_flush_ctx_t val_flush_ctx;
 
+  // Batch snapshot for compaction (when non-NULL, cache ops go through batch)
+  tsdb_page_cache_snapshot_t *batch_snapshot;
+
 } timeseries_page_stream_writer_t;
 
 /**

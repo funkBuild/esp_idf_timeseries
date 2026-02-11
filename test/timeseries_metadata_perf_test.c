@@ -16,7 +16,7 @@
 #include "timeseries_metadata.h"
 #include "timeseries_id_list.h"
 #include "timeseries_string_list.h"
-#include "mbedtls/md5.h"
+#include "mbedtls/md.h"
 #include "unity.h"
 #include <stdlib.h>
 #include <string.h>
@@ -157,7 +157,7 @@ TEST_CASE("metadata_perf: series_type_lookup_repeated", "[metadata_perf][lookup]
     // Build the series_id the same way the insert code does
     unsigned char series_id[16];
     const char *buffer = "test_measurement:device:device_0:location:location_0:value";
-    mbedtls_md5((const unsigned char*)buffer, strlen(buffer), series_id);
+    mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_MD5), (const unsigned char*)buffer, strlen(buffer), series_id);
 
     const size_t NUM_LOOKUPS = 100;
     int64_t total_time = 0;

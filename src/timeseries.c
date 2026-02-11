@@ -18,7 +18,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#include "mbedtls/md5.h"
+#include "mbedtls/md.h"
 
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -275,7 +275,7 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
       ESP_LOGI(TAG, "Cache HIT for field '%s' - skipping metadata operations", data->field_names[i]);
     } else {
       // Cache miss - compute MD5
-      mbedtls_md5((const unsigned char*)cache_key, key_len, series_id);
+      mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_MD5), (const unsigned char*)cache_key, key_len, series_id);
       ESP_LOGI(TAG, "Cache MISS for field '%s' - performing metadata operations", data->field_names[i]);
     }
 

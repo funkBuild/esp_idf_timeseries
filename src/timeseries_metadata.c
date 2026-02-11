@@ -10,7 +10,7 @@
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "timeseries_page_cache_snapshot.h"
-#include "mbedtls/md5.h"
+#include "mbedtls/md.h"
 
 #include <inttypes.h>
 #include <string.h>
@@ -339,7 +339,7 @@ bool tsdb_insert_single_field(timeseries_db_t* db, uint32_t measurement_id, cons
 
   // 2) MD5 => series_id
   unsigned char series_id[16];
-  mbedtls_md5((const unsigned char*)buffer, strlen(buffer), series_id);
+  mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_MD5), (const unsigned char*)buffer, strlen(buffer), series_id);
 
   // 3) Ensure field type in metadata
   if (!tsdb_ensure_series_type_in_metadata(db, series_id, field_val->type)) {

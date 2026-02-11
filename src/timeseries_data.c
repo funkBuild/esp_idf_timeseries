@@ -1,7 +1,7 @@
 #include "timeseries_data.h"
 #include "esp_log.h"
 #include "esp_partition.h"
-#include "mbedtls/md5.h"
+#include "mbedtls/md.h"
 #include "timeseries_compaction.h" // for timeseries_compact_level0_pages()
 #include "timeseries_internal.h"
 #include "timeseries_iterator.h"

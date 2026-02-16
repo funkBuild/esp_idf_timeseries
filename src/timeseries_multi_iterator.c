@@ -216,14 +216,20 @@ bool timeseries_multi_points_iterator_next(timeseries_multi_points_iterator_t* m
   }
   if (out_val) {
     *out_val = multi_iter->subs[best_sub].current_val;
-  }
-
-  // Transfer string ownership to the caller: NULL out the winning sub's
-  // string pointer so that multi_iter_advance_sub (called below) does not
-  // free the string we just handed to the caller via out_val.
-  if (multi_iter->subs[best_sub].current_val.type == TIMESERIES_FIELD_TYPE_STRING) {
-    multi_iter->subs[best_sub].current_val.data.string_val.str = NULL;
-    multi_iter->subs[best_sub].current_val.data.string_val.length = 0;
+    // Transfer string ownership to the caller: NULL out the winning sub's
+    // string pointer so that multi_iter_advance_sub (called below) does not
+    // free the string we just handed to the caller via out_val.
+    if (multi_iter->subs[best_sub].current_val.type == TIMESERIES_FIELD_TYPE_STRING) {
+      multi_iter->subs[best_sub].current_val.data.string_val.str = NULL;
+      multi_iter->subs[best_sub].current_val.data.string_val.length = 0;
+    }
+  } else {
+    // No caller to receive ownership — free the string to avoid leak
+    if (multi_iter->subs[best_sub].current_val.type == TIMESERIES_FIELD_TYPE_STRING) {
+      free(multi_iter->subs[best_sub].current_val.data.string_val.str);
+      multi_iter->subs[best_sub].current_val.data.string_val.str = NULL;
+      multi_iter->subs[best_sub].current_val.data.string_val.length = 0;
+    }
   }
 
   // 3) For each popped sub-iterator:

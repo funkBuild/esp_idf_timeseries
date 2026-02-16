@@ -245,12 +245,19 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
              data->num_points, data->num_fields, data->num_points * data->num_fields);
   }
 
-  // Pre-compute the common prefix (measurement + tags) for MD5 optimization
-  char prefix_buffer[192];
+  // Pre-compute the common prefix (measurement + tags) for MD5 optimization.
+  // Size matches cache_key to avoid truncation for valid inputs.
+  char prefix_buffer[256];
   size_t prefix_len = snprintf(prefix_buffer, sizeof(prefix_buffer), "%s", data->measurement_name);
+  if (prefix_len >= sizeof(prefix_buffer)) {
+    ESP_LOGE(TAG, "Measurement name too long for prefix buffer");
+    return false;
+  }
   for (size_t t = 0; t < data->num_tags; t++) {
-    prefix_len += snprintf(prefix_buffer + prefix_len, sizeof(prefix_buffer) - prefix_len,
+    size_t remaining = sizeof(prefix_buffer) - prefix_len;
+    size_t written = snprintf(prefix_buffer + prefix_len, remaining,
                           ":%s:%s", data->tag_keys[t], data->tag_values[t]);
+    prefix_len += written;
     if (prefix_len >= sizeof(prefix_buffer)) {
       ESP_LOGE(TAG, "Prefix buffer overflow");
       return false;
@@ -258,6 +265,7 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
   }
 
   // For each field i => build the series_id => store all points in one shot
+  bool any_field_failed = false;
   for (size_t i = 0; i < data->num_fields; i++) {
     // Build the cache key string
     char cache_key[256];
@@ -331,7 +339,8 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
              i + 1, data->num_fields, data->field_names[i], data->num_points);
     if (!tsdb_append_multiple_points(&s_tsdb, series_id, data->timestamps_ms, field_array, data->num_points)) {
       ESP_LOGE(TAG, "Failed to insert multi points for field '%s'", data->field_names[i]);
-      return false;
+      any_field_failed = true;
+      continue;  // best-effort: try remaining fields to minimize inconsistency
     }
     ESP_LOGV(TAG, "Successfully inserted field='%s' with %zu points for measurement=%s",
              data->field_names[i], data->num_points, data->measurement_name);
@@ -346,7 +355,7 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
     ESP_LOGI(TAG, "Large insert complete. Consider calling timeseries_compact() to optimize storage.");
   }
 
-  return true;
+  return !any_field_failed;
 }
 
 bool timeseries_compact(void) {
@@ -612,6 +621,10 @@ void timeseries_set_chunk_size(size_t chunk_size) {
   if (chunk_size == 0) {
     ESP_LOGW(TAG, "Invalid chunk size (0), keeping current value");
     return;
+  }
+  if (chunk_size > UINT16_MAX) {
+    ESP_LOGW(TAG, "Chunk size %zu exceeds max (65535), clamping", chunk_size);
+    chunk_size = UINT16_MAX;
   }
   s_tsdb.chunk_size = chunk_size;
   ESP_LOGI(TAG, "Chunk size set to %zu points", chunk_size);

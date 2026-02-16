@@ -125,6 +125,9 @@ bool chimp_decoder_get_value(ChimpFloatDecoder *dec, double *value) {
       significant_bits = 64;
     dec->stored_trailing_zeros =
         64 - significant_bits - dec->stored_leading_zeros;
+    if (dec->stored_trailing_zeros < 0) {
+      return false; // corrupt header
+    }
     int to_read = 64 - dec->stored_leading_zeros - dec->stored_trailing_zeros;
     uint64_t value_bits = 0;
     if (to_read > 0) {

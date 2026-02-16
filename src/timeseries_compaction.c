@@ -374,7 +374,9 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       if (db->flash_write_mutex) { xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY); }
       db->compaction_claimed_count = 0;
       if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
+      if (db->region_alloc_mutex) { xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY); }
       db->active_batch = NULL;
+      if (db->region_alloc_mutex) { xSemaphoreGive(db->region_alloc_mutex); }
       tsdb_snapshot_release(batch);
       free(pages);
       return false;
@@ -415,8 +417,11 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       if (db->flash_write_mutex) { xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY); }
       db->compaction_claimed_count = 0;
       if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
+      if (db->region_alloc_mutex) { xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY); }
       db->active_batch = NULL;
+      if (db->region_alloc_mutex) { xSemaphoreGive(db->region_alloc_mutex); }
       tsdb_snapshot_release(batch);
+      free(uniq_ids.list);
       free(pages);
       return false;
     }
@@ -465,6 +470,11 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       // Begin streaming this series
       if (!timeseries_page_stream_writer_begin_series(&sw, uniq_ids.list[i], ftype)) {
         ESP_LOGE(TAG, "Failed to begin_series for i=%zu", i);
+        if (ftype == TIMESERIES_FIELD_TYPE_STRING) {
+          for (size_t j = 0; j < pts_used; j++) {
+            free(pts[j].field_val.data.string_val.str);
+          }
+        }
         free(pts);
         series_loop_failed = true;
         break;
@@ -547,7 +557,9 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       if (db->flash_write_mutex) { xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY); }
       db->compaction_claimed_count = 0;
       if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
+      if (db->region_alloc_mutex) { xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY); }
       db->active_batch = NULL;
+      if (db->region_alloc_mutex) { xSemaphoreGive(db->region_alloc_mutex); }
       tsdb_snapshot_release(batch);
       free(pages);
       return false;
@@ -598,9 +610,15 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
     xSemaphoreGive(db->region_alloc_mutex);
   }
 
-  // Commit the batch to merge with any concurrent inserts
-  tsdb_pagecache_batch_sort(batch);
-  tsdb_pagecache_commit_batch(db, batch);
+  if (success) {
+    // Commit the batch to merge with any concurrent inserts
+    tsdb_pagecache_batch_sort(batch);
+    tsdb_pagecache_commit_batch(db, batch);
+  } else {
+    // Don't commit a failed compaction — discard the batch to avoid
+    // making partial/duplicate data visible to queries.
+    tsdb_snapshot_release(batch);
+  }
 
   free(pages);
   return success;
@@ -864,7 +882,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
             size_t newcap = (S->record_capacity == 0) ? 4 : (S->record_capacity * 2);
             tsdb_record_descriptor_t* grow = realloc(S->records, newcap * sizeof(tsdb_record_descriptor_t));
             if (!grow) {
-              return false;
+              goto series_map_cleanup;
             }
             S->records = grow;
             S->record_capacity = newcap;
@@ -881,7 +899,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
           size_t newcap = (series_map_cap == 0) ? 4 : (series_map_cap * 2);
           tsdb_series_descriptors_t* grow = realloc(series_map, newcap * sizeof(tsdb_series_descriptors_t));
           if (!grow) {
-            return false;
+            goto series_map_cleanup;
           }
           series_map = grow;
           series_map_cap = newcap;
@@ -892,7 +910,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
         series_map[series_map_used].record_capacity = 4;
         series_map[series_map_used].records = calloc(4, sizeof(tsdb_record_descriptor_t));
         if (!series_map[series_map_used].records) {
-          return false;
+          goto series_map_cleanup;
         }
         series_map[series_map_used].records[0] = desc;
         series_map_used++;
@@ -1148,6 +1166,13 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
   // printf("free heap size:%ld\n", esp_get_free_heap_size());
 
   return true;
+
+series_map_cleanup:
+  for (size_t s = 0; s < series_map_used; s++) {
+    free(series_map[s].records);
+  }
+  free(series_map);
+  return false;
 }
 
 /**
@@ -1218,11 +1243,16 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_
            (unsigned int)total_records, (unsigned int)total_data_size);
 
   // 4) Allocate a new page using the rewriter, passing the computed total size.
+  //    Acquire flash_write_mutex for the entire rewrite+obsolete sequence to
+  //    prevent interleaving with concurrent inserts.
+  if (db->flash_write_mutex) { xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY); }
+
   if (total_records > 0) {
     timeseries_page_rewriter_t rewriter;
     memset(&rewriter, 0, sizeof(rewriter));  // Ensure batch_snapshot is NULL (not garbage)
     if (!timeseries_page_rewriter_start(db, level, total_data_size, &rewriter)) {
       ESP_LOGE(TAG, "Failed to initialize page rewriter");
+      if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
       return false;
     }
     // The new page offset is now rewriter.base_offset.
@@ -1231,6 +1261,7 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_
     if (!timeseries_fielddata_iterator_init(db, old_page_ofs, old_page_size, &f_iter)) {
       ESP_LOGE(TAG, "Failed to re-init fielddata iterator @0x%08X", (unsigned int)old_page_ofs);
       timeseries_page_rewriter_abort(&rewriter);
+      if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
       return false;
     }
     while (timeseries_fielddata_iterator_next(&f_iter, &fd_hdr)) {
@@ -1242,6 +1273,7 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_
       if (!timeseries_page_rewriter_write_field_data(&rewriter, old_page_ofs, f_iter.current_record_offset, &fd_hdr)) {
         ESP_LOGE(TAG, "Failed writing field data to new page @0x%08X", (unsigned int)rewriter.base_offset);
         timeseries_page_rewriter_abort(&rewriter);
+        if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
         return false;
       }
     }
@@ -1249,6 +1281,7 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_
     // 6) Finalize the new page.
     if (!timeseries_page_rewriter_finalize(&rewriter)) {
       ESP_LOGE(TAG, "Failed to finalize new page @0x%08X", (unsigned int)rewriter.base_offset);
+      if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
       return false;
     }
   }
@@ -1260,6 +1293,8 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_
     ESP_LOGE(TAG, "Failed marking old page @0x%08X obsolete (err=0x%x)", (unsigned int)old_page_ofs, err);
     // Not strictly fatal, so continue.
   }
+
+  if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
 
   // Remove the old page from the cache.
   tsdb_pagecache_remove_entry(db, old_page_ofs);

@@ -306,6 +306,12 @@ bool timeseries_multi_series_iterator_next(
     }
     if (out_val) {
       *out_val = actual_val;
+    } else {
+      // No caller to receive ownership — free string to avoid leak
+      if (actual_val.type == TIMESERIES_FIELD_TYPE_STRING &&
+          actual_val.data.string_val.str) {
+        free(actual_val.data.string_val.str);
+      }
     }
 
     // 4. Check if we have more data left
@@ -344,14 +350,13 @@ bool timeseries_multi_series_iterator_next(
     while (true) {
       uint64_t ts_cur;
       timeseries_field_value_t val_cur;
-      // 'Peek'
+      // Peek to check timestamp without consuming
       if (!timeseries_multi_points_iterator_peek(iter->sub_iters[s], &ts_cur,
                                                  &val_cur)) {
-        // no more data
         break;
       }
       if (ts_cur < window_start) {
-        // skip old data -- consume the point and free any owned string
+        // Skip old data -- consume the point and free any owned string
         (void)timeseries_multi_points_iterator_next(iter->sub_iters[s], &ts_cur,
                                                     &val_cur);
         if (val_cur.type == TIMESERIES_FIELD_TYPE_STRING) {
@@ -361,23 +366,33 @@ bool timeseries_multi_series_iterator_next(
         continue;
       }
       if (ts_cur >= window_end) {
-        // belongs to a future window, stop
         break;
       }
 
-      // If here, ts_cur is in [window_start, window_end).
-      update_aggregator(iter->aggregator, &val_cur, &accumulator, &sample_count,
-                        &min_v, &max_v, &last_val);
-
-      // consume it
+      // Consume first to get properly deduplicated value with ownership,
+      // then feed to the aggregator.
       (void)timeseries_multi_points_iterator_next(iter->sub_iters[s], &ts_cur,
                                                   &val_cur);
+
+      update_aggregator(iter->aggregator, &val_cur, &accumulator, &sample_count,
+                        &min_v, &max_v, &last_val);
     }
   }
 
   // Finalize aggregator
   timeseries_field_value_t aggregated = finalize_aggregator(
       iter->aggregator, accumulator, sample_count, min_v, max_v, &last_val);
+
+  // If the aggregator did not transfer last_val's string into the result
+  // (i.e. non-LAST aggregation on string data), free it to avoid a leak.
+  if (last_val.type == TIMESERIES_FIELD_TYPE_STRING &&
+      last_val.data.string_val.str != NULL) {
+    // Check if finalize_aggregator returned a different value (non-LAST path)
+    if (aggregated.type != TIMESERIES_FIELD_TYPE_STRING ||
+        aggregated.data.string_val.str != last_val.data.string_val.str) {
+      free(last_val.data.string_val.str);
+    }
+  }
 
   // Output
   if (out_ts) {

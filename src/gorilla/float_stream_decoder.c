@@ -79,6 +79,9 @@ bool float_stream_decoder_get_value(FloatStreamDecoder *dec, double *value) {
       uint64_t db = header & 0x3F;
       dec->data_bits = (db == 0) ? 64 : (int)db;
       dec->prev_tzb = 64 - dec->prev_lzb - dec->data_bits;
+      if (dec->prev_tzb < 0) {
+        return false; // corrupt header
+      }
     } else {
       return false;
     }

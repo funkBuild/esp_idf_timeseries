@@ -168,7 +168,9 @@ void gorilla_decoder_deinit(gorilla_decoder_stream_t *decoder) {
     boolean_stream_decoder_destroy(
         (BooleanStreamDecoder *)decoder->decoder_impl);
     decoder->decoder_impl = NULL;
-  } else if (decoder->stream_type == GORILLA_STREAM_STRING) {
+  } else if (decoder->stream_type == GORILLA_STREAM_STRING &&
+             decoder->decoder_impl != NULL) {
     string_stream_decoder_destroy((StringStreamDecoder *)decoder->decoder_impl);
+    decoder->decoder_impl = NULL;
   }
 }

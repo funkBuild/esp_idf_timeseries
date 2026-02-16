@@ -138,6 +138,13 @@ static bool read_uncompressed_bytes(StringStreamDecoder *dec, uint8_t *dst,
       return false;
     }
 
+    /* Detect zero-progress: no bytes produced and no bytes consumed means
+       the stream is stuck (truncated input). Break to avoid infinite loop. */
+    if (bytes_produced == 0 && bytes_consumed == 0 && !dec->stream_ended) {
+      ESP_LOGE(TAG, "inflate() made no progress, likely truncated stream");
+      return false;
+    }
+
     /* If we've consumed the entire in_buffer, reset it. */
     if (dec->in_buffer_pos >= dec->in_buffer_size) {
       dec->in_buffer_pos = 0;
@@ -206,23 +213,14 @@ static uint32_t from_little_endian_u32(const uint8_t *bytes) {
 bool string_stream_decoder_get_value(StringStreamDecoder *dec,
                                      uint8_t **out_data, size_t *out_length) {
 
-  if (!dec) {
-    ESP_LOGE(TAG, "dec is NULL");
-  }
-
-  if (!out_data) {
-    ESP_LOGE(TAG, "out_data is NULL");
-  }
-
-  if (!out_length) {
-    ESP_LOGE(TAG, "out_length is NULL");
+  if (!dec || !out_data || !out_length) {
+    ESP_LOGE(TAG, "Invalid args: dec=%p out_data=%p out_length=%p",
+             (void *)dec, (void *)out_data, (void *)out_length);
+    return false;
   }
 
   if (dec->finished) {
     ESP_LOGE(TAG, "dec->finished is true");
-  }
-
-  if (!dec || !out_data || !out_length || dec->finished) {
     return false;
   }
 

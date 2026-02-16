@@ -400,27 +400,32 @@ static size_t find_or_create_column(timeseries_query_result_t *result,
     return SIZE_MAX; /* signal fatal OOM */
   }
   result->columns = new_cols;
-  result->num_columns = new_num_cols;
 
-  // Initialize the new column
+  // Initialize the new column before incrementing num_columns
   memset(&result->columns[new_col_index], 0,
          sizeof(result->columns[new_col_index]));
   result->columns[new_col_index].name = strdup(field_name);
+  if (!result->columns[new_col_index].name) {
+    ESP_LOGE(TAG, "OOM allocating column name '%s'", field_name);
+    return SIZE_MAX;
+  }
   result->columns[new_col_index].type = field_type;
 
   // Because we already have 'result->num_points' rows, we must allocate
   // enough space for that many values in this new column.
-  /* Allocate value storage for existing rows. Free 'name' if that fails to
-     avoid a leak, then propagate OOM via SIZE_MAX. */
   if (result->num_points) {
     result->columns[new_col_index].values =
         calloc(result->num_points, sizeof(timeseries_field_value_t));
     if (!result->columns[new_col_index].values) {
       free((void *)result->columns[new_col_index].name);
+      result->columns[new_col_index].name = NULL;
       ESP_LOGE(TAG, "OOM allocating initial cells for column '%s'", field_name);
       return SIZE_MAX;
     }
   }
+
+  // Only increment num_columns after the column is fully initialized
+  result->num_columns = new_num_cols;
 
   return new_col_index;
 }
@@ -451,13 +456,11 @@ static size_t find_or_create_row(timeseries_query_result_t *result,
   uint64_t *new_ts_array =
       realloc(result->timestamps, new_count * sizeof(uint64_t));
   if (!new_ts_array) {
-    // In a real system, handle OOM robustly
     ESP_LOGE(TAG, "Out of memory expanding timestamps");
-    return SIZE_MAX; // fallback, or handle error
+    return SIZE_MAX;
   }
   result->timestamps = new_ts_array;
   result->timestamps[new_row_index] = ts;
-  result->num_points = new_count;
 
   // Expand each column's values array by 1
   for (size_t c = 0; c < result->num_columns; c++) {
@@ -466,14 +469,19 @@ static size_t find_or_create_row(timeseries_query_result_t *result,
                 new_count * sizeof(timeseries_field_value_t));
     if (!new_values) {
       ESP_LOGE(TAG, "Out of memory expanding column=%zu", c);
+      // Rollback: shrink timestamps back and don't increment num_points
+      // Already-expanded columns have harmless extra capacity
       return SIZE_MAX;
     }
     result->columns[c].values = new_values;
 
-    // Initialize the new cell to type=0 or your own sentinel
+    // Initialize the new cell to type=0
     memset(&result->columns[c].values[new_row_index], 0,
            sizeof(timeseries_field_value_t));
   }
+
+  // Only increment num_points after all columns are successfully expanded
+  result->num_points = new_count;
 
   return new_row_index;
 }
@@ -992,15 +1000,27 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
 
         // Optional time-range filtering (if requested)
         if (query->start_ms != 0 && rollup_ts < query->start_ms) {
+          if (val_agg.type == TIMESERIES_FIELD_TYPE_STRING &&
+              val_agg.data.string_val.str) {
+            free(val_agg.data.string_val.str);
+          }
           continue;
         }
         if (query->end_ms != 0 && rollup_ts > query->end_ms) {
+          if (val_agg.type == TIMESERIES_FIELD_TYPE_STRING &&
+              val_agg.data.string_val.str) {
+            free(val_agg.data.string_val.str);
+          }
           break; // aggregator times are in ascending order, so we can break
         }
 
         // Check limit for this field
         if (query->limit != 0 && inserted_for_this_field >= query->limit) {
           // We've reached the maximum number of points we allow for this field
+          if (val_agg.type == TIMESERIES_FIELD_TYPE_STRING &&
+              val_agg.data.string_val.str) {
+            free(val_agg.data.string_val.str);
+          }
           break;
         }
 
@@ -1010,7 +1030,18 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
         if (row_index == SIZE_MAX) {
           ESP_LOGE(TAG, "OOM inserting new result row – aborting field '%s'",
                    fld->field_name);
+          if (val_agg.type == TIMESERIES_FIELD_TYPE_STRING &&
+              val_agg.data.string_val.str) {
+            free(val_agg.data.string_val.str);
+          }
           break;
+        }
+
+        // Free any existing string in this cell before overwriting (can happen
+        // when find_or_create_row returns an existing row with a duplicate ts).
+        if (result->columns[col_index].values[row_index].type == TIMESERIES_FIELD_TYPE_STRING &&
+            result->columns[col_index].values[row_index].data.string_val.str) {
+          free(result->columns[col_index].values[row_index].data.string_val.str);
         }
 
         // Use the type from the aggregated value as it may be different from

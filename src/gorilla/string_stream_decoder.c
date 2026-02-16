@@ -6,7 +6,7 @@
 
 #include "esp_log.h"
 
-static const char* TAG = "STRING_DECODER";
+static const char *TAG = "STRING_DECODER";
 
 /**
  * The size of the chunk we'll request from the fill callback and feed to zlib.
@@ -23,7 +23,7 @@ static const char* TAG = "STRING_DECODER";
 struct StringStreamDecoder {
   z_stream zstrm;       /* Zlib stream state. */
   FillCallback fill_cb; /* Callback to fetch compressed data. */
-  void* fill_ctx;       /* Context pointer for fill_cb. */
+  void *fill_ctx;       /* Context pointer for fill_cb. */
 
   bool finished;     /* If the user called finish or if we hit Z_STREAM_END. */
   bool stream_ended; /* True if inflate() returned Z_STREAM_END. */
@@ -34,16 +34,18 @@ struct StringStreamDecoder {
 };
 
 /* Forward declarations for internal helper functions. */
-static bool refill_input_buffer(StringStreamDecoder* dec);
-static bool read_uncompressed_bytes(StringStreamDecoder* dec, uint8_t* dst, size_t len);
-static uint32_t from_little_endian_u32(const uint8_t* bytes);
+static bool refill_input_buffer(StringStreamDecoder *dec);
+static bool read_uncompressed_bytes(StringStreamDecoder *dec, uint8_t *dst,
+                                    size_t len);
+static uint32_t from_little_endian_u32(const uint8_t *bytes);
 
-StringStreamDecoder* string_stream_decoder_create(FillCallback fill_cb, void* fill_ctx) {
+StringStreamDecoder *string_stream_decoder_create(FillCallback fill_cb,
+                                                  void *fill_ctx) {
   if (!fill_cb) {
     return NULL;
   }
 
-  StringStreamDecoder* dec = (StringStreamDecoder*)calloc(1, sizeof(*dec));
+  StringStreamDecoder *dec = (StringStreamDecoder *)calloc(1, sizeof(*dec));
   if (!dec) {
     return NULL;
   }
@@ -75,7 +77,7 @@ StringStreamDecoder* string_stream_decoder_create(FillCallback fill_cb, void* fi
   return dec;
 }
 
-void string_stream_decoder_destroy(StringStreamDecoder* dec) {
+void string_stream_decoder_destroy(StringStreamDecoder *dec) {
   if (!dec) {
     return;
   }
@@ -91,7 +93,8 @@ void string_stream_decoder_destroy(StringStreamDecoder* dec) {
  * the fill callback to get more compressed data. We continue until we have
  * produced `len` uncompressed bytes or until we reach the end of the stream.
  */
-static bool read_uncompressed_bytes(StringStreamDecoder* dec, uint8_t* dst, size_t len) {
+static bool read_uncompressed_bytes(StringStreamDecoder *dec, uint8_t *dst,
+                                    size_t len) {
   size_t total_read = 0;
   while (total_read < len) {
     /* If we have no compressed bytes left to feed zlib, try to fill the buffer.
@@ -122,14 +125,16 @@ static bool read_uncompressed_bytes(StringStreamDecoder* dec, uint8_t* dst, size
     total_read += bytes_produced;
 
     /* How many input bytes did we consume? */
-    size_t bytes_consumed = (dec->in_buffer_size - dec->in_buffer_pos) - dec->zstrm.avail_in;
+    size_t bytes_consumed =
+        (dec->in_buffer_size - dec->in_buffer_pos) - dec->zstrm.avail_in;
     dec->in_buffer_pos += bytes_consumed;
 
     /* If we've reached the end of the compressed stream (Z_STREAM_END) but
        haven't read all `len` uncompressed bytes, it's an error (truncated
        data). */
     if (dec->stream_ended && total_read < len) {
-      ESP_LOGW(TAG, "Truncated data: wanted %u bytes, got %u", (unsigned int)len, (unsigned int)total_read);
+      ESP_LOGW(TAG, "Truncated data: wanted %u bytes, got %u",
+               (unsigned int)len, (unsigned int)total_read);
       return false;
     }
 
@@ -148,7 +153,7 @@ static bool read_uncompressed_bytes(StringStreamDecoder* dec, uint8_t* dst, size
  * @return true if we read > 0 bytes, false if we read 0 (EOF) or an error
  * occurred.
  */
-static bool refill_input_buffer(StringStreamDecoder* dec) {
+static bool refill_input_buffer(StringStreamDecoder *dec) {
   if (dec->stream_ended) {
     return false; /* End of stream reached already. */
   }
@@ -172,7 +177,8 @@ static bool refill_input_buffer(StringStreamDecoder* dec) {
   }
 
   size_t filled = 0;
-  bool success = dec->fill_cb(dec->fill_ctx, dec->in_buffer + dec->in_buffer_size, space, &filled);
+  bool success = dec->fill_cb(
+      dec->fill_ctx, dec->in_buffer + dec->in_buffer_size, space, &filled);
 
   if (!success || filled == 0) {
     /* Callback signaled end-of-data or an error. */
@@ -184,7 +190,7 @@ static bool refill_input_buffer(StringStreamDecoder* dec) {
 }
 
 /* Helper to interpret a 4-byte little-endian prefix as a 32-bit integer. */
-static uint32_t from_little_endian_u32(const uint8_t* bytes) {
+static uint32_t from_little_endian_u32(const uint8_t *bytes) {
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
   // On little-endian systems, we can simply copy the bytes.
   uint32_t x;
@@ -192,12 +198,14 @@ static uint32_t from_little_endian_u32(const uint8_t* bytes) {
   return x;
 #else
   // On big-endian systems, reconstruct the integer.
-  return ((uint32_t)bytes[0]) | (((uint32_t)bytes[1]) << 8) | (((uint32_t)bytes[2]) << 16) |
-         (((uint32_t)bytes[3]) << 24);
+  return ((uint32_t)bytes[0]) | (((uint32_t)bytes[1]) << 8) |
+         (((uint32_t)bytes[2]) << 16) | (((uint32_t)bytes[3]) << 24);
 #endif
 }
 
-bool string_stream_decoder_get_value(StringStreamDecoder* dec, uint8_t** out_data, size_t* out_length) {
+bool string_stream_decoder_get_value(StringStreamDecoder *dec,
+                                     uint8_t **out_data, size_t *out_length) {
+
   if (!dec) {
     ESP_LOGE(TAG, "dec is NULL");
   }
@@ -235,7 +243,7 @@ bool string_stream_decoder_get_value(StringStreamDecoder* dec, uint8_t** out_dat
   }
 
   /* Allocate a buffer to hold the string data. */
-  uint8_t* buf = (uint8_t*)malloc(length + 1); /* +1 for NUL terminator */
+  uint8_t *buf = (uint8_t *)malloc(length);
   if (!buf) {
     ESP_LOGE(TAG, "OOM for string data of length %u", (unsigned int)length);
     return false;
@@ -243,13 +251,11 @@ bool string_stream_decoder_get_value(StringStreamDecoder* dec, uint8_t** out_dat
 
   /* Now read the `length` bytes of string content. */
   if (!read_uncompressed_bytes(dec, buf, length)) {
-    ESP_LOGE(TAG, "Failed to read %u bytes of string data", (unsigned int)length);
+    ESP_LOGE(TAG, "Failed to read %u bytes of string data",
+             (unsigned int)length);
     free(buf);
     return false;
   }
-
-  /* Ensure the string is NUL-terminated. */
-  buf[length] = '\0'; /* NUL-terminate the string. */
 
   /* Success! Return them to the caller. */
   *out_data = buf;
@@ -257,7 +263,7 @@ bool string_stream_decoder_get_value(StringStreamDecoder* dec, uint8_t** out_dat
   return true;
 }
 
-bool string_stream_decoder_finish(StringStreamDecoder* dec) {
+bool string_stream_decoder_finish(StringStreamDecoder *dec) {
   if (!dec) {
     return false;
   }
@@ -300,7 +306,8 @@ bool string_stream_decoder_finish(StringStreamDecoder* dec) {
         return false;
       }
 
-      size_t consumed = (dec->in_buffer_size - dec->in_buffer_pos) - dec->zstrm.avail_in;
+      size_t consumed =
+          (dec->in_buffer_size - dec->in_buffer_pos) - dec->zstrm.avail_in;
       dec->in_buffer_pos += consumed;
       if (dec->in_buffer_pos >= dec->in_buffer_size) {
         dec->in_buffer_pos = 0;

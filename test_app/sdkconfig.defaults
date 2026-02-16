@@ -1,7 +1,17 @@
 # ESP IDF Timeseries Test Configuration
+# Enables all features for comprehensive testing
 
 # Target
 CONFIG_IDF_TARGET="esp32s3"
+
+# Series ID Cache Configuration
+CONFIG_TIMESERIES_USE_SERIES_ID_CACHE=y
+CONFIG_TIMESERIES_SERIES_ID_CACHE_SIZE=64
+CONFIG_TIMESERIES_CACHE_USE_LRU=y
+CONFIG_TIMESERIES_ENABLE_CACHE_STATS=y
+
+# Chunk Buffer Configuration
+CONFIG_TIMESERIES_CHUNK_BUFFER_SIZE=16
 
 # Flash Configuration - 16MB for QEMU
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
@@ -25,6 +35,9 @@ CONFIG_UNITY_ENABLE_IDF_TEST_RUNNER=y
 
 # Disable task watchdog during tests
 CONFIG_ESP_TASK_WDT_EN=n
+
+# Increase main task stack for test functions with deep call stacks
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # Compiler Optimization - Use O2 for performance testing
 CONFIG_COMPILER_OPTIMIZATION_PERF=y

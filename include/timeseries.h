@@ -16,18 +16,6 @@ typedef enum {
   TIMESERIES_FIELD_TYPE_STRING,
 } timeseries_field_type_e;
 
-/**
- * @brief Supported aggregation methods for rollups
- */
-typedef enum {
-  TSDB_AGGREGATION_AVG = 0,
-  TSDB_AGGREGATION_MIN,
-  TSDB_AGGREGATION_MAX,
-  TSDB_AGGREGATION_LATEST,
-  TSDB_AGGREGATION_SUM,
-  TSDB_AGGREGATION_COUNT,
-} timeseries_aggregation_method_e;
-
 typedef struct {
   timeseries_field_type_e type;
   union {
@@ -65,6 +53,20 @@ typedef struct {
   uint64_t* timestamps_ms;  // length = num_points
   size_t num_points;
 } timeseries_insert_data_t;
+
+/**
+ * @brief Supported aggregation methods for rollups
+ */
+typedef enum {
+  TSDB_AGGREGATION_NONE = 0,
+  TSDB_AGGREGATION_MIN,
+  TSDB_AGGREGATION_MAX,
+  TSDB_AGGREGATION_AVG,
+  TSDB_AGGREGATION_LAST,
+  TSDB_AGGREGATION_LATEST = TSDB_AGGREGATION_LAST,
+  TSDB_AGGREGATION_SUM,
+  TSDB_AGGREGATION_COUNT,
+} timeseries_aggregation_method_e;
 
 /**
  * @brief Query descriptor for selecting data from the TSDB.
@@ -110,6 +112,7 @@ typedef struct timeseries_query_t {
   size_t limit;
   uint32_t rollup_interval;
   timeseries_aggregation_method_e aggregate_method;
+
 } timeseries_query_t;
 
 /**
@@ -167,16 +170,25 @@ typedef struct timeseries_query_result_t {
   size_t num_columns;
 } timeseries_query_result_t;
 
+/**
+ * @brief Tag key-value pair for listing tags
+ */
 typedef struct {
   char* key;
   char* val;
 } tsdb_tag_pair_t;
 
+/**
+ * @brief Page usage summary for a single level
+ */
 typedef struct {
   uint32_t num_pages;
   uint32_t size_bytes;
 } tsdb_page_usage_summary_t;
 
+/**
+ * @brief Overall storage usage summary
+ */
 typedef struct {
   tsdb_page_usage_summary_t page_summaries[5];
   tsdb_page_usage_summary_t metadata_summary;
@@ -186,6 +198,10 @@ typedef struct {
 
 bool timeseries_init(void);
 
+/**
+ * @brief Insert multiple data points for multiple fields in one call.
+ *        Each field is stored in a single entry (multi (ts,value) array).
+ */
 bool timeseries_insert(const timeseries_insert_data_t* data);
 
 /**
@@ -206,18 +222,6 @@ void timeseries_query_free_result(timeseries_query_result_t* result);
 
 bool timeseries_clear_all();
 
-bool timeseries_get_measurements(char*** measurements, size_t* num_measurements);
-
-bool timeseries_get_fields_for_measurement(const char* measurement_name, char*** fields, size_t* num_fields);
-
-bool timeseries_get_tags_for_measurement(const char* measurement_name, tsdb_tag_pair_t** tags, size_t* num_tags);
-
-bool timeseries_get_usage_summary(tsdb_usage_summary_t* summary);
-
-bool timeseries_delete_measurement(const char* measurement_name);
-
-bool timeseries_delete_measurement_and_field(const char* measurement_name, const char* field_name);
-
 /**
  * @brief Set the chunk size for large inserts
  */
@@ -228,6 +232,36 @@ void timeseries_set_chunk_size(size_t chunk_size);
  *        freeing all resources.
  */
 void timeseries_deinit(void);
+
+/**
+ * @brief Get all measurement names
+ */
+bool timeseries_get_measurements(char*** measurements, size_t* num_measurements);
+
+/**
+ * @brief Get all field names for a measurement
+ */
+bool timeseries_get_fields_for_measurement(const char* measurement_name, char*** fields, size_t* num_fields);
+
+/**
+ * @brief Get all tag key-value pairs for a measurement
+ */
+bool timeseries_get_tags_for_measurement(const char* measurement_name, tsdb_tag_pair_t** tags, size_t* num_tags);
+
+/**
+ * @brief Get storage usage summary
+ */
+bool timeseries_get_usage_summary(tsdb_usage_summary_t* summary);
+
+/**
+ * @brief Delete all data for a measurement
+ */
+bool timeseries_delete_measurement(const char* measurement_name);
+
+/**
+ * @brief Delete all data for a specific field within a measurement
+ */
+bool timeseries_delete_measurement_and_field(const char* measurement_name, const char* field_name);
 
 #ifdef __cplusplus
 }

@@ -10,17 +10,20 @@
 extern "C" {
 #endif
 
+/* timeseries_aggregation_method_e is defined in timeseries.h */
+#include "timeseries.h"
+
 /**
  * @brief A high-level iterator that merges multiple multi_points_iterators
  *        and returns aggregated points at regular rollup intervals.
  */
 typedef struct {
-  timeseries_multi_points_iterator_t** sub_iters;
+  timeseries_multi_points_iterator_t **sub_iters;
   size_t sub_count;
 
   timeseries_aggregation_method_e aggregator;
-  uint64_t rollup_interval;  ///< e.g. in microseconds, or ms, or however you
-                             ///< store times
+  uint64_t rollup_interval; ///< e.g. in microseconds, or ms, or however you
+                            ///< store times
 
   bool valid;
 
@@ -48,9 +51,10 @@ typedef struct {
  * @param[out] out_iter   The resulting multi-series iterator
  * @return true if OK
  */
-bool timeseries_multi_series_iterator_init(timeseries_multi_points_iterator_t** sub_iters, size_t sub_count,
-                                           uint64_t rollup_interval, timeseries_aggregation_method_e method,
-                                           timeseries_multi_series_iterator_t* out_iter);
+bool timeseries_multi_series_iterator_init(
+    timeseries_multi_points_iterator_t **sub_iters, size_t sub_count,
+    uint64_t rollup_interval, timeseries_aggregation_method_e method,
+    timeseries_multi_series_iterator_t *out_iter);
 
 /**
  * @brief Advance to the next rollup window.
@@ -65,17 +69,19 @@ bool timeseries_multi_series_iterator_init(timeseries_multi_points_iterator_t** 
  * @param out_vals An array of values, one for each sub-iterator
  * @return true if a new aggregated window is produced, false if done
  */
-bool timeseries_multi_series_iterator_next(timeseries_multi_series_iterator_t* iter, uint64_t* out_ts,
-                                           timeseries_field_value_t* out_vals);
+bool timeseries_multi_series_iterator_next(
+    timeseries_multi_series_iterator_t *iter, uint64_t *out_ts,
+    timeseries_field_value_t *out_vals);
 
 /**
  * @brief Free resources. (Does not necessarily deinit the sub_iters themselves,
  *        depending on your ownership model.)
  */
-void timeseries_multi_series_iterator_deinit(timeseries_multi_series_iterator_t* iter);
+void timeseries_multi_series_iterator_deinit(
+    timeseries_multi_series_iterator_t *iter);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif  // TIMESERIES_MULTI_SERIES_ITERATOR_H
+#endif // TIMESERIES_MULTI_SERIES_ITERATOR_H

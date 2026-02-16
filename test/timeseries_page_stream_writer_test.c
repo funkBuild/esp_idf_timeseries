@@ -41,7 +41,7 @@ static void teardown_database(void) {
 // ============================================================================
 
 TEST_CASE("page_stream_writer: init with NULL db", "[psw][null]") {
-    timeseries_page_stream_writer_t writer;
+    timeseries_page_stream_writer_t writer = {0};
     bool result = timeseries_page_stream_writer_init(NULL, &writer, 1, 4096);
     TEST_ASSERT_FALSE(result);
 }
@@ -79,7 +79,7 @@ TEST_CASE("page_stream_writer: write_value with NULL writer", "[psw][null]") {
 
 TEST_CASE("page_stream_writer: write_value with NULL value", "[psw][null]") {
     setup_database();
-    timeseries_page_stream_writer_t writer;
+    timeseries_page_stream_writer_t writer = {0};
 
     // Initialize writer
     TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &writer, 1, 4096));
@@ -116,7 +116,7 @@ TEST_CASE("page_stream_writer: finalize with NULL writer", "[psw][null]") {
 
 TEST_CASE("page_stream_writer: write after finalize", "[psw][state]") {
     setup_database();
-    timeseries_page_stream_writer_t writer;
+    timeseries_page_stream_writer_t writer = {0};
 
     // Initialize and finalize immediately (empty page)
     TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &writer, 1, 4096));
@@ -133,7 +133,7 @@ TEST_CASE("page_stream_writer: write after finalize", "[psw][state]") {
 
 TEST_CASE("page_stream_writer: double finalize is safe", "[psw][state]") {
     setup_database();
-    timeseries_page_stream_writer_t writer;
+    timeseries_page_stream_writer_t writer = {0};
 
     // Initialize and finalize twice
     TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &writer, 1, 4096));
@@ -152,7 +152,7 @@ TEST_CASE("page_stream_writer: double finalize is safe", "[psw][state]") {
 
 TEST_CASE("page_stream_writer: single point write", "[psw][basic]") {
     setup_database();
-    timeseries_page_stream_writer_t writer;
+    timeseries_page_stream_writer_t writer = {0};
 
     // Initialize writer
     TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &writer, 1, 4096));
@@ -182,7 +182,7 @@ TEST_CASE("page_stream_writer: single point write", "[psw][basic]") {
 
 TEST_CASE("page_stream_writer: multiple points same series", "[psw][basic]") {
     setup_database();
-    timeseries_page_stream_writer_t writer;
+    timeseries_page_stream_writer_t writer = {0};
 
     // Initialize writer
     TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &writer, 1, 4096));
@@ -230,7 +230,7 @@ TEST_CASE("page_stream_writer: all field types", "[psw][types]") {
     };
 
     for (size_t t = 0; t < sizeof(types)/sizeof(types[0]); t++) {
-        timeseries_page_stream_writer_t writer;
+        timeseries_page_stream_writer_t writer = {0};
 
         // Initialize writer
         TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &writer, 1, 4096));
@@ -285,7 +285,7 @@ TEST_CASE("page_stream_writer: all field types", "[psw][types]") {
 
 TEST_CASE("page_stream_writer: zero points in series", "[psw][boundary]") {
     setup_database();
-    timeseries_page_stream_writer_t writer;
+    timeseries_page_stream_writer_t writer = {0};
 
     // Initialize writer
     TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &writer, 1, 4096));
@@ -309,7 +309,7 @@ TEST_CASE("page_stream_writer: zero points in series", "[psw][boundary]") {
 
 TEST_CASE("page_stream_writer: very small initial size", "[psw][boundary]") {
     setup_database();
-    timeseries_page_stream_writer_t writer;
+    timeseries_page_stream_writer_t writer = {0};
 
     // Initialize with very small prev_data_size (should round up to 4KB)
     TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &writer, 1, 100));
@@ -345,7 +345,7 @@ TEST_CASE("page_stream_writer: very small initial size", "[psw][boundary]") {
 
 TEST_CASE("page_stream_writer: force relocation during writes", "[psw][relocation]") {
     setup_database();
-    timeseries_page_stream_writer_t writer;
+    timeseries_page_stream_writer_t writer = {0};
 
     // Initialize with minimal size to force relocations
     TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &writer, 1, 100));
@@ -380,7 +380,7 @@ TEST_CASE("page_stream_writer: force relocation during writes", "[psw][relocatio
 
 TEST_CASE("page_stream_writer: multiple series with relocations", "[psw][relocation]") {
     setup_database();
-    timeseries_page_stream_writer_t writer;
+    timeseries_page_stream_writer_t writer = {0};
 
     // Initialize with minimal size
     TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &writer, 1, 100));
@@ -419,7 +419,7 @@ TEST_CASE("page_stream_writer: multiple series with relocations", "[psw][relocat
 
 TEST_CASE("page_stream_writer: string values", "[psw][string]") {
     setup_database();
-    timeseries_page_stream_writer_t writer;
+    timeseries_page_stream_writer_t writer = {0};
 
     TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &writer, 1, 4096));
 
@@ -450,7 +450,7 @@ TEST_CASE("page_stream_writer: string values", "[psw][string]") {
 
 TEST_CASE("page_stream_writer: empty string values", "[psw][string]") {
     setup_database();
-    timeseries_page_stream_writer_t writer;
+    timeseries_page_stream_writer_t writer = {0};
 
     TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &writer, 1, 4096));
 
@@ -480,7 +480,7 @@ TEST_CASE("page_stream_writer: empty string values", "[psw][string]") {
 
 TEST_CASE("page_stream_writer: large dataset (2000 points)", "[psw][large]") {
     setup_database();
-    timeseries_page_stream_writer_t writer;
+    timeseries_page_stream_writer_t writer = {0};
 
     // Start with small size to test growth
     TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &writer, 1, 1000));

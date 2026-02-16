@@ -133,46 +133,20 @@ static bool relocate_region(timeseries_page_stream_writer_t* writer_ctx, uint32_
   }
 
   // 1) Reserve a new blank region (mutex-protected)
-  uint32_t run_ofs = 0, run_sz = 0;
-  if (!tsdb_reserve_blank_region(db, new_size, writer_ctx->batch_snapshot, &run_ofs, &run_sz)) {
-    ESP_LOGE(TAG, "Failed to find blank region for size=%" PRIu32, new_size);
+  uint32_t found_ofs = 0, found_sz = 0;
+  if (!tsdb_reserve_blank_region(db, new_size, writer_ctx->batch_snapshot, &found_ofs, &found_sz)) {
+    ESP_LOGE(TAG, "Failed to find blank region for size=%u", (unsigned int)new_size);
     return false;
   }
 
-  ESP_LOGW(TAG, "relocate_region found run @0x%08" PRIx32 " (size=%" PRIu32 ")", run_ofs, run_sz);
-
-  /* -------- 2a. SAME run -> grow in place -------------------------------- */
-  if (run_ofs == old_offset) {
-    /* only the tail needs erasing */
-    uint32_t erase_start = old_offset + old_size;
-    uint32_t erase_len = new_size - old_size; /* always 4 KiB aligned */
-
-    if (erase_len) {
-      if (esp_partition_erase_range(db->partition, erase_start, erase_len) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to erase extension 0x%08" PRIx32 " (+%" PRIu32 ")", erase_start, erase_len);
-        return false;
-      }
-      ESP_LOGV(TAG, "Grew region in place to %" PRIu32 " bytes", new_size);
-    }
-    *out_new_offset = old_offset; /* nothing moved */
-    return true;
-  }
-
-  /* -------- 2b. Different run -> old behaviour --------------------------- */
-  /* 2b-1  Erase destination                                                */
-  if (esp_partition_erase_range(db->partition, run_ofs, new_size) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to erase new region @0x%08" PRIx32, run_ofs);
+  // 2) Copy old data to new
+  if (!copy_flash_block(db->partition, old_offset, found_ofs, old_size)) {
+    ESP_LOGE(TAG, "Failed copying region 0x%08" PRIx32 " => 0x%08" PRIx32, old_offset, found_ofs);
     return false;
   }
 
-  /* 2b-2  Copy data                                                        */
-  if (!copy_flash_block(db->partition, old_offset, run_ofs, old_size)) {
-    ESP_LOGE(TAG, "Copy 0x%08" PRIx32 " => 0x%08" PRIx32 " failed", old_offset, run_ofs);
-    return false;
-  }
-
-  *out_new_offset = run_ofs;
-  ESP_LOGV(TAG, "Relocated region 0x%08" PRIx32 " -> 0x%08" PRIx32, old_offset, run_ofs);
+  *out_new_offset = found_ofs;
+  ESP_LOGV(TAG, "Relocated region 0x%08" PRIx32 " => 0x%08" PRIx32, old_offset, found_ofs);
   return true;
 }
 
@@ -314,9 +288,7 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
   }
 
   int64_t end_time = esp_timer_get_time();
-  ESP_LOGI(TAG, "Reserved blank region @0x%08X (size=%u bytes) in %.3f ms",
-           (unsigned int)region_ofs, (unsigned int)initial_size,
-           (end_time - start_time) / 1000.0);
+  ESP_LOGI(TAG, "Reserved blank region in %.3f ms", (end_time - start_time) / 1000.0);
 
   // 2) Write proper page header (replaces placeholder written by reserve)
   timeseries_page_header_t hdr;
@@ -501,7 +473,7 @@ bool timeseries_page_stream_writer_finalize_timestamp(timeseries_page_stream_wri
  */
 bool timeseries_page_stream_writer_write_value(timeseries_page_stream_writer_t* writer,
                                                const timeseries_field_value_t* fv) {
-  if (!writer || writer->finalized) {
+  if (!writer || !fv || writer->finalized) {
     return false;
   }
 
@@ -573,7 +545,6 @@ bool timeseries_page_stream_writer_end_series(timeseries_page_stream_writer_t* w
     ESP_LOGE(TAG, "Failed finishing gorilla val_stream");
     return false;
   }
-
   // Capture the end offset for values
   uint32_t val_end = writer->write_ptr;
   gorilla_stream_deinit(&writer->val_stream);

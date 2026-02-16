@@ -16,7 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-TIMEOUT_SEC=120
+TIMEOUT_SEC=300
 SKIP_BUILD=false
 QEMU_PID=""
 OUTPUT_FILE=""

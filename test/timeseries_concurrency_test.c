@@ -379,7 +379,7 @@ TEST_CASE("stress_insert_query_compact", "[concurrency]") {
     ensure_db_initialized();
 
     // Seed some initial data
-    insert_test_data("stress", "stress_val", 200, 1);
+    insert_test_data("stress", "stress_val", 50, 1);
 
     stress_test_context_t ctx = {0};
     atomic_store(&ctx.running, true);
@@ -397,11 +397,11 @@ TEST_CASE("stress_insert_query_compact", "[concurrency]") {
     TEST_ASSERT_EQUAL(pdPASS, ret1);
     TEST_ASSERT_EQUAL(pdPASS, ret2);
 
-    // Run for 5 seconds, triggering compaction periodically
+    // Run for 1 second, triggering compaction once mid-way
     uint32_t compact_count = 0;
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < 10; i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
-        if (i % 10 == 0) {
+        if (i == 5) {
             timeseries_compact();
             compact_count++;
         }

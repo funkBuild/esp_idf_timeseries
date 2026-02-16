@@ -49,11 +49,6 @@ bool timeseries_entity_iterator_next(timeseries_entity_iterator_t* ent_iter, tim
 
 bool timeseries_entity_iterator_read_data(timeseries_entity_iterator_t* ent_iter,
                                           const timeseries_entry_header_t* header, void* key_buf, void* value_buf);
-bool timeseries_entity_iterator_peek_key(timeseries_entity_iterator_t* it, const timeseries_entry_header_t* hdr,
-                                         void* key_buf);
-
-bool timeseries_entity_iterator_read_value(timeseries_entity_iterator_t* it, const timeseries_entry_header_t* hdr,
-                                           void* value_buf);
 
 // -----------------------------------------------------------------------------
 // Field Data Iterator (using timeseries_field_data_header_t)
@@ -75,23 +70,19 @@ typedef struct {
  *        4096-byte aligned sectors.
  */
 typedef struct {
-  timeseries_db_t* db;
-  const esp_partition_t* partition;
-  uint32_t min_size;
   bool valid;
+  uint32_t min_size;
+  uint32_t current_offset;  // where we are scanning in the partition
+  size_t current_index;     // which entry in the page_cache we're examining
 
-  /* cursor into the partition / page-cache */
-  uint32_t current_offset;
-  size_t current_index;
-
-  /* wear-levelling helpers */
-  uint32_t start_offset;  // first byte we will examine
-  bool wrapped;           // true once we've jumped past the end -> 0
-
-  /* state for an in-progress blank run */
-  bool in_blank_run;
+  // We'll accumulate a "free region" start + length as we go
   uint32_t run_start;
   uint32_t run_length;
+  bool in_blank_run;
+
+  // We still store a pointer to db->partition for partition->size
+  const esp_partition_t* partition;
+  timeseries_db_t* db;
 
   // Snapshot reference held during iteration
   tsdb_page_cache_snapshot_t* snapshot;
@@ -104,11 +95,6 @@ typedef struct {
   // Snapshot reference held during iteration
   tsdb_page_cache_snapshot_t* snapshot;
 } timeseries_page_cache_iterator_t;
-
-typedef struct {
-  timeseries_page_cache_iterator_t inner;
-  bool valid;
-} timeseries_metadata_page_iterator_t;
 
 /**
  * @brief Initialize an iterator over a field data page.
@@ -172,12 +158,6 @@ bool timeseries_page_cache_iterator_init(timeseries_db_t* db, timeseries_page_ca
 
 bool timeseries_page_cache_iterator_next(timeseries_page_cache_iterator_t* iter, timeseries_page_header_t* out_header,
                                          uint32_t* out_offset, uint32_t* out_size);
-
-bool timeseries_metadata_page_iterator_init(timeseries_db_t* db, timeseries_metadata_page_iterator_t* iter);
-
-bool timeseries_metadata_page_iterator_next(timeseries_metadata_page_iterator_t* iter,
-                                            timeseries_page_header_t* out_header, uint32_t* out_offset,
-                                            uint32_t* out_size);
 
 void timeseries_page_cache_iterator_deinit(timeseries_page_cache_iterator_t* iter);
 

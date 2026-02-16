@@ -1,12 +1,9 @@
 #include "esp_timer.h"
-#include "timeseries_cache_field_names.h"
-#include "timeseries_cache_field_series.h"
-#include "timeseries_cache_measurement_id.h"
-#include "timeseries_cache_measurement_series.h"
 #include "timeseries_id_list.h"
 #include "timeseries_internal.h"
 #include "timeseries_iterator.h"
 #include "timeseries_metadata.h"
+#include "timeseries_string_list.h"
 
 #include "esp_log.h"
 
@@ -101,6 +98,7 @@ bool tsdb_series_delete(timeseries_db_t* db, timeseries_series_id_list_t* series
       tsdb_mark_metadata_deleted_in_page(db, page_offset, page_size, series_to_delete);
     }
   }
+  timeseries_page_cache_iterator_deinit(&page_iter);
 
   int64_t end_time = esp_timer_get_time();
   ESP_LOGI(TAG, "Deleted %zu series records in %.3f ms", deleted_count, (end_time - start_time) / 1000.0);
@@ -197,84 +195,49 @@ bool timeseries_delete_by_measurement_and_field(timeseries_db_t* db, const char*
 
   bool ok = false;
   timeseries_series_id_list_t series_to_delete;
-  timeseries_string_list_t fields_to_query;
-  timeseries_series_id_list_t* field_series_list = NULL;
-
   tsdb_series_id_list_init(&series_to_delete);
-  tsdb_string_list_init(&fields_to_query);
 
-  /* -------------------------------------------------------------------- */
-  /*  1. Resolve measurement                                              */
-  /* -------------------------------------------------------------------- */
+  /* 1. Resolve measurement */
   uint32_t measurement_id = 0;
   if (!tsdb_find_measurement_id(db, measurement_name, &measurement_id)) {
     ESP_LOGW(TAG, "Measurement '%s' not found - nothing to delete", measurement_name);
-    ok = true; /* nothing to delete is not an error */
-    goto cleanup;
-  }
-
-  /* -------------------------------------------------------------------- */
-  /*  2. Build field list (just one field in this case)                  */
-  /* -------------------------------------------------------------------- */
-  tsdb_string_list_append_unique(&fields_to_query, field_name);
-
-  /* -------------------------------------------------------------------- */
-  /*  3. Find series IDs for this specific field                          */
-  /* -------------------------------------------------------------------- */
-  field_series_list = calloc(1, sizeof(timeseries_series_id_list_t));
-  if (!field_series_list) {
-    ESP_LOGE(TAG, "OOM allocating field series list");
-    goto cleanup;
-  }
-  tsdb_series_id_list_init(field_series_list);
-
-  // Find series IDs for the specific field
-  tsdb_find_series_ids_for_fields(db, measurement_id, &fields_to_query, field_series_list);
-
-  if (field_series_list->count == 0) {
-    ESP_LOGW(TAG, "No series found for field '%s' in measurement '%s' - nothing to delete", field_name,
-             measurement_name);
     ok = true;
     goto cleanup;
   }
 
-  // Copy the series IDs to our delete list
-  for (size_t i = 0; i < field_series_list->count; i++) {
-    tsdb_series_id_list_append(&series_to_delete, field_series_list->ids[i].bytes);
-  }
-
-  ESP_LOGI(TAG, "Found %zu series to delete for field '%s' in measurement '%s'", series_to_delete.count, field_name,
-           measurement_name);
-
-  /* -------------------------------------------------------------------- */
-  /*  4. Delete the series data and purge metadata                        */
-  /* -------------------------------------------------------------------- */
-  ok = tsdb_series_delete(db, &series_to_delete);
-  if (!ok) {
-    ESP_LOGE(TAG, "Failed to delete series data for field '%s' in measurement '%s'", field_name, measurement_name);
+  /* 2. Find series IDs for this specific field */
+  if (!tsdb_find_series_ids_for_field(db, measurement_id, field_name, &series_to_delete)) {
+    ESP_LOGW(TAG, "No series found for field '%s' in measurement '%s' - nothing to delete",
+             field_name, measurement_name);
+    ok = true;
     goto cleanup;
   }
 
-  tsdb_fieldseries_cache_delete(db->meta_cache, measurement_id, field_name);
-  tsdb_measser_cache_delete(db->meta_cache, measurement_id);
-  tsdb_fieldnames_cache_delete(db->meta_cache, measurement_id);
-
-  /* ---- remove the FIELDLISTINDEX entry from on‑disk metadata ------------- */
-  /* (Soft‑delete only that single field‑list index key) */
-  if (!tsdb_soft_delete_fieldlistindex_entry(db, measurement_id, field_name)) {
-    ESP_LOGW(TAG,
-             "Failed to remove FIELDLISTINDEX entry for field '%s' in measurement '%s' "
-             "(will be rebuilt on demand)",
+  if (series_to_delete.count == 0) {
+    ESP_LOGW(TAG, "No series found for field '%s' in measurement '%s' - nothing to delete",
              field_name, measurement_name);
+    ok = true;
+    goto cleanup;
+  }
+
+  ESP_LOGI(TAG, "Found %zu series to delete for field '%s' in measurement '%s'",
+           series_to_delete.count, field_name, measurement_name);
+
+  /* 3. Delete the series data */
+  ok = tsdb_series_delete(db, &series_to_delete);
+  if (!ok) {
+    ESP_LOGE(TAG, "Failed to delete series data for field '%s' in measurement '%s'",
+             field_name, measurement_name);
+    goto cleanup;
+  }
+
+  /* 4. Soft-delete the FIELDLISTINDEX entry from metadata */
+  if (!tsdb_soft_delete_fieldlistindex_entry(db, measurement_id, field_name)) {
+    ESP_LOGW(TAG, "Failed to remove FIELDLISTINDEX entry for field '%s' in measurement '%s' "
+             "(will be rebuilt on demand)", field_name, measurement_name);
   }
 
 cleanup:
-  if (field_series_list) {
-    tsdb_series_id_list_free(field_series_list);
-    free(field_series_list);
-  }
-  tsdb_string_list_free(&fields_to_query);
   tsdb_series_id_list_free(&series_to_delete);
-
   return ok;
 }

@@ -53,11 +53,6 @@ typedef struct {
   size_t num_series;                   // same as series_ids.count
 } field_info_t;
 
-typedef struct {
-  const char* field_name;
-  timeseries_series_id_list_t series_ids;
-} bulk_field_entry_t;
-
 /**
  * @brief Execute the query using the given database context.
  *
@@ -75,8 +70,6 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
  * @param result  The result object to free
  */
 void timeseries_query_free_result(timeseries_query_result_t* result);
-
-void intersect_series_id_lists(timeseries_series_id_list_t* out, const timeseries_series_id_list_t* other);
 
 #ifdef __cplusplus
 }

@@ -1045,8 +1045,9 @@ TEST_CASE("query: rollup_interval aggregates data", "[query][rollup]") {
 TEST_CASE("query: very long measurement name", "[query][edge]") {
     setup_test();
 
-    // Create a very long but valid measurement name
-    char long_name[256];
+    // Create a long but valid measurement name (must leave room for
+    // ":<field_name>" in the 256-byte cache key buffer)
+    char long_name[200];
     memset(long_name, 'a', sizeof(long_name) - 1);
     long_name[sizeof(long_name) - 1] = '\0';
 

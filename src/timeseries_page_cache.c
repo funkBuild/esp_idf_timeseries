@@ -3,32 +3,31 @@
 #include "timeseries_page_cache_snapshot.h"
 
 #include "esp_log.h"
-#include <inttypes.h>
 #include <string.h>
 
-static const char* TAG = "TimeseriesPageCache";
+static const char *TAG = "TimeseriesPageCache";
 
 /**
  * @brief Compare function for sorting timeseries_cached_page_t by ascending
  * offset. Used by qsort.
  */
-static int page_offset_compare(const void* a, const void* b) {
-  const timeseries_cached_page_t* pa = (const timeseries_cached_page_t*)a;
-  const timeseries_cached_page_t* pb = (const timeseries_cached_page_t*)b;
+static int page_offset_compare(const void *a, const void *b) {
+  const timeseries_cached_page_t *pa = (const timeseries_cached_page_t *)a;
+  const timeseries_cached_page_t *pb = (const timeseries_cached_page_t *)b;
 
   if (pa->offset < pb->offset) {
     return -1;
   } else if (pa->offset > pb->offset) {
     return 1;
   }
-  return 0;  // equal
+  return 0; // equal
 }
 
 /**
  * @brief Build the page cache for the given database.
  * Scans the entire partition and builds a snapshot of all recognized pages.
  */
-bool tsdb_build_page_cache(timeseries_db_t* db) {
+bool tsdb_build_page_cache(timeseries_db_t *db) {
   if (!db || !db->partition) {
     return false;
   }
@@ -67,7 +66,8 @@ bool tsdb_build_page_cache(timeseries_db_t* db) {
  * @brief Add a new entry to the page cache using CAS retry.
  * Thread-safe for concurrent readers and writers.
  */
-void tsdb_pagecache_add_entry(timeseries_db_t* db, uint32_t offset, const timeseries_page_header_t* hdr) {
+void tsdb_pagecache_add_entry(timeseries_db_t *db, uint32_t offset,
+                              const timeseries_page_header_t *hdr) {
   if (!db || !hdr) {
     return;
   }

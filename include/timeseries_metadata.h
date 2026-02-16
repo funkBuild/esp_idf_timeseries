@@ -84,6 +84,19 @@ bool tsdb_lookup_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
                                          timeseries_field_type_e* out_type);
 
 /**
+ * @brief Look up series type with cache (Phase 2 optimization)
+ * @note Uses cache first, falls back to metadata scan. Caches result on miss.
+ */
+bool tsdb_lookup_series_type_cached(timeseries_db_t *db,
+                                     const unsigned char series_id[16],
+                                     timeseries_field_type_e *out_type);
+
+/**
+ * @brief Clear the series type cache
+ */
+void tsdb_clear_type_cache(timeseries_db_t *db);
+
+/**
  * @brief Ensure the metadata has an entry for this series_id and field type.
  *        If it does not exist, creates it. If it exists with a conflicting
  *        type, returns false.
@@ -183,6 +196,16 @@ bool timeseries_metadata_get_tags_for_measurement(timeseries_db_t* db, uint32_t 
 bool tsdb_remove_measurement_from_metadata(timeseries_db_t* db, const char* measurement_name);
 
 bool tsdb_soft_delete_fieldlistindex_entry(timeseries_db_t* db, uint32_t measurement_id, const char* field_name);
+
+/**
+ * @brief Scan all metadata entries to find the maximum measurement ID.
+ *        Used during init to restore next_measurement_id across reboots.
+ *
+ * @param db      Pointer to the database context
+ * @param out_max Pointer to store the maximum measurement ID found (0 if none)
+ * @return true if scan completed, false on error
+ */
+bool tsdb_find_max_measurement_id(timeseries_db_t *db, uint32_t *out_max);
 
 #ifdef __cplusplus
 }

@@ -136,6 +136,17 @@ bool timeseries_multi_points_iterator_init(timeseries_points_iterator_t** sub_it
     return false;
   }
 
+  // Pre-allocate deduplication buffer (Fix #1.4)
+  out_iter->dedup_buffer = (size_t*)malloc(sub_count * sizeof(size_t));
+  if (!out_iter->dedup_buffer) {
+    free(out_iter->heap);
+    free(out_iter->subs);
+    out_iter->heap = NULL;
+    out_iter->subs = NULL;
+    return false;
+  }
+  out_iter->dedup_buffer_cap = sub_count;
+
   out_iter->sub_count = sub_count;
   out_iter->heap_size = 0;
   out_iter->valid = true;
@@ -180,10 +191,8 @@ bool timeseries_multi_points_iterator_next(timeseries_multi_points_iterator_t* m
   uint64_t smallest_ts = multi_iter->subs[best_sub].current_ts;
   uint32_t best_seq = multi_iter->subs[best_sub].page_seq;
 
-  /* collect all subs with the same ts into popped[]                    */
-  size_t popped_cap = multi_iter->heap_size;
-  size_t* popped = (size_t*)malloc(popped_cap * sizeof(size_t));
-  if (!popped) return false;
+  /* Use pre-allocated deduplication buffer (Fix #1.4) */
+  size_t* popped = multi_iter->dedup_buffer;
 
   size_t same_cnt = 0;
   while (multi_iter->heap_size && multi_iter->subs[multi_iter->heap[0]].current_ts == smallest_ts) {
@@ -203,10 +212,10 @@ bool timeseries_multi_points_iterator_next(timeseries_multi_points_iterator_t* m
   if (out_ts) *out_ts = smallest_ts;
   if (out_val) {
     if (!field_value_deep_copy(out_val, &multi_iter->subs[best_sub].current_val)) {
-      free(popped);
       return false; /* OOM */
     }
   }
+  // No free needed - using pre-allocated buffer (Fix #1.4)
 
   /* ---------------- step 3: advance sub-iterators ------------------- */
   for (size_t i = 0; i < same_cnt; ++i) {
@@ -225,7 +234,6 @@ bool timeseries_multi_points_iterator_next(timeseries_multi_points_iterator_t* m
     heap_sift_up(multi_iter, multi_iter->heap_size - 1);
   }
 
-  free(popped);
   return true;
 }
 
@@ -250,6 +258,10 @@ void timeseries_multi_points_iterator_deinit(timeseries_multi_points_iterator_t*
   if (multi_iter->heap) {
     free(multi_iter->heap);
     multi_iter->heap = NULL;
+  }
+  if (multi_iter->dedup_buffer) {
+    free(multi_iter->dedup_buffer);
+    multi_iter->dedup_buffer = NULL;
   }
   memset(multi_iter, 0, sizeof(*multi_iter));
 }

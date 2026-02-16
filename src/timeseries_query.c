@@ -5,6 +5,7 @@
 #include "timeseries_iterator.h"
 #include "timeseries_metadata.h"  // for tsdb_find_measurement_id, etc.
 #include "timeseries_multi_series_iterator.h"
+#include "timeseries_page_cache_snapshot.h"
 #include "timeseries_points_iterator.h"
 
 #include "esp_log.h"
@@ -411,6 +412,23 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
   /* but the wrapper array itself can be freed.                         */
   free(lists);
 
+  // Log which series_ids we're looking for
+  for (size_t f = 0; f < actual_fields_count; ++f) {
+    ESP_LOGI(TAG, "Looking for field '%s' with %zu series:", fields_array[f].field_name, fields_array[f].num_series);
+    for (size_t s = 0; s < fields_array[f].num_series; ++s) {
+      ESP_LOGI(TAG, "  Series %zu: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+               s,
+               fields_array[f].series_lists[s].series_id.bytes[0], fields_array[f].series_lists[s].series_id.bytes[1],
+               fields_array[f].series_lists[s].series_id.bytes[2], fields_array[f].series_lists[s].series_id.bytes[3],
+               fields_array[f].series_lists[s].series_id.bytes[4], fields_array[f].series_lists[s].series_id.bytes[5],
+               fields_array[f].series_lists[s].series_id.bytes[6], fields_array[f].series_lists[s].series_id.bytes[7],
+               fields_array[f].series_lists[s].series_id.bytes[8], fields_array[f].series_lists[s].series_id.bytes[9],
+               fields_array[f].series_lists[s].series_id.bytes[10], fields_array[f].series_lists[s].series_id.bytes[11],
+               fields_array[f].series_lists[s].series_id.bytes[12], fields_array[f].series_lists[s].series_id.bytes[13],
+               fields_array[f].series_lists[s].series_id.bytes[14], fields_array[f].series_lists[s].series_id.bytes[15]);
+    }
+  }
+
   end_time = esp_timer_get_time();
   ESP_LOGV(TAG, "Prepared %zu fields in %.3f ms", actual_fields_count, (end_time - start_time) / 1000.0);
 
@@ -420,10 +438,8 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
 
   start_time = esp_timer_get_time();
 
-  if (!fetch_series_data(db, fields_array, actual_fields_count, query, result)) {
-    ESP_LOGE(TAG, "fetch_series_data(...) returned error");
-    /* keep going – we still clean everything */
-  }
+  size_t points_fetched = fetch_series_data(db, fields_array, actual_fields_count, query, result);
+  // Note: 0 points is a valid result, not an error
 
   end_time = esp_timer_get_time();
   ESP_LOGV(TAG, "Fetched data in %.3f ms", (end_time - start_time) / 1000.0);
@@ -568,10 +584,8 @@ static size_t find_or_create_row(timeseries_query_result_t* result, uint64_t ts)
     timeseries_field_value_t* new_values =
         realloc(result->columns[c].values, new_count * sizeof(timeseries_field_value_t));
     if (!new_values) {
-      // OOM fallback
       ESP_LOGE(TAG, "Out of memory expanding column=%zu", c);
-      // We won't back out changes for brevity; a real system might roll back
-      continue;
+      return SIZE_MAX;
     }
     result->columns[c].values = new_values;
 
@@ -602,7 +616,8 @@ void intersect_series_id_lists(timeseries_series_id_list_t* out, const timeserie
      to avoid stack overflow with large series counts */
   timeseries_series_id_t* tmp = malloc(other->count * sizeof(timeseries_series_id_t));
   if (tmp == NULL) {
-    ESP_LOGE(TAG, "Failed to allocate memory for series ID intersection");
+    ESP_LOGE(TAG, "Failed to allocate memory for series ID intersection (%zu entries)", other->count);
+    tsdb_series_id_list_clear(out);
     return;
   }
   memcpy(tmp, other->ids, other->count * sizeof(timeseries_series_id_t));
@@ -662,7 +677,7 @@ static bool field_record_list_append(field_record_info_t** list, const timeserie
   }
   memset(new_node, 0, sizeof(*new_node));
 
-  new_node->page_offset = 0;
+  new_node->page_offset = 0;  // Not used anymore
   new_node->record_offset = absolute_offset;
   new_node->start_time = fdh->start_time;
   new_node->end_time = fdh->end_time;
@@ -773,13 +788,14 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
     return 0;
   }
 
+  // Profiling timers for Phase 3 optimization
+  uint64_t prof_start, prof_end;
   int64_t start_time, end_time;
-
-  start_time = esp_timer_get_time();
 
   // --------------------------------------------------------------------------
   // PART A: Single pass to gather the record_info linked-lists for each series
   // --------------------------------------------------------------------------
+  prof_start = esp_timer_get_time();
 
   series_lookup_t srl_tbl = {0};
   if (!series_lookup_build(fields_array, num_fields, &srl_tbl)) {
@@ -787,11 +803,10 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
     return 0;
   }
 
-  end_time = esp_timer_get_time();
-  ESP_LOGW(TAG, "Built series lookup table in %.3f ms", (end_time - start_time) / 1000.0);
+  prof_end = esp_timer_get_time();
+  ESP_LOGI(TAG, "[PROFILE] Lookup table build: %.3f ms", (prof_end - prof_start) / 1000.0);
 
-  // Initialize the result structure
-  start_time = esp_timer_get_time();
+  prof_start = esp_timer_get_time();
 
   timeseries_page_cache_iterator_t page_iter;
   if (!timeseries_page_cache_iterator_init(db, &page_iter)) {
@@ -803,12 +818,21 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
   timeseries_page_header_t hdr;
   uint32_t page_offset = 0;
   uint32_t page_size = 0;
+  int pages_processed = 0;
+  int field_data_pages = 0;
+  int records_found = 0;
 
   while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &page_offset, &page_size)) {
+    pages_processed++;
     // Only process FIELD_DATA pages
     if (hdr.page_type != TIMESERIES_PAGE_TYPE_FIELD_DATA) {
+      ESP_LOGV(TAG, "Skipping non-field-data page @0x%08X type=%u state=%u",
+               (unsigned int)page_offset, hdr.page_type, hdr.page_state);
       continue;
     }
+    field_data_pages++;
+    ESP_LOGI(TAG, "Scanning FIELD_DATA page @0x%08X size=%u level=%u state=%u",
+             (unsigned int)page_offset, (unsigned int)page_size, hdr.field_data_level, hdr.page_state);
 
     timeseries_fielddata_iterator_t fdata_iter;
     if (!timeseries_fielddata_iterator_init(db, page_offset, page_size, &fdata_iter)) {
@@ -817,10 +841,14 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
     }
 
     timeseries_field_data_header_t fdh;
+    int page_records = 0;
+    int page_records_matched = 0;
     while (timeseries_fielddata_iterator_next(&fdata_iter, &fdh)) {
+      page_records++;
       // Skip if flagged as deleted
       if ((fdh.flags & TSDB_FIELDDATA_FLAG_DELETED) == 0) {
-        ESP_LOGW(TAG, "Skipping deleted record @0x%08X", (unsigned int)fdata_iter.current_record_offset);
+        ESP_LOGD(TAG, "Skipping deleted record @0x%08X flags=0x%02X",
+                 (unsigned int)fdata_iter.current_record_offset, fdh.flags);
         continue;
       }
 
@@ -830,28 +858,54 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
         continue;
       }
 
-      // Calculate the offset for the raw data portion
+      // Calculate the absolute offset for the raw data portion
       uint32_t absolute_offset =
           page_offset + fdata_iter.current_record_offset + sizeof(timeseries_field_data_header_t);
 
       /* Fast path: single probe instead of nested loops */
       series_record_list_t* srl = series_lookup_find(&srl_tbl, fdh.series_id);
       if (srl) {
-        if (field_record_list_append(&srl->records_head, &fdh, absolute_offset, query->limit)) {
-          field_record_list_prune(&srl->records_head, query->limit);
-        }
+        records_found++;
+        page_records_matched++;
+        bool is_compressed = (fdh.flags & TSDB_FIELDDATA_FLAG_COMPRESSED) == 0;
+        ESP_LOGD(TAG, "MATCH: series %02X%02X%02X%02X... @0x%08X count=%u len=%u compressed=%d",
+                 fdh.series_id[0], fdh.series_id[1], fdh.series_id[2], fdh.series_id[3],
+                 (unsigned int)absolute_offset, fdh.record_count, fdh.record_length, is_compressed);
+        field_record_list_append(&srl->records_head, &fdh, absolute_offset,
+                                 query->limit);
       }
     }  // end while fielddata_iterator
+    ESP_LOGV(TAG, "Page @0x%08X: %d records scanned, %d matched",
+             (unsigned int)page_offset, page_records, page_records_matched);
   }  // end while page_iterator
+  timeseries_page_cache_iterator_deinit(&page_iter);
 
-  end_time = esp_timer_get_time();
-  ESP_LOGI(TAG, "Gathered record info in %.3f ms", (end_time - start_time) / 1000.0);
+  prof_end = esp_timer_get_time();
+  ESP_LOGI(TAG, "[PROFILE] Page scanning: %.3f ms (%d pages, %d field_data pages, %d records)",
+           (prof_end - prof_start) / 1000.0, pages_processed, field_data_pages, records_found);
 
-  start_time = esp_timer_get_time();
+  // Optimization #1: Prune once per series after all records collected (instead of after each append)
+  prof_start = esp_timer_get_time();
+  for (size_t f = 0; f < num_fields; f++) {
+    for (size_t s = 0; s < fields_array[f].num_series; s++) {
+      field_record_list_prune(&fields_array[f].series_lists[s].records_head, query->limit);
+    }
+  }
+  prof_end = esp_timer_get_time();
+  ESP_LOGI(TAG, "[PROFILE] Prune lists: %.3f ms", (prof_end - prof_start) / 1000.0);
 
   // --------------------------------------------------------------------------
   // PART B: Verify that all series in each field share the same type
   // --------------------------------------------------------------------------
+  prof_start = esp_timer_get_time();
+
+  // Fine-grained profiling for Phase 3
+  uint64_t prof_type_verify = 0;
+  uint64_t prof_iter_create = 0;
+  uint64_t prof_decompress = 0;
+  uint64_t prof_result_build = 0;
+  uint64_t prof_temp;
+
   size_t total_points_aggregated = 0;
 
   // Example aggregator settings. In real usage, these might come from the
@@ -859,7 +913,7 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
   timeseries_aggregation_method_e agg_method = query->aggregate_method;
 
   for (size_t f = 0; f < num_fields; f++) {
-    start_time = esp_timer_get_time();
+    prof_temp = esp_timer_get_time();
 
     field_info_t* fld = &fields_array[f];
     if (fld->num_series == 0) {
@@ -873,7 +927,8 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
 
     for (size_t s = 0; s < fld->num_series; s++) {
       timeseries_field_type_e series_type;
-      bool found_type = tsdb_lookup_series_type_in_metadata(db, fld->series_lists[s].series_id.bytes, &series_type);
+      // Use cached lookup (Phase 2 optimization)
+      bool found_type = tsdb_lookup_series_type_cached(db, fld->series_lists[s].series_id.bytes, &series_type);
       if (!found_type) {
         ESP_LOGW(TAG,
                  "No type in metadata for series=%.2X%.2X%.2X%.2X..., "
@@ -900,15 +955,15 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
       continue;
     }
 
-    end_time = esp_timer_get_time();
-    ESP_LOGI(TAG, "Field '%s' has type %d with %zu series in %.3f ms", fld->field_name, (int)field_type,
-             fld->num_series, (end_time - start_time) / 1000.0);
+    prof_type_verify += (esp_timer_get_time() - prof_temp);
+    ESP_LOGV(TAG, "Field '%s' has type %d with %zu series", fld->field_name, (int)field_type, fld->num_series);
 
     // ----------------------------------------------------------------------
     // PART C: Build multi_points_iterator per series, unify via
     // multi_series_iterator
     //         and store the aggregator results in the `result` struct.
     // ----------------------------------------------------------------------
+    prof_temp = esp_timer_get_time();
 
     start_time = esp_timer_get_time();
 
@@ -1002,10 +1057,15 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
           rec = rec->next;
           continue;
         }
-        bool ok = timeseries_points_iterator_init(db, rec->page_offset + rec->record_offset, rec->record_length,
-                                                  rec->record_count, field_type, rec->compressed, pit);
-        if (!ok) {
-          ESP_LOGW(TAG, "Failed init of points_iter offset=0x%08X", (unsigned)(rec->page_offset + rec->record_offset));
+        // Debug: log the actual offset being used
+        ESP_LOGV(TAG, "Initializing points_iter: absolute_offset=0x%08X, length=%u, count=%u",
+                 rec->record_offset, rec->record_length, rec->record_count);
+        bool iter_ok = timeseries_points_iterator_init(db, rec->record_offset, rec->record_length,
+                                                       rec->record_count, field_type, rec->compressed, pit);
+        if (!iter_ok) {
+          ESP_LOGW(TAG, "Failed init of points_iter offset=0x%08X, length=%u, count=%u, type=%d",
+                   (unsigned)(rec->record_offset),
+                   rec->record_length, rec->record_count, field_type);
           free(pit);
           rec = rec->next;
           continue;
@@ -1040,6 +1100,8 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
     }  // end for each series in field
 
     // Use multi_series_iterator to aggregate across all series in the field
+    prof_iter_create += (esp_timer_get_time() - prof_temp);
+
     timeseries_multi_series_iterator_t ms_iter;
     if (!timeseries_multi_series_iterator_init(series_multi_iters, fld->num_series, query->rollup_interval, agg_method,
                                                &ms_iter)) {
@@ -1048,12 +1110,17 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
       // We'll pull aggregated points until exhausted, or until limit/time-range
       // reached
       while (true) {
+        prof_temp = esp_timer_get_time();
         uint64_t rollup_ts = 0;
         timeseries_field_value_t val_agg;
         bool got_data = timeseries_multi_series_iterator_next(&ms_iter, &rollup_ts, &val_agg);
+        prof_decompress += (esp_timer_get_time() - prof_temp);
+
         if (!got_data) {
           break;  // no more data
         }
+
+        prof_temp = esp_timer_get_time();
 
         // Optional time-range filtering (if requested)
         if (query->start_ms != 0 && rollup_ts < query->start_ms) {
@@ -1088,6 +1155,8 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
         inserted_for_this_field++;
         total_points_aggregated++;
 
+        prof_result_build += (esp_timer_get_time() - prof_temp);
+
       }  // end while aggregator
       timeseries_multi_series_iterator_deinit(&ms_iter);
     }
@@ -1114,6 +1183,13 @@ static size_t fetch_series_data(timeseries_db_t* db, field_info_t* fields_array,
     ESP_LOGI(TAG, "Aggregated %zu points for field '%s' in %.3f ms", inserted_for_this_field, fld->field_name,
              (end_time - start_time) / 1000.0);
   }  // end for each field
+
+  prof_end = esp_timer_get_time();
+  ESP_LOGI(TAG, "[PROFILE] Type verification + iteration + aggregation: %.3f ms",
+           (prof_end - prof_start) / 1000.0);
+  ESP_LOGI(TAG, "[PROFILE DETAIL] Type verify: %.3f ms, Iter create: %.3f ms, Decompress: %.3f ms, Result build: %.3f ms",
+           prof_type_verify / 1000.0, prof_iter_create / 1000.0,
+           prof_decompress / 1000.0, prof_result_build / 1000.0);
 
   series_lookup_free(&srl_tbl);
 

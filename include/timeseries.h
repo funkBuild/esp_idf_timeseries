@@ -188,7 +188,15 @@ bool timeseries_init(void);
 
 bool timeseries_insert(const timeseries_insert_data_t* data);
 
+/**
+ * @brief Trigger compaction (runs in background if background task is available).
+ */
 bool timeseries_compact(void);
+
+/**
+ * @brief Trigger compaction and wait for it to complete.
+ */
+bool timeseries_compact_sync(void);
 
 bool timeseries_expire(void);
 
@@ -209,6 +217,17 @@ bool timeseries_get_usage_summary(tsdb_usage_summary_t* summary);
 bool timeseries_delete_measurement(const char* measurement_name);
 
 bool timeseries_delete_measurement_and_field(const char* measurement_name, const char* field_name);
+
+/**
+ * @brief Set the chunk size for large inserts
+ */
+void timeseries_set_chunk_size(size_t chunk_size);
+
+/**
+ * @brief Deinitialize the timeseries database, stopping background tasks and
+ *        freeing all resources.
+ */
+void timeseries_deinit(void);
 
 #ifdef __cplusplus
 }

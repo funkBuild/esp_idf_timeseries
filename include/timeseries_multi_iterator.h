@@ -25,6 +25,10 @@ typedef struct timeseries_multi_points_iterator_t {
   size_t sub_count;
 
   bool valid;
+
+  // Pre-allocated deduplication buffer (Fix #1.4)
+  size_t *dedup_buffer;
+  size_t dedup_buffer_cap;
 } timeseries_multi_points_iterator_t;
 
 /**

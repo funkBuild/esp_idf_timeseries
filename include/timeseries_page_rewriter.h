@@ -17,6 +17,8 @@ typedef struct {
   uint32_t capacity;    // Total allocated capacity (in bytes).
   uint8_t level;        // Field data level (from header).
   bool finalized;
+  // Batch snapshot for compaction (when non-NULL, cache ops go through batch)
+  tsdb_page_cache_snapshot_t *batch_snapshot;
 } timeseries_page_rewriter_t;
 
 /**

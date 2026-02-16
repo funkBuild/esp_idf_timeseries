@@ -6,6 +6,7 @@
 #include "gorilla/gorilla_stream_decoder.h"
 #include "timeseries_compression.h"
 #include "timeseries_data.h"
+#include "timeseries_page_cache_snapshot.h"
 
 #include <inttypes.h>
 #include <math.h>
@@ -157,23 +158,44 @@ bool timeseries_entity_iterator_init(timeseries_db_t* db, uint32_t page_offset, 
   // We do NOT set current_entry_offset here; we do it in next()
   ent_iter->current_entry_offset = 0;
   ent_iter->valid = true;
+
+  // Try to mmap the metadata page for faster reads
+  ent_iter->page_ptr = NULL;
+  ent_iter->mmap_hdl = 0;
+
+  // Use esp_partition_mmap to map the page
+  const void* mapped_ptr = NULL;
+  esp_err_t err = esp_partition_mmap(db->partition, page_offset, page_size,
+                                      ESP_PARTITION_MMAP_DATA, &mapped_ptr,
+                                      &ent_iter->mmap_hdl);
+  if (err == ESP_OK && mapped_ptr != NULL) {
+    ent_iter->page_ptr = (const uint8_t*)mapped_ptr;
+    ESP_LOGV(TAG, "Mapped metadata page at offset 0x%08" PRIx32 " to %p", page_offset, mapped_ptr);
+  } else {
+    ESP_LOGV(TAG, "Failed to mmap metadata page (err=0x%x), falling back to reads", err);
+    ent_iter->page_ptr = NULL;
+    ent_iter->mmap_hdl = 0;
+  }
+
   return true;
 }
 
-void timeseries_entity_iterator_deinit(timeseries_entity_iterator_t* ent_iter) {}
+void timeseries_entity_iterator_deinit(timeseries_entity_iterator_t* ent_iter) {
+  if (ent_iter && ent_iter->page_ptr != NULL && ent_iter->mmap_hdl != 0) {
+    esp_partition_munmap(ent_iter->mmap_hdl);
+    ent_iter->page_ptr = NULL;
+    ent_iter->mmap_hdl = 0;
+  }
+}
 
 bool timeseries_entity_iterator_next(timeseries_entity_iterator_t* ent_iter, timeseries_entry_header_t* out_header) {
   if (!ent_iter || !ent_iter->valid) {
     return false;
   }
-  uint32_t page_start = ent_iter->page_offset;
-  uint32_t page_end = page_start + ent_iter->page_size;
+  uint32_t page_end = ent_iter->page_size;
 
-  // The offset for the *next* entry
-  uint32_t curr_offset = page_start + ent_iter->offset;
-
-  // Check space for at least an entry header
-  if (curr_offset + sizeof(timeseries_entry_header_t) > page_end) {
+  // Check space for at least an entry header (relative to page start)
+  if (ent_iter->offset + sizeof(timeseries_entry_header_t) > page_end) {
     ent_iter->valid = false;
     return false;
   }
@@ -181,13 +203,21 @@ bool timeseries_entity_iterator_next(timeseries_entity_iterator_t* ent_iter, tim
   // Save the entry_offset BEFORE reading
   ent_iter->current_entry_offset = ent_iter->offset;
 
-  // read the header
+  // Read the header - use mmap if available, otherwise fall back to partition read
   timeseries_entry_header_t hdr;
-  esp_err_t err = esp_partition_read(ent_iter->db->partition, curr_offset, &hdr, sizeof(hdr));
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to read entity header @0x%08" PRIx32 " (err=0x%x)", curr_offset, err);
-    ent_iter->valid = false;
-    return false;
+
+  if (ent_iter->page_ptr != NULL) {
+    // Use direct memory access via mmap
+    memcpy(&hdr, ent_iter->page_ptr + ent_iter->offset, sizeof(hdr));
+  } else {
+    // Fall back to partition read
+    uint32_t curr_offset = ent_iter->page_offset + ent_iter->offset;
+    esp_err_t err = esp_partition_read(ent_iter->db->partition, curr_offset, &hdr, sizeof(hdr));
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to read entity header @0x%08" PRIx32 " (err=0x%x)", curr_offset, err);
+      ent_iter->valid = false;
+      return false;
+    }
   }
 
   // check for blank (all 0xFF)
@@ -206,8 +236,8 @@ bool timeseries_entity_iterator_next(timeseries_entity_iterator_t* ent_iter, tim
   }
 
   uint32_t total_size = sizeof(hdr) + hdr.key_len + hdr.value_len;
-  if (curr_offset + total_size > page_end) {
-    ESP_LOGW(TAG, "Entry extends beyond boundary @0x%08" PRIx32, curr_offset);
+  if (ent_iter->offset + total_size > page_end) {
+    ESP_LOGW(TAG, "Entry extends beyond boundary @offset=%" PRIu32, ent_iter->offset);
     ent_iter->valid = false;
     return false;
   }
@@ -228,25 +258,38 @@ bool timeseries_entity_iterator_read_data(timeseries_entity_iterator_t* ent_iter
     return false;
   }
 
-  // The start of this entry is page_offset + current_entry_offset
-  uint32_t entry_start = ent_iter->page_offset + ent_iter->current_entry_offset;
-  uint32_t key_offset = entry_start + sizeof(timeseries_entry_header_t);
-  uint32_t value_offset = key_offset + header->key_len;
+  // Calculate offsets relative to page start
+  uint32_t key_offset_rel = ent_iter->current_entry_offset + sizeof(timeseries_entry_header_t);
+  uint32_t value_offset_rel = key_offset_rel + header->key_len;
 
-  // read the key
-  if (key_buf && header->key_len > 0) {
-    esp_err_t err = esp_partition_read(ent_iter->db->partition, key_offset, key_buf, header->key_len);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed to read entry key (err=0x%x)", err);
-      return false;
+  if (ent_iter->page_ptr != NULL) {
+    // Use direct memory access via mmap
+    if (key_buf && header->key_len > 0) {
+      memcpy(key_buf, ent_iter->page_ptr + key_offset_rel, header->key_len);
     }
-  }
-  // read the value
-  if (value_buf && header->value_len > 0) {
-    esp_err_t err = esp_partition_read(ent_iter->db->partition, value_offset, value_buf, header->value_len);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed to read entry value (err=0x%x)", err);
-      return false;
+    if (value_buf && header->value_len > 0) {
+      memcpy(value_buf, ent_iter->page_ptr + value_offset_rel, header->value_len);
+    }
+  } else {
+    // Fall back to partition read
+    uint32_t key_offset = ent_iter->page_offset + key_offset_rel;
+    uint32_t value_offset = ent_iter->page_offset + value_offset_rel;
+
+    // read the key
+    if (key_buf && header->key_len > 0) {
+      esp_err_t err = esp_partition_read(ent_iter->db->partition, key_offset, key_buf, header->key_len);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read entry key (err=0x%x)", err);
+        return false;
+      }
+    }
+    // read the value
+    if (value_buf && header->value_len > 0) {
+      esp_err_t err = esp_partition_read(ent_iter->db->partition, value_offset, value_buf, header->value_len);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read entry value (err=0x%x)", err);
+        return false;
+      }
     }
   }
   return true;
@@ -433,15 +476,53 @@ bool timeseries_blank_iterator_init(timeseries_db_t* db, timeseries_blank_iterat
   iter->run_start = 0;
   iter->run_length = 0;
 
+  // Acquire current snapshot for consistent iteration
+  iter->snapshot = tsdb_snapshot_acquire_current(db);
+  iter->owns_snapshot = true;
+
   return true;
 }
 
-bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t* out_offset, uint32_t* out_size) {
-  if (!iter || !iter->valid) {
+bool timeseries_blank_iterator_init_with_snapshot(timeseries_db_t* db, timeseries_blank_iterator_t* iter,
+                                                   uint32_t min_size, tsdb_page_cache_snapshot_t* snapshot) {
+  if (!db || !iter || !db->partition) {
     return false;
   }
 
-  timeseries_db_t* db = iter->db;
+  iter->db = db;
+  iter->partition = db->partition;
+  iter->min_size = min_size;
+  iter->valid = true;
+  iter->current_offset = 0;
+  iter->current_index = 0;
+
+  iter->in_blank_run = false;
+  iter->run_start = 0;
+  iter->run_length = 0;
+
+  // Use the provided snapshot without acquiring (caller owns it)
+  iter->snapshot = snapshot;
+  iter->owns_snapshot = false;
+
+  return true;
+}
+
+void timeseries_blank_iterator_deinit(timeseries_blank_iterator_t* iter) {
+  if (!iter) {
+    return;
+  }
+  if (iter->owns_snapshot && iter->snapshot) {
+    tsdb_snapshot_release(iter->snapshot);
+    iter->snapshot = NULL;
+  }
+}
+
+bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t* out_offset, uint32_t* out_size) {
+  if (!iter || !iter->valid || !iter->snapshot) {
+    return false;
+  }
+
+  tsdb_page_cache_snapshot_t* snap = iter->snapshot;
   const esp_partition_t* part = iter->partition;
   const uint32_t part_size = part->size;
 
@@ -472,7 +553,7 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t*
      * 2.  Reached the end of the page-cache?
      *     Treat the rest of the device as free, then wrap/terminate.
      * ------------------------------------------------------------*/
-    if (iter->current_index >= db->page_cache_count) {
+    if (iter->current_index >= snap->count) {
       /* a) Consume the area current_offset .. part_size as free */
       if (iter->current_offset < part_size) {
         uint32_t free_start = iter->current_offset;
@@ -524,7 +605,7 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t*
         iter->current_index = 0;
         continue;  // back to while(true)
       } else {
-        iter->valid = false;  // second time – done
+        iter->valid = false;  // second time - done
         return false;
       }
     }
@@ -532,7 +613,7 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t*
     /* --------------------------------------------------------------
      * 3.  Get the next cached page
      * ------------------------------------------------------------*/
-    timeseries_cached_page_t* entry = &db->page_cache[iter->current_index];
+    timeseries_cached_page_t* entry = &snap->entries[iter->current_index];
     uint32_t page_offset = entry->offset;
     uint32_t page_size = entry->header.page_size;
     uint8_t page_state = entry->header.page_state;
@@ -624,15 +705,16 @@ bool timeseries_blank_iterator_next(timeseries_blank_iterator_t* iter, uint32_t*
 
 /**
  * @brief Initialize the page cache iterator.
+ * Acquires the current snapshot for consistent iteration.
  */
 bool timeseries_page_cache_iterator_init(timeseries_db_t* db, timeseries_page_cache_iterator_t* iter) {
   if (!db || !iter) {
     return false;
   }
-  iter->db = db;
+  iter->snapshot = tsdb_snapshot_acquire_current(db);
   iter->index = 0;
-  iter->valid = true;
-  return true;
+  iter->valid = (iter->snapshot != NULL);
+  return iter->valid;
 }
 
 /**
@@ -640,13 +722,12 @@ bool timeseries_page_cache_iterator_init(timeseries_db_t* db, timeseries_page_ca
  */
 bool timeseries_page_cache_iterator_next(timeseries_page_cache_iterator_t* iter, timeseries_page_header_t* out_header,
                                          uint32_t* out_offset, uint32_t* out_size) {
-  if (!iter || !iter->valid) {
+  if (!iter || !iter->valid || !iter->snapshot) {
     return false;
   }
-  timeseries_db_t* db = iter->db;
 
-  while (iter->index < db->page_cache_count) {
-    timeseries_cached_page_t* entry = &db->page_cache[iter->index++];
+  while (iter->index < iter->snapshot->count) {
+    timeseries_cached_page_t* entry = &iter->snapshot->entries[iter->index++];
     if (entry->header.page_state == TIMESERIES_PAGE_STATE_ACTIVE) {
       // Return it
       if (out_header) {
@@ -663,4 +744,14 @@ bool timeseries_page_cache_iterator_next(timeseries_page_cache_iterator_t* iter,
   }
   iter->valid = false;
   return false;
+}
+
+void timeseries_page_cache_iterator_deinit(timeseries_page_cache_iterator_t* iter) {
+  if (!iter) {
+    return;
+  }
+  if (iter->snapshot) {
+    tsdb_snapshot_release(iter->snapshot);
+    iter->snapshot = NULL;
+  }
 }

@@ -92,12 +92,17 @@ typedef struct {
   bool in_blank_run;
   uint32_t run_start;
   uint32_t run_length;
+
+  // Snapshot reference held during iteration
+  tsdb_page_cache_snapshot_t* snapshot;
+  bool owns_snapshot;  // true if we acquired it (and must release)
 } timeseries_blank_iterator_t;
 
 typedef struct {
-  timeseries_db_t* db;
   size_t index;
   bool valid;
+  // Snapshot reference held during iteration
+  tsdb_page_cache_snapshot_t* snapshot;
 } timeseries_page_cache_iterator_t;
 
 typedef struct {
@@ -173,6 +178,17 @@ bool timeseries_metadata_page_iterator_init(timeseries_db_t* db, timeseries_meta
 bool timeseries_metadata_page_iterator_next(timeseries_metadata_page_iterator_t* iter,
                                             timeseries_page_header_t* out_header, uint32_t* out_offset,
                                             uint32_t* out_size);
+
+void timeseries_page_cache_iterator_deinit(timeseries_page_cache_iterator_t* iter);
+
+/**
+ * @brief Initialize a blank iterator using an externally-provided snapshot.
+ * The snapshot is NOT acquired (caller owns the reference).
+ */
+bool timeseries_blank_iterator_init_with_snapshot(timeseries_db_t* db, timeseries_blank_iterator_t* iter,
+                                                   uint32_t min_size, tsdb_page_cache_snapshot_t* snapshot);
+
+void timeseries_blank_iterator_deinit(timeseries_blank_iterator_t* iter);
 
 #ifdef __cplusplus
 }

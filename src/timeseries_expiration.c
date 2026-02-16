@@ -10,6 +10,10 @@
 #include "timeseries_iterator.h"    // timeseries_fielddata_iterator_t
 #include "timeseries_metadata.h"    // tsdb_lookup_series_type_in_metadata(), etc.
 #include "timeseries_page_cache.h"  // tsdb_pagecache_get_total_active_size()
+#include "timeseries_page_cache_snapshot.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include <inttypes.h>
 #include <stdlib.h>
@@ -120,17 +124,29 @@ bool timeseries_expiration_run(timeseries_db_t* db, float usage_threshold, float
   ESP_LOGI(TAG, "Target: freeing at least %u bytes (reduction_threshold=%.2f%%).", (unsigned int)bytes_to_free,
            reduction_threshold * 100.0f);
 
-  // 3) Gather the 25 oldest (non-deleted) field-data entries by `start_time`
+  // 3) Hold flash_write_mutex across gather+mark to prevent TOCTOU:
+  //    gathered record offsets must remain valid until marking completes.
+  if (db->flash_write_mutex) {
+    xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+  }
+
+  // Gather the 25 oldest (non-deleted) field-data entries by `start_time`
   tsdb_oldest_fd_entry_t top25[25];  // static array for max-25
   memset(top25, 0, sizeof(top25));
   size_t found_count = 0;
 
   if (!gather_25_oldest_fielddata(db, top25, &found_count)) {
     ESP_LOGE(TAG, "Failed scanning DB to find oldest field-data entries.");
+    if (db->flash_write_mutex) {
+      xSemaphoreGive(db->flash_write_mutex);
+    }
     return false;
   }
   if (found_count == 0) {
     ESP_LOGI(TAG, "No active field-data records => nothing to expire.");
+    if (db->flash_write_mutex) {
+      xSemaphoreGive(db->flash_write_mutex);
+    }
     return true;
   }
 
@@ -141,6 +157,10 @@ bool timeseries_expiration_run(timeseries_db_t* db, float usage_threshold, float
   modified_pages_list_init(&modified);
 
   mark_entries_deleted(db, top25, found_count, bytes_to_free, &modified);
+
+  if (db->flash_write_mutex) {
+    xSemaphoreGive(db->flash_write_mutex);
+  }
 
   // 5) If any pages got modified, run a page-list compaction
   if (modified.used > 0) {
@@ -321,6 +341,7 @@ static bool gather_25_oldest_fielddata(timeseries_db_t* db, tsdb_oldest_fd_entry
       }
     }
   }
+  timeseries_page_cache_iterator_deinit(&page_iter);
 
   return true;
 }
@@ -370,8 +391,8 @@ static void mark_entries_deleted(timeseries_db_t* db, const tsdb_oldest_fd_entry
       continue;
     }
 
-    // If success, add to sum and track that page in modified_out
-    sum_freed += sorted[i].record_length;
+    // If success, add to sum (include header size) and track that page
+    sum_freed += sizeof(timeseries_field_data_header_t) + sorted[i].record_length;
     modified_pages_list_add(modified_out, sorted[i].page_offset);
   }
 

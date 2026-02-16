@@ -6,12 +6,88 @@
 #include "timeseries_internal.h"
 #include "timeseries_iterator.h"
 #include "timeseries_page_cache.h"
+#include "timeseries_page_cache_snapshot.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 
 static const char* TAG = "TimeseriesData";
+
+// ---------------------------------------------------------------------------
+// Centralized blank-region allocation (serialized by region_alloc_mutex)
+// ---------------------------------------------------------------------------
+bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
+                                tsdb_page_cache_snapshot_t *batch_snapshot,
+                                uint32_t *out_offset, uint32_t *out_size) {
+    xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
+
+    // Find blank region using appropriate snapshot
+    timeseries_blank_iterator_t blank_iter;
+    if (batch_snapshot) {
+        timeseries_blank_iterator_init_with_snapshot(db, &blank_iter, min_size, batch_snapshot);
+    } else {
+        timeseries_blank_iterator_init(db, &blank_iter, min_size);
+    }
+
+    uint32_t region_ofs = 0, region_size = 0;
+    if (!timeseries_blank_iterator_next(&blank_iter, &region_ofs, &region_size)) {
+        timeseries_blank_iterator_deinit(&blank_iter);
+        xSemaphoreGive(db->region_alloc_mutex);
+        return false;
+    }
+    timeseries_blank_iterator_deinit(&blank_iter);
+
+    // Only reserve the requested size, not the full gap (round up to 4K for erase alignment)
+    uint32_t reserve_size = ((min_size + 4095) / 4096) * 4096;
+    if (reserve_size > region_size) {
+        reserve_size = region_size;
+    }
+
+    // Erase only the reserved portion
+    if (esp_partition_erase_range(db->partition, region_ofs, reserve_size) != ESP_OK) {
+        xSemaphoreGive(db->region_alloc_mutex);
+        return false;
+    }
+
+    // Register in both snapshots so neither path can double-allocate
+    // Create a placeholder header for registration
+    timeseries_page_header_t placeholder_hdr;
+    memset(&placeholder_hdr, 0xFF, sizeof(placeholder_hdr));
+    placeholder_hdr.magic_number = TIMESERIES_MAGIC_NUM;
+    placeholder_hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
+    placeholder_hdr.page_size = reserve_size;
+
+    // Register in live snapshot (for insert path visibility)
+    if (!batch_snapshot) {
+        // Caller is the insert path - add to live snapshot
+        tsdb_pagecache_add_entry(db, region_ofs, &placeholder_hdr);
+    }
+
+    // Register in batch snapshot (for compaction path visibility)
+    if (batch_snapshot) {
+        tsdb_pagecache_batch_add(batch_snapshot, region_ofs, &placeholder_hdr);
+        tsdb_pagecache_batch_sort(batch_snapshot);
+    }
+
+    // Also register in the OTHER active snapshot if it exists
+    if (db->active_batch && db->active_batch != batch_snapshot) {
+        tsdb_pagecache_batch_add(db->active_batch, region_ofs, &placeholder_hdr);
+        tsdb_pagecache_batch_sort(db->active_batch);
+    }
+    if (batch_snapshot && !db->active_batch) {
+        // Compaction is allocating but also needs the live snapshot updated
+        tsdb_pagecache_add_entry(db, region_ofs, &placeholder_hdr);
+    }
+
+    *out_offset = region_ofs;
+    *out_size = reserve_size;
+    xSemaphoreGive(db->region_alloc_mutex);
+    return true;
+}
 
 // Forward declarations
 static bool find_level0_page_with_space(timeseries_db_t* db, size_t bytes_needed, bool* out_any_l0_exists,
@@ -119,11 +195,25 @@ bool tsdb_append_multiple_points(timeseries_db_t* db, const unsigned char series
   ESP_LOGV(TAG, "tsdb_append_multiple_points: series=%.2X%.2X%.2X%.2X..., count=%zu", series_id[0], series_id[1],
            series_id[2], series_id[3], count);
 
+  // Use configurable chunk size from DB context
+  const size_t chunk_size = db->chunk_size;
+
   size_t remaining = count;
   size_t idx = 0;
 
   while (remaining > 0) {
-    size_t npoints_possible = remaining;
+    size_t npoints_possible = (remaining > chunk_size) ? chunk_size : remaining;
+
+    // Log progress for large inserts
+    if (count > chunk_size && remaining % 500 == 0) {
+      ESP_LOGI(TAG, "Insert progress: %zu/%zu points completed",
+               count - remaining, count);
+    }
+
+    // Take flash write mutex to protect L0 page finding/creation/writing
+    if (db->flash_write_mutex) {
+      xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+    }
 
     while (npoints_possible > 0) {
       size_t bytes_needed = calc_bytes_needed_for_npoints_columnar(npoints_possible, values + idx);
@@ -133,9 +223,15 @@ bool tsdb_append_multiple_points(timeseries_db_t* db, const unsigned char series
 
       if (find_level0_page_with_space(db, bytes_needed, &any_l0_exists, &page_offset, &used_offset)) {
         // We have space => write
-        if (!write_points_to_page(db, page_offset, used_offset, series_id, timestamps + idx, values + idx,
+        ESP_LOGV(TAG, "Writing %zu points to page @0x%08" PRIx32 " (bytes needed: %zu)",
+                 npoints_possible, page_offset, bytes_needed);
+        if (!write_points_to_page(db, page_offset, used_offset, series_id,
+                                  timestamps + idx, values + idx,
                                   npoints_possible)) {
           ESP_LOGE(TAG, "Failed writing points to L0=0x%08" PRIx32, page_offset);
+          if (db->flash_write_mutex) {
+            xSemaphoreGive(db->flash_write_mutex);
+          }
           return false;
         }
         idx += npoints_possible;
@@ -148,33 +244,72 @@ bool tsdb_append_multiple_points(timeseries_db_t* db, const unsigned char series
           ESP_LOGV(TAG, "No existing L0 pages => creating one...");
           uint32_t new_page_offset = 0;
           if (!create_level0_field_page(db, &new_page_offset)) {
-            ESP_LOGE(TAG, "Failed to create L0 page; none existed.");
-            return false;
+            // No space — trigger compaction and retry once
+            ESP_LOGW(TAG, "No space for L0 page, triggering compaction and retrying...");
+            if (db->flash_write_mutex) {
+              xSemaphoreGive(db->flash_write_mutex);
+            }
+            if (db->compaction_trigger) {
+              xSemaphoreGive(db->compaction_trigger);
+              vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            if (db->flash_write_mutex) {
+              xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+            }
+            if (!create_level0_field_page(db, &new_page_offset)) {
+              ESP_LOGE(TAG, "Failed to create L0 page even after compaction.");
+              if (db->flash_write_mutex) {
+                xSemaphoreGive(db->flash_write_mutex);
+              }
+              return false;
+            }
           }
           // now try again
           continue;
         } else {
           // L0 pages exist but all are full
           if (npoints_possible == 1) {
-            // can't store even 1 => compaction + new L0
-            ESP_LOGV(TAG, "All L0 full => compaction + new page.");
-            if (!timeseries_compact_all_levels(db)) {
-              ESP_LOGE(TAG, "Compaction failed,");
-              // We can continue here as long as we can create a new L0 page
-            }
+            // can't store even 1 => create new L0 page (background compaction handles cleanup)
+            ESP_LOGV(TAG, "All L0 pages full => creating new L0 page (progress: %zu/%zu points)",
+                     count - remaining, count);
             uint32_t new_page_offset = 0;
             if (!create_level0_field_page(db, &new_page_offset)) {
-              ESP_LOGE(TAG, "Failed to create new L0 after compaction.");
-              return false;
+              // No space — trigger compaction and retry once
+              ESP_LOGW(TAG, "No space for new L0 page, triggering compaction and retrying...");
+              if (db->flash_write_mutex) {
+                xSemaphoreGive(db->flash_write_mutex);
+              }
+              if (db->compaction_trigger) {
+                xSemaphoreGive(db->compaction_trigger);
+                // Wait briefly for compaction to free space
+                vTaskDelay(pdMS_TO_TICKS(100));
+              }
+              if (db->flash_write_mutex) {
+                xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+              }
+              if (!create_level0_field_page(db, &new_page_offset)) {
+                ESP_LOGE(TAG, "Failed to create new L0 page even after compaction.");
+                if (db->flash_write_mutex) {
+                  xSemaphoreGive(db->flash_write_mutex);
+                }
+                return false;
+              }
             }
+            ESP_LOGV(TAG, "Created new L0 page @0x%08X", new_page_offset);
             continue;
           } else {
             // reduce npoints_possible
+            ESP_LOGV(TAG, "Can't fit %zu points (need %zu bytes), trying %zu points",
+                     npoints_possible, bytes_needed, npoints_possible / 2);
             npoints_possible /= 2;
           }
         }
       }
     }  // end while (npoints_possible > 0)
+
+    if (db->flash_write_mutex) {
+      xSemaphoreGive(db->flash_write_mutex);
+    }
 
     if (npoints_possible == 0) {
       ESP_LOGE(TAG, "Unable to store any points. Out of space?");
@@ -184,6 +319,13 @@ bool tsdb_append_multiple_points(timeseries_db_t* db, const unsigned char series
 
   ESP_LOGV(TAG, "Successfully appended all %zu points to L0 pages", count);
   return true;
+}
+
+static bool is_page_claimed_by_compaction(timeseries_db_t *db, uint32_t offset) {
+    for (size_t i = 0; i < db->compaction_claimed_count; i++) {
+        if (db->compaction_claimed_pages[i] == offset) return true;
+    }
+    return false;
 }
 
 /**
@@ -205,17 +347,26 @@ static bool find_level0_page_with_space(timeseries_db_t* db, size_t bytes_needed
     esp_err_t err = esp_partition_read(db->partition, db->last_l0_page_offset, &hdr, sizeof(hdr));
     if (err == ESP_OK) {
       // Confirm the cached page is still a valid, active L0 field-data page
-      if (hdr.magic_number == TIMESERIES_MAGIC_NUM && hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
-          hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE && hdr.field_data_level == 0) {
-        *out_any_l0_exists = true;           // At least one L0 page exists
-        uint32_t page_size = hdr.page_size;  // from the header
-        uint32_t free_space = page_size - db->last_l0_used_offset;
+      if (hdr.magic_number == TIMESERIES_MAGIC_NUM &&
+          hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
+          hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE &&
+          hdr.field_data_level == 0) {
+        *out_any_l0_exists = true;          // At least one L0 page exists
 
-        if (free_space >= bytes_needed) {
-          // We can use the cached page immediately
-          *out_page_offset = db->last_l0_page_offset;
-          *out_used_offset = db->last_l0_used_offset;
-          return true;
+        // Check if this page is claimed by compaction
+        if (is_page_claimed_by_compaction(db, db->last_l0_page_offset)) {
+          db->last_l0_cache_valid = false;
+          // fall through to full scan
+        } else {
+          uint32_t page_size = hdr.page_size; // from the header
+          uint32_t free_space = page_size - db->last_l0_used_offset;
+
+          if (free_space >= bytes_needed) {
+            // We can use the cached page immediately
+            *out_page_offset = db->last_l0_page_offset;
+            *out_used_offset = db->last_l0_used_offset;
+            return true;
+          }
         }
       }
     }
@@ -257,6 +408,11 @@ static bool find_level0_page_with_space(timeseries_db_t* db, size_t bytes_needed
 
       uint32_t free_space = page_size - last_offset;
       if (free_space >= bytes_needed) {
+        // Check if this page is claimed by compaction
+        if (is_page_claimed_by_compaction(db, page_offset)) {
+          continue; // Skip claimed pages
+        }
+
         // Found a suitable page
         *out_page_offset = page_offset;
         *out_used_offset = last_offset;
@@ -271,6 +427,7 @@ static bool find_level0_page_with_space(timeseries_db_t* db, size_t bytes_needed
     }
   }
 
+  timeseries_page_cache_iterator_deinit(&page_iter);
   return found_space;
 }
 
@@ -285,16 +442,10 @@ static bool create_level0_field_page(timeseries_db_t* db, uint32_t* out_offset) 
 
   uint32_t l0_size = TIMESERIES_FIELD_DATA_PAGE_SIZE;
 
-  // 1) Find a blank region
-  timeseries_blank_iterator_t blank_iter;
-  if (!timeseries_blank_iterator_init(db, &blank_iter, l0_size)) {
-    ESP_LOGE(TAG, "Failed to init blank iterator for L0 page creation.");
-    return false;
-  }
-
+  // 1) Reserve a blank region (mutex-protected, registers placeholder)
   uint32_t blank_offset = 0;
   uint32_t blank_length = 0;
-  if (!timeseries_blank_iterator_next(&blank_iter, &blank_offset, &blank_length)) {
+  if (!tsdb_reserve_blank_region(db, l0_size, NULL, &blank_offset, &blank_length)) {
     ESP_LOGW(TAG, "No blank region found to create L0 page (size=%u).", (unsigned int)l0_size);
     return false;
   }
@@ -304,16 +455,7 @@ static bool create_level0_field_page(timeseries_db_t* db, uint32_t* out_offset) 
     return false;
   }
 
-  ESP_LOGW(TAG, "Found blank region @0x%08" PRIx32 " (length=%" PRIu32 " bytes).", blank_offset, blank_length);
-
-  // 2) Erase it
-  esp_err_t err = esp_partition_erase_range(db->partition, blank_offset, l0_size);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to erase region for L0 page (err=0x%x)", err);
-    return false;
-  }
-
-  // 3) Write new page header
+  // 2) Write proper page header (replaces placeholder written by reserve)
   timeseries_page_header_t new_hdr;
   memset(&new_hdr, 0xFF, sizeof(new_hdr));
   new_hdr.magic_number = TIMESERIES_MAGIC_NUM;
@@ -323,19 +465,20 @@ static bool create_level0_field_page(timeseries_db_t* db, uint32_t* out_offset) 
   new_hdr.field_data_level = 0;
   new_hdr.page_size = l0_size;
 
-  err = esp_partition_write(db->partition, blank_offset, &new_hdr, sizeof(new_hdr));
+  esp_err_t err = esp_partition_write(db->partition, blank_offset, &new_hdr, sizeof(new_hdr));
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to write L0 header (err=0x%x)", err);
     return false;
   }
 
+  // 3) Update the live snapshot cache entry with the real header
+  // (replaces the placeholder registered by tsdb_reserve_blank_region)
+  tsdb_pagecache_add_entry(db, blank_offset, &new_hdr);
+
   *out_offset = blank_offset;
   ESP_LOGV(TAG, "Created new level-0 page @0x%08" PRIx32 " (size=%u bytes).", blank_offset, (unsigned int)l0_size);
 
-  // 4) Update the page cache system
-  tsdb_pagecache_add_entry(db, blank_offset, &new_hdr);
-
-  // 5) Update the "last L0" cache
+  // 4) Update the "last L0" cache
   db->last_l0_cache_valid = true;
   db->last_l0_page_offset = blank_offset;
   db->last_l0_used_offset = sizeof(timeseries_page_header_t);
@@ -371,16 +514,42 @@ static bool write_points_to_page(timeseries_db_t* db, uint32_t page_offset, uint
   // Column header
   timeseries_col_data_header_t col_hdr;
   memset(&col_hdr, 0, sizeof(col_hdr));
-  col_hdr.ts_len = (uint16_t)ts_size;
-  col_hdr.val_len = (uint16_t)val_size;
+  col_hdr.ts_len = (uint32_t)ts_size;
+  col_hdr.val_len = (uint32_t)val_size;
 
   size_t total_col_data = sizeof(col_hdr) + ts_size + val_size;
   fhdr.record_length = (uint32_t)total_col_data;
 
-  // 3) Allocate a buffer for [col_hdr + timestamps + values]
-  uint8_t* col_buf = (uint8_t*)malloc(total_col_data);
+  // 3) Use pre-allocated buffer if available, otherwise allocate.
+  //    SAFETY: write_buffer is shared state, safe here because caller holds flash_write_mutex.
+  uint8_t *col_buf = NULL;
+  bool using_preallocated = false;
+
+  if (db->write_buffer && db->write_buffer_capacity >= total_col_data) {
+    // Use pre-allocated buffer
+    col_buf = db->write_buffer;
+    using_preallocated = true;
+    ESP_LOGV(TAG, "Using pre-allocated buffer (%zu bytes needed, %zu available)",
+             total_col_data, db->write_buffer_capacity);
+  } else if (db->write_buffer && total_col_data <= 64 * 1024) { // Don't grow beyond 64KB
+    // Try to grow the pre-allocated buffer
+    uint8_t *new_buffer = (uint8_t *)realloc(db->write_buffer, total_col_data);
+    if (new_buffer) {
+      db->write_buffer = new_buffer;
+      db->write_buffer_capacity = total_col_data;
+      col_buf = db->write_buffer;
+      using_preallocated = true;
+      ESP_LOGV(TAG, "Grew pre-allocated buffer to %zu bytes", total_col_data);
+    }
+  }
+
   if (!col_buf) {
-    return false;
+    // Fall back to malloc for very large writes or if no pre-allocated buffer
+    col_buf = (uint8_t *)malloc(total_col_data);
+    if (!col_buf) {
+      return false;
+    }
+    ESP_LOGV(TAG, "Using malloc for buffer (%zu bytes)", total_col_data);
   }
 
   // 4) Fill col_buf
@@ -399,13 +568,19 @@ static bool write_points_to_page(timeseries_db_t* db, uint32_t page_offset, uint
   uint32_t write_addr = page_offset + used_offset;
   esp_err_t err = esp_partition_write(db->partition, write_addr, &fhdr, sizeof(fhdr));
   if (err != ESP_OK) {
-    free(col_buf);
+    if (!using_preallocated) {
+      free(col_buf);
+    }
     return false;
   }
   write_addr += sizeof(fhdr);
 
   err = esp_partition_write(db->partition, write_addr, col_buf, total_col_data);
-  free(col_buf);
+
+  // Only free if we allocated it (not using pre-allocated buffer)
+  if (!using_preallocated) {
+    free(col_buf);
+  }
 
   if (err != ESP_OK) {
     return false;

@@ -1213,7 +1213,7 @@ TEST_CASE("Can query the data with strings", "[esp_idf_timeseries]") {
     free(field_values[i].data.string_val.str);
   }
 
-  timeseries_compact();
+  timeseries_compact_sync();
 
   // ---------------------------------------------------------
 

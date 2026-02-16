@@ -11,9 +11,13 @@
 #include "timeseries_metadata.h"
 #include "timeseries_multi_iterator.h"
 #include "timeseries_page_cache.h"
+#include "timeseries_page_cache_snapshot.h"
 #include "timeseries_page_rewriter.h"
 #include "timeseries_page_stream_writer.h"
 #include "timeseries_points_iterator.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include <inttypes.h>
 #include <stdlib.h>
@@ -28,10 +32,11 @@ static bool tsdb_find_level_pages(timeseries_db_t* db, uint8_t source_level, siz
                                   tsdb_level_page_t** out_pages, size_t* out_count, size_t* out_total_pages);
 
 static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t source_level,
-                                               const tsdb_level_page_t* pages, size_t page_count);
+                                               const tsdb_level_page_t* pages, size_t page_count,
+                                               tsdb_page_cache_snapshot_t* batch);
 
 static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_page_t* pages, size_t page_count,
-                                        uint8_t to_level);
+                                        uint8_t to_level, tsdb_page_cache_snapshot_t* batch);
 
 typedef struct {
   size_t count;
@@ -142,6 +147,9 @@ static bool gather_unique_series_ids(timeseries_db_t* db, const tsdb_level_page_
         continue;
       }
       // Add the series_id to out_ids if not present
+      ESP_LOGD(TAG, "Found series_id %02X%02X%02X%02X... flags=0x%02X records=%u in page @0x%08" PRIx32,
+               fd_hdr.series_id[0], fd_hdr.series_id[1], fd_hdr.series_id[2], fd_hdr.series_id[3],
+               fd_hdr.flags, fd_hdr.record_count, pg->offset);
       append_if_not_found_in_list(&out_ids->list, &out_ids->count, &out_ids->capacity, fd_hdr.series_id);
     }
   }
@@ -202,6 +210,12 @@ static bool collect_points_for_series(timeseries_db_t* db, const tsdb_level_page
           tsdb_compact_data_point_t* tmp = realloc(*out_pts, new_cap * sizeof(tsdb_compact_data_point_t));
           if (!tmp) {
             ESP_LOGE(TAG, "OOM collecting points for series");
+            // Free string values already accumulated
+            if (*out_type == TIMESERIES_FIELD_TYPE_STRING) {
+              for (size_t k = 0; k < *out_used; k++) {
+                free((*out_pts)[k].field_val.data.string_val.str);
+              }
+            }
             timeseries_points_iterator_deinit(&pts_iter);
             return false;
           }
@@ -230,14 +244,18 @@ static int compare_points_by_timestamp(const void* a, const void* b) {
   return 0;
 }
 
-static size_t remove_duplicates_in_place(tsdb_compact_data_point_t* pts, size_t count) {
+static size_t remove_duplicates_in_place(tsdb_compact_data_point_t* pts, size_t count,
+                                          timeseries_field_type_e ftype) {
   if (count < 2) return count;
   size_t write_idx = 1;
   for (size_t i = 1; i < count; i++) {
     if (pts[i].timestamp != pts[write_idx - 1].timestamp) {
       pts[write_idx++] = pts[i];
     } else {
-      // Overwrite the dup with the newer one if desired:
+      // Free the old value's string before overwriting with the newer one
+      if (ftype == TIMESERIES_FIELD_TYPE_STRING) {
+        free(pts[write_idx - 1].field_val.data.string_val.str);
+      }
       pts[write_idx - 1] = pts[i];
     }
   }
@@ -267,6 +285,45 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
     return true;
   }
 
+  // Begin a batch snapshot for all cache mutations during compaction
+  tsdb_page_cache_snapshot_t* batch = tsdb_pagecache_begin_batch(db);
+  if (!batch) {
+    ESP_LOGE(TAG, "Failed to begin batch for compaction");
+    free(pages);
+    return false;
+  }
+  // Set active_batch under region_alloc_mutex to synchronize with insert path
+  if (db->region_alloc_mutex) {
+    xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
+  }
+  db->active_batch = batch;
+  if (db->region_alloc_mutex) {
+    xSemaphoreGive(db->region_alloc_mutex);
+  }
+
+  // FIX 2C: Claim pages so inserts won't write to them
+  if (db->flash_write_mutex) {
+    xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+  }
+  size_t claim_count = (subset_cnt > TSDB_MAX_COMPACTION_CLAIMED_PAGES)
+                        ? TSDB_MAX_COMPACTION_CLAIMED_PAGES : subset_cnt;
+  for (size_t i = 0; i < claim_count; i++) {
+    db->compaction_claimed_pages[i] = pages[i].offset;
+  }
+  db->compaction_claimed_count = claim_count;
+  // If the cached L0 page is being claimed, invalidate cache
+  if (db->last_l0_cache_valid) {
+    for (size_t i = 0; i < claim_count; i++) {
+      if (db->last_l0_page_offset == pages[i].offset) {
+        db->last_l0_cache_valid = false;
+        break;
+      }
+    }
+  }
+  if (db->flash_write_mutex) {
+    xSemaphoreGive(db->flash_write_mutex);
+  }
+
   bool success = false;
 
   if (from_level == 0) {
@@ -285,6 +342,11 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
     memset(&uniq_ids, 0, sizeof(uniq_ids));
     if (!gather_unique_series_ids(db, pages, subset_cnt, &uniq_ids)) {
       ESP_LOGE(TAG, "Failed gathering unique series IDs");
+      if (db->flash_write_mutex) { xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY); }
+      db->compaction_claimed_count = 0;
+      if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
+      db->active_batch = NULL;
+      tsdb_snapshot_release(batch);
       free(pages);
       return false;
     }
@@ -292,7 +354,14 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
     if (uniq_ids.count == 0) {
       // No data => just mark pages obsolete
       ESP_LOGV(TAG, "No valid series in L0 => marking pages obsolete.");
-      tsdb_mark_old_level_pages_obsolete(db, from_level, pages, subset_cnt);
+      tsdb_mark_old_level_pages_obsolete(db, from_level, pages, subset_cnt, batch);
+      if (db->flash_write_mutex) { xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY); }
+      db->compaction_claimed_count = 0;
+      db->last_l0_cache_valid = false;
+      if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
+      db->active_batch = NULL;
+      tsdb_pagecache_batch_sort(batch);
+      tsdb_pagecache_commit_batch(db, batch);
       free(pages);
       return true;
     }
@@ -300,14 +369,31 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
     end_time = esp_timer_get_time();
     ESP_LOGI(TAG, "Gathered %zu unique series IDs in %.3f ms", uniq_ids.count, (end_time - start_time) / 1000.0);
 
+    // Estimate output size: sum source page sizes, halve for compression
+    uint32_t total_source_size = 0;
+    for (size_t i = 0; i < subset_cnt; i++) {
+      total_source_size += pages[i].size;
+    }
+    uint32_t estimated_size = total_source_size / 2;
+    if (estimated_size < 4096) {
+      estimated_size = 4096;
+    }
+
     timeseries_page_stream_writer_t sw;
-    if (!timeseries_page_stream_writer_init(db, &sw, to_level, 4096)) {
+    sw.batch_snapshot = batch;  // Set before init so it uses batch
+    if (!timeseries_page_stream_writer_init(db, &sw, to_level, estimated_size)) {
       ESP_LOGE(TAG, "Failed to init page_stream_writer for new L1 page.");
+      if (db->flash_write_mutex) { xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY); }
+      db->compaction_claimed_count = 0;
+      if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
+      db->active_batch = NULL;
+      tsdb_snapshot_release(batch);
       free(pages);
       return false;
     }
 
     // (C) For each series ID, read points, sort, deduplicate, then stream
+    bool series_loop_failed = false;
     for (size_t i = 0; i < uniq_ids.count; i++) {
       tsdb_compact_data_point_t* pts = NULL;
       size_t pts_used = 0, pts_cap = 0;
@@ -319,8 +405,9 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       // Collect this series’s points from all L0 pages
       if (!collect_points_for_series(db, pages, subset_cnt, uniq_ids.list[i], &pts, &pts_used, &pts_cap, &ftype,
                                      &min_ts, &max_ts)) {
-        // If we fail, bail out
+        // If we fail, bail out (string values already freed by collect_points_for_series on OOM)
         free(pts);
+        series_loop_failed = true;
         break;
       }
       if (pts_used == 0) {
@@ -340,7 +427,7 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
 
       // Remove duplicates (by timestamp)
       start_time = esp_timer_get_time();
-      pts_used = remove_duplicates_in_place(pts, pts_used);
+      pts_used = remove_duplicates_in_place(pts, pts_used, ftype);
       end_time = esp_timer_get_time();
       ESP_LOGI(TAG, "Removed duplicates, now %zu points in %.3f ms", pts_used, (end_time - start_time) / 1000.0);
 
@@ -350,41 +437,77 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       if (!timeseries_page_stream_writer_begin_series(&sw, uniq_ids.list[i], ftype)) {
         ESP_LOGE(TAG, "Failed to begin_series for i=%zu", i);
         free(pts);
+        series_loop_failed = true;
         break;
       }
 
       // PASS #1: Write timestamps
-      for (size_t j = 0; j < pts_used; j++) {
+      bool write_failed = false;
+      for (size_t j = 0; j < pts_used && !write_failed; j++) {
         uint64_t ts = pts[j].timestamp;
         if (!timeseries_page_stream_writer_write_timestamp(&sw, ts)) {
           ESP_LOGE(TAG, "Failed writing timestamp for j=%zu", j);
-          // you could break or bail out entirely
+          write_failed = true;
         }
+      }
+
+      if (write_failed) {
+        ESP_LOGE(TAG, "Timestamp write failed for series %zu, aborting compaction", i);
+        // Free strings if needed
+        if (ftype == TIMESERIES_FIELD_TYPE_STRING) {
+          for (size_t j = 0; j < pts_used; j++) {
+            free(pts[j].field_val.data.string_val.str);
+          }
+        }
+        free(pts);
+        series_loop_failed = true;
+        break;  // Page is in inconsistent state, abort
       }
 
       // finalize timestamps
       timeseries_page_stream_writer_finalize_timestamp(&sw);
 
       // PASS #2: Write values
-      for (size_t j = 0; j < pts_used; j++) {
+      size_t values_written = 0;
+      for (size_t j = 0; j < pts_used && !write_failed; j++) {
         if (!timeseries_page_stream_writer_write_value(&sw, &pts[j].field_val)) {
           ESP_LOGE(TAG, "Failed writing value for j=%zu", j);
-          // break or bail
+          write_failed = true;
         }
 
         // If we have a string, free the allocated memory
         if (ftype == TIMESERIES_FIELD_TYPE_STRING) {
           free(pts[j].field_val.data.string_val.str);
+          pts[j].field_val.data.string_val.str = NULL;
         }
+        values_written = j + 1;
+      }
+
+      // If value write failed, free remaining string values and abort
+      if (write_failed) {
+        ESP_LOGE(TAG, "Value write failed for series %zu, aborting compaction", i);
+        if (ftype == TIMESERIES_FIELD_TYPE_STRING) {
+          for (size_t k = values_written; k < pts_used; k++) {
+            free(pts[k].field_val.data.string_val.str);
+          }
+        }
+        free(pts);
+        series_loop_failed = true;
+        break;  // Page is in inconsistent state, abort
       }
 
       // end this series
-      timeseries_page_stream_writer_end_series(&sw);
+      if (!timeseries_page_stream_writer_end_series(&sw)) {
+        ESP_LOGE(TAG, "Failed to end_series for i=%zu with %zu points", i, pts_used);
+        free(pts);
+        series_loop_failed = true;
+        break;
+      }
 
       free(pts);
 
       end_time = esp_timer_get_time();
-      ESP_LOGI(TAG, "Wrote series with %zu points in %.3f ms", pts_used, (end_time - start_time) / 1000.0);
+      ESP_LOGI(TAG, "Wrote series %zu with %zu points in %.3f ms", i, pts_used, (end_time - start_time) / 1000.0);
     }
 
     free(uniq_ids.list);
@@ -392,26 +515,63 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
     // (D) Finalize the new page
     if (!timeseries_page_stream_writer_finalize(&sw)) {
       ESP_LOGE(TAG, "Failed finalizing new L1 page via stream-writer.");
+      if (db->flash_write_mutex) { xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY); }
+      db->compaction_claimed_count = 0;
+      if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
+      db->active_batch = NULL;
+      tsdb_snapshot_release(batch);
       free(pages);
       return false;
     }
 
-    success = true;
+    // Debug: Log the cache state after finalize
+    ESP_LOGI(TAG, "After finalize - batch snapshot state (%zu entries):", batch->count);
+    for (size_t ci = 0; ci < batch->count; ci++) {
+      timeseries_cached_page_t* ce = &batch->entries[ci];
+      ESP_LOGI(TAG, "  [%zu] offset=0x%08" PRIx32 " type=%u state=%u level=%u size=%" PRIu32,
+               ci, ce->offset, ce->header.page_type, ce->header.page_state,
+               ce->header.field_data_level, ce->header.page_size);
+    }
+
+    success = !series_loop_failed;
   } else {
     // --------------------------------------------------------------------
     // LEVEL-1 (or higher) => LEVEL-2
     // Use your existing multi-iterator approach
     // --------------------------------------------------------------------
     ESP_LOGI(TAG, "Compacting from level-%u => level-%u using multi-iterator...", from_level, to_level);
-    success = tsdb_compact_multi_iterator(db, pages, subset_cnt, to_level);
+    success = tsdb_compact_multi_iterator(db, pages, subset_cnt, to_level, batch);
   }
 
   // If we succeeded, mark old pages as obsolete
   if (success) {
-    if (!tsdb_mark_old_level_pages_obsolete(db, from_level, pages, subset_cnt)) {
+    if (!tsdb_mark_old_level_pages_obsolete(db, from_level, pages, subset_cnt, batch)) {
       ESP_LOGW(TAG, "Failed marking old level-%u pages obsolete!", from_level);
     }
   }
+
+  // Clear claimed set and active_batch before commit
+  if (db->flash_write_mutex) {
+    xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+  }
+  db->compaction_claimed_count = 0;
+  db->last_l0_cache_valid = false;
+  if (db->flash_write_mutex) {
+    xSemaphoreGive(db->flash_write_mutex);
+  }
+
+  // Clear active_batch under region_alloc_mutex before commit
+  if (db->region_alloc_mutex) {
+    xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
+  }
+  db->active_batch = NULL;
+  if (db->region_alloc_mutex) {
+    xSemaphoreGive(db->region_alloc_mutex);
+  }
+
+  // Commit the batch to merge with any concurrent inserts
+  tsdb_pagecache_batch_sort(batch);
+  tsdb_pagecache_commit_batch(db, batch);
 
   free(pages);
   return success;
@@ -471,6 +631,7 @@ static bool tsdb_find_level_pages(timeseries_db_t* db, uint8_t source_level, siz
       ++subset_found;
     }
   }
+  timeseries_page_cache_iterator_deinit(&page_iter);
 
   *out_total_pages = total_found;
 
@@ -499,14 +660,18 @@ static bool tsdb_find_level_pages(timeseries_db_t* db, uint8_t source_level, siz
 // -----------------------------------------------------------------------------
 
 static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t source_level,
-                                               const tsdb_level_page_t* pages, size_t page_count) {
+                                               const tsdb_level_page_t* pages, size_t page_count,
+                                               tsdb_page_cache_snapshot_t* batch) {
   if (!db || !pages) {
     return false;
   }
 
+  ESP_LOGI(TAG, "Marking %zu old level-%u pages as obsolete",
+           page_count, source_level);
+
   for (size_t i = 0; i < page_count; i++) {
     uint32_t pofs = pages[i].offset;
-    ESP_LOGV(TAG, "Marking level-%u page @0x%08" PRIx32 " as obsolete.", source_level, pofs);
+    ESP_LOGI(TAG, "Marking level-%u page @0x%08" PRIx32 " as obsolete.", source_level, pofs);
 
     // 1) Read the existing page header
     timeseries_page_header_t hdr;
@@ -522,17 +687,27 @@ static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t sour
       // 3) Mark obsolete
       hdr.page_state = TIMESERIES_PAGE_STATE_OBSOLETE;
 
-      // 4) Write updated header
+      // 4) Write updated header (protected by flash_write_mutex)
+      if (db->flash_write_mutex) {
+        xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+      }
       err = esp_partition_write(db->partition, pofs, &hdr, sizeof(hdr));
+      if (db->flash_write_mutex) {
+        xSemaphoreGive(db->flash_write_mutex);
+      }
       if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed marking page @0x%08" PRIx32 " obsolete (err=0x%x)", pofs, err);
         continue;
       }
 
-      // Remove from cache
-      tsdb_pagecache_remove_entry(db, pofs);
+      // Remove from cache (batch or live)
+      if (batch) {
+        tsdb_pagecache_batch_remove(batch, pofs);
+      } else {
+        tsdb_pagecache_remove_entry(db, pofs);
+      }
 
-      ESP_LOGV(TAG, "Obsolete mark success for page @0x%08" PRIx32, pofs);
+      ESP_LOGI(TAG, "Removed page @0x%08" PRIx32 " from cache", pofs);
     } else {
       ESP_LOGW(TAG, "Skipping page @0x%08" PRIx32 " (not an active level-%u field-data page).", pofs, source_level);
     }
@@ -607,7 +782,7 @@ static int sort_by_seq_and_offset(const void* a, const void* b) {
 }
 
 static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_page_t* pages, size_t page_count,
-                                        uint8_t to_level) {
+                                        uint8_t to_level, tsdb_page_cache_snapshot_t* batch) {
   if (!db || !pages || page_count == 0) {
     return false;
   }
@@ -731,6 +906,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
   // 2) Create one stream writer for a new page that will hold multiple series
   // ----------------------------------------------------------------
   timeseries_page_stream_writer_t writer;
+  writer.batch_snapshot = batch;  // Set before init so it uses batch
   if (!timeseries_page_stream_writer_init(db, &writer, to_level, total_record_bytes)) {
     ESP_LOGE(TAG, "Failed to initialize stream-writer for multi-series page");
     for (size_t s = 0; s < series_map_used; s++) {
@@ -836,6 +1012,12 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
       uint64_t ts;
       timeseries_field_value_t fv;
       while (timeseries_multi_points_iterator_next(&multi_iter, &ts, &fv)) {
+        // Free string values yielded by the iterator (we only need timestamps)
+        if (S->records[0].field_type == TIMESERIES_FIELD_TYPE_STRING &&
+            fv.data.string_val.str) {
+          free(fv.data.string_val.str);
+          fv.data.string_val.str = NULL;
+        }
         // Timestamps get written first
         if (!timeseries_page_stream_writer_write_timestamp(&writer, ts)) {
           ESP_LOGE(TAG, "Failed writing timestamp for s=%zu", s);
@@ -1022,6 +1204,7 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_
   // 4) Allocate a new page using the rewriter, passing the computed total size.
   if (total_records > 0) {
     timeseries_page_rewriter_t rewriter;
+    memset(&rewriter, 0, sizeof(rewriter));  // Ensure batch_snapshot is NULL (not garbage)
     if (!timeseries_page_rewriter_start(db, level, total_data_size, &rewriter)) {
       ESP_LOGE(TAG, "Failed to initialize page rewriter");
       return false;

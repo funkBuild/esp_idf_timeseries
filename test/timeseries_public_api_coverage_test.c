@@ -549,192 +549,611 @@ TEST_CASE("public_api: empty string fields insert and query", "[public_api][stri
 }
 
 // ============================================================================
-// Query aggregation method tests
+// Helper: insert N float points with specific values
+// ============================================================================
+static bool insert_float_vals(const char *measurement, const char *field,
+                               const double *float_vals,
+                               const uint64_t *timestamps, size_t count) {
+    timeseries_field_value_t *vals = malloc(count * sizeof(timeseries_field_value_t));
+    if (!vals) return false;
+    for (size_t i = 0; i < count; i++) {
+        vals[i].type = TIMESERIES_FIELD_TYPE_FLOAT;
+        vals[i].data.float_val = float_vals[i];
+    }
+    const char *fields[] = {field};
+    timeseries_insert_data_t data = {
+        .measurement_name = measurement,
+        .field_names = fields,
+        .field_values = vals,
+        .num_fields = 1,
+        .timestamps_ms = (uint64_t *)timestamps,
+        .num_points = count,
+    };
+    bool ok = timeseries_insert(&data);
+    free(vals);
+    return ok;
+}
+
+// Helper: insert N bool points
+static bool insert_bools(const char *measurement, const char *field,
+                          const bool *bool_vals, const uint64_t *timestamps,
+                          size_t count) {
+    timeseries_field_value_t *vals = malloc(count * sizeof(timeseries_field_value_t));
+    if (!vals) return false;
+    for (size_t i = 0; i < count; i++) {
+        vals[i].type = TIMESERIES_FIELD_TYPE_BOOL;
+        vals[i].data.bool_val = bool_vals[i];
+    }
+    const char *fields[] = {field};
+    timeseries_insert_data_t data = {
+        .measurement_name = measurement,
+        .field_names = fields,
+        .field_values = vals,
+        .num_fields = 1,
+        .timestamps_ms = (uint64_t *)timestamps,
+        .num_points = count,
+    };
+    bool ok = timeseries_insert(&data);
+    free(vals);
+    return ok;
+}
+
+// Helper: run an aggregation query and return the result
+static bool query_agg(const char *measurement,
+                       timeseries_aggregation_method_e method,
+                       uint32_t rollup_interval,
+                       timeseries_query_result_t *result) {
+    timeseries_query_t q;
+    memset(&q, 0, sizeof(q));
+    q.measurement_name = measurement;
+    q.start_ms = 0;
+    q.end_ms = INT64_MAX;
+    q.rollup_interval = rollup_interval;
+    q.aggregate_method = method;
+    memset(result, 0, sizeof(*result));
+    return timeseries_query(&q, result);
+}
+
+// ============================================================================
+// Query aggregation method tests — exact value validation
+//
+// Window alignment: the iterator sets window_start = earliest timestamp in the
+// data, so timestamps starting at 1000 with rollup=500 gives:
+//   Window 0: [1000, 1500)
+//   Window 1: [1500, 2000)
+//   etc.
 // ============================================================================
 
-TEST_CASE("public_api: query aggregation AVG", "[public_api][aggregation]") {
+TEST_CASE("public_api: AVG on INT exact values", "[public_api][aggregation]") {
     ensure_init();
 
-    // Insert 10 points: values 0,1,2,...,9 at timestamps 0,100,200,...,900
-    int64_t int_vals[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
-    uint64_t timestamps[] = {0, 100, 200, 300, 400, 500, 600, 700, 800, 900};
-    TEST_ASSERT_TRUE(insert_ints("agg_avg", "val", int_vals, timestamps, 10));
-
-    // Query with rollup_interval=500 and AVG aggregation
-    // Window 1: ts 0-499 -> values 0,1,2,3,4 -> avg=2
-    // Window 2: ts 500-999 -> values 5,6,7,8,9 -> avg=7
-    timeseries_query_t q;
-    memset(&q, 0, sizeof(q));
-    q.measurement_name = "agg_avg";
-    q.start_ms = 0;
-    q.end_ms = INT64_MAX;
-    q.rollup_interval = 500;
-    q.aggregate_method = TSDB_AGGREGATION_AVG;
+    // Two windows of 3 points each:
+    // Window [1000,1500): values 10, 20, 30 → avg = 20
+    // Window [1500,2000): values 40, 50, 60 → avg = 50
+    int64_t vals[]    = {10, 20, 30, 40, 50, 60};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500, 1600, 1700};
+    TEST_ASSERT_TRUE(insert_ints("eavg_i", "v", vals, ts, 6));
 
     timeseries_query_result_t r;
-    memset(&r, 0, sizeof(r));
-    bool ok = timeseries_query(&q, &r);
-    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(query_agg("eavg_i", TSDB_AGGREGATION_AVG, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
+    TEST_ASSERT_EQUAL(1, r.num_columns);
 
-    ESP_LOGI(TAG, "AVG rollup: %" PRIu32 " points", (uint32_t)r.num_points);
-    TEST_ASSERT_TRUE(r.num_points > 0);
-    TEST_ASSERT_TRUE(r.num_points < 10);
+    // Values should be INT (type preserved for AVG of INT)
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, r.columns[0].values[0].type);
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, r.columns[0].values[1].type);
+
+    TEST_ASSERT_EQUAL_INT64(20, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(50, r.columns[0].values[1].data.int_val);
+
+    // Timestamps should be the window start times
+    TEST_ASSERT_EQUAL_UINT64(1000, r.timestamps[0]);
+    TEST_ASSERT_EQUAL_UINT64(1500, r.timestamps[1]);
 
     timeseries_query_free_result(&r);
 }
 
-TEST_CASE("public_api: query aggregation MIN", "[public_api][aggregation]") {
+TEST_CASE("public_api: AVG on FLOAT exact values", "[public_api][aggregation]") {
     ensure_init();
 
-    int64_t int_vals[] = {10, 3, 7, 1, 5, 9, 2, 8, 4, 6};
-    uint64_t timestamps[] = {0, 100, 200, 300, 400, 500, 600, 700, 800, 900};
-    TEST_ASSERT_TRUE(insert_ints("agg_min", "val", int_vals, timestamps, 10));
-
-    timeseries_query_t q;
-    memset(&q, 0, sizeof(q));
-    q.measurement_name = "agg_min";
-    q.start_ms = 0;
-    q.end_ms = INT64_MAX;
-    q.rollup_interval = 500;
-    q.aggregate_method = TSDB_AGGREGATION_MIN;
+    // Window [1000,1500): 1.5, 2.5, 3.5 → avg = 2.5
+    // Window [1500,2000): 4.5, 5.5, 6.5 → avg = 5.5
+    double vals[]     = {1.5, 2.5, 3.5, 4.5, 5.5, 6.5};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500, 1600, 1700};
+    TEST_ASSERT_TRUE(insert_float_vals("eavg_f", "v", vals, ts, 6));
 
     timeseries_query_result_t r;
-    memset(&r, 0, sizeof(r));
-    TEST_ASSERT_TRUE(timeseries_query(&q, &r));
+    TEST_ASSERT_TRUE(query_agg("eavg_f", TSDB_AGGREGATION_AVG, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
 
-    ESP_LOGI(TAG, "MIN rollup: %" PRIu32 " points", (uint32_t)r.num_points);
-    TEST_ASSERT_TRUE(r.num_points > 0);
-    TEST_ASSERT_TRUE(r.num_points < 10);
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_FLOAT, r.columns[0].values[0].type);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 2.5, r.columns[0].values[0].data.float_val);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 5.5, r.columns[0].values[1].data.float_val);
 
     timeseries_query_free_result(&r);
 }
 
-TEST_CASE("public_api: query aggregation MAX", "[public_api][aggregation]") {
+TEST_CASE("public_api: MIN on INT exact values", "[public_api][aggregation]") {
     ensure_init();
 
-    int64_t int_vals[] = {10, 3, 7, 1, 5, 9, 2, 8, 4, 6};
-    uint64_t timestamps[] = {0, 100, 200, 300, 400, 500, 600, 700, 800, 900};
-    TEST_ASSERT_TRUE(insert_ints("agg_max", "val", int_vals, timestamps, 10));
-
-    timeseries_query_t q;
-    memset(&q, 0, sizeof(q));
-    q.measurement_name = "agg_max";
-    q.start_ms = 0;
-    q.end_ms = INT64_MAX;
-    q.rollup_interval = 500;
-    q.aggregate_method = TSDB_AGGREGATION_MAX;
+    // Window [1000,1500): 5, 2, 8 → min = 2
+    // Window [1500,2000): 1, 9, 3 → min = 1
+    int64_t vals[]    = {5, 2, 8, 1, 9, 3};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500, 1600, 1700};
+    TEST_ASSERT_TRUE(insert_ints("emin_i", "v", vals, ts, 6));
 
     timeseries_query_result_t r;
-    memset(&r, 0, sizeof(r));
-    TEST_ASSERT_TRUE(timeseries_query(&q, &r));
+    TEST_ASSERT_TRUE(query_agg("emin_i", TSDB_AGGREGATION_MIN, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
 
-    ESP_LOGI(TAG, "MAX rollup: %" PRIu32 " points", (uint32_t)r.num_points);
-    TEST_ASSERT_TRUE(r.num_points > 0);
-    TEST_ASSERT_TRUE(r.num_points < 10);
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, r.columns[0].values[0].type);
+    TEST_ASSERT_EQUAL_INT64(2, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(1, r.columns[0].values[1].data.int_val);
 
     timeseries_query_free_result(&r);
 }
 
-TEST_CASE("public_api: query aggregation SUM", "[public_api][aggregation]") {
+TEST_CASE("public_api: MIN on FLOAT exact values", "[public_api][aggregation]") {
     ensure_init();
 
-    int64_t int_vals[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-    uint64_t timestamps[] = {0, 100, 200, 300, 400, 500, 600, 700, 800, 900};
-    TEST_ASSERT_TRUE(insert_ints("agg_sum", "val", int_vals, timestamps, 10));
-
-    timeseries_query_t q;
-    memset(&q, 0, sizeof(q));
-    q.measurement_name = "agg_sum";
-    q.start_ms = 0;
-    q.end_ms = INT64_MAX;
-    q.rollup_interval = 500;
-    q.aggregate_method = TSDB_AGGREGATION_SUM;
+    // Window [1000,1500): 3.7, 1.2, 5.9 → min = 1.2
+    // Window [1500,2000): 0.5, 4.8, 2.3 → min = 0.5
+    double vals[]     = {3.7, 1.2, 5.9, 0.5, 4.8, 2.3};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500, 1600, 1700};
+    TEST_ASSERT_TRUE(insert_float_vals("emin_f", "v", vals, ts, 6));
 
     timeseries_query_result_t r;
-    memset(&r, 0, sizeof(r));
-    TEST_ASSERT_TRUE(timeseries_query(&q, &r));
+    TEST_ASSERT_TRUE(query_agg("emin_f", TSDB_AGGREGATION_MIN, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
 
-    ESP_LOGI(TAG, "SUM rollup: %" PRIu32 " points", (uint32_t)r.num_points);
-    TEST_ASSERT_TRUE(r.num_points > 0);
-    TEST_ASSERT_TRUE(r.num_points < 10);
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_FLOAT, r.columns[0].values[0].type);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 1.2, r.columns[0].values[0].data.float_val);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 0.5, r.columns[0].values[1].data.float_val);
 
     timeseries_query_free_result(&r);
 }
 
-TEST_CASE("public_api: query aggregation COUNT", "[public_api][aggregation]") {
+TEST_CASE("public_api: MAX on INT exact values", "[public_api][aggregation]") {
     ensure_init();
 
-    int64_t int_vals[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-    uint64_t timestamps[] = {0, 100, 200, 300, 400, 500, 600, 700, 800, 900};
-    TEST_ASSERT_TRUE(insert_ints("agg_count", "val", int_vals, timestamps, 10));
-
-    timeseries_query_t q;
-    memset(&q, 0, sizeof(q));
-    q.measurement_name = "agg_count";
-    q.start_ms = 0;
-    q.end_ms = INT64_MAX;
-    q.rollup_interval = 500;
-    q.aggregate_method = TSDB_AGGREGATION_COUNT;
+    // Window [1000,1500): 5, 2, 8 → max = 8
+    // Window [1500,2000): 1, 9, 3 → max = 9
+    int64_t vals[]    = {5, 2, 8, 1, 9, 3};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500, 1600, 1700};
+    TEST_ASSERT_TRUE(insert_ints("emax_i", "v", vals, ts, 6));
 
     timeseries_query_result_t r;
-    memset(&r, 0, sizeof(r));
-    TEST_ASSERT_TRUE(timeseries_query(&q, &r));
+    TEST_ASSERT_TRUE(query_agg("emax_i", TSDB_AGGREGATION_MAX, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
 
-    ESP_LOGI(TAG, "COUNT rollup: %" PRIu32 " points", (uint32_t)r.num_points);
-    TEST_ASSERT_TRUE(r.num_points > 0);
-    TEST_ASSERT_TRUE(r.num_points < 10);
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, r.columns[0].values[0].type);
+    TEST_ASSERT_EQUAL_INT64(8, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(9, r.columns[0].values[1].data.int_val);
 
     timeseries_query_free_result(&r);
 }
 
-TEST_CASE("public_api: query aggregation LAST", "[public_api][aggregation]") {
+TEST_CASE("public_api: MAX on FLOAT exact values", "[public_api][aggregation]") {
     ensure_init();
 
-    int64_t int_vals[] = {100, 200, 300, 400, 500, 600, 700, 800, 900, 1000};
-    uint64_t timestamps[] = {0, 100, 200, 300, 400, 500, 600, 700, 800, 900};
-    TEST_ASSERT_TRUE(insert_ints("agg_last", "val", int_vals, timestamps, 10));
-
-    timeseries_query_t q;
-    memset(&q, 0, sizeof(q));
-    q.measurement_name = "agg_last";
-    q.start_ms = 0;
-    q.end_ms = INT64_MAX;
-    q.rollup_interval = 500;
-    q.aggregate_method = TSDB_AGGREGATION_LAST;
+    double vals[]     = {3.7, 1.2, 5.9, 0.5, 4.8, 2.3};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500, 1600, 1700};
+    TEST_ASSERT_TRUE(insert_float_vals("emax_f", "v", vals, ts, 6));
 
     timeseries_query_result_t r;
-    memset(&r, 0, sizeof(r));
-    TEST_ASSERT_TRUE(timeseries_query(&q, &r));
+    TEST_ASSERT_TRUE(query_agg("emax_f", TSDB_AGGREGATION_MAX, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
 
-    ESP_LOGI(TAG, "LAST rollup: %" PRIu32 " points", (uint32_t)r.num_points);
-    TEST_ASSERT_TRUE(r.num_points > 0);
-    TEST_ASSERT_TRUE(r.num_points < 10);
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_FLOAT, r.columns[0].values[0].type);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 5.9, r.columns[0].values[0].data.float_val);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 4.8, r.columns[0].values[1].data.float_val);
 
     timeseries_query_free_result(&r);
 }
 
-TEST_CASE("public_api: query aggregation NONE with rollup is same as raw", "[public_api][aggregation]") {
+TEST_CASE("public_api: SUM on INT exact values", "[public_api][aggregation]") {
     ensure_init();
 
-    TEST_ASSERT_TRUE(insert_floats("agg_none", "val", 20, 0, 100));
-
-    // TSDB_AGGREGATION_NONE with rollup_interval should behave like no rollup
-    timeseries_query_t q;
-    memset(&q, 0, sizeof(q));
-    q.measurement_name = "agg_none";
-    q.start_ms = 0;
-    q.end_ms = INT64_MAX;
-    q.rollup_interval = 500;
-    q.aggregate_method = TSDB_AGGREGATION_NONE;
+    // Window [1000,1500): 1, 2, 3 → sum = 6
+    // Window [1500,2000): 4, 5, 6 → sum = 15
+    int64_t vals[]    = {1, 2, 3, 4, 5, 6};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500, 1600, 1700};
+    TEST_ASSERT_TRUE(insert_ints("esum_i", "v", vals, ts, 6));
 
     timeseries_query_result_t r;
-    memset(&r, 0, sizeof(r));
-    TEST_ASSERT_TRUE(timeseries_query(&q, &r));
+    TEST_ASSERT_TRUE(query_agg("esum_i", TSDB_AGGREGATION_SUM, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
 
-    ESP_LOGI(TAG, "NONE rollup: %" PRIu32 " points", (uint32_t)r.num_points);
-    // With NONE aggregation, behavior depends on implementation - just verify no crash
-    TEST_ASSERT_TRUE(r.num_points > 0);
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, r.columns[0].values[0].type);
+    TEST_ASSERT_EQUAL_INT64(6, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(15, r.columns[0].values[1].data.int_val);
 
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: SUM on FLOAT exact values", "[public_api][aggregation]") {
+    ensure_init();
+
+    double vals[]     = {1.5, 2.5, 3.0, 4.0, 5.5, 6.5};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500, 1600, 1700};
+    TEST_ASSERT_TRUE(insert_float_vals("esum_f", "v", vals, ts, 6));
+
+    timeseries_query_result_t r;
+    TEST_ASSERT_TRUE(query_agg("esum_f", TSDB_AGGREGATION_SUM, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
+
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_FLOAT, r.columns[0].values[0].type);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 7.0, r.columns[0].values[0].data.float_val);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 16.0, r.columns[0].values[1].data.float_val);
+
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: COUNT exact values", "[public_api][aggregation]") {
+    ensure_init();
+
+    // Window [1000,1500): 3 points → count = 3
+    // Window [1500,2000): 2 points → count = 2
+    int64_t vals[]    = {10, 20, 30, 40, 50};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500, 1600};
+    TEST_ASSERT_TRUE(insert_ints("ecnt", "v", vals, ts, 5));
+
+    timeseries_query_result_t r;
+    TEST_ASSERT_TRUE(query_agg("ecnt", TSDB_AGGREGATION_COUNT, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
+
+    // COUNT always returns INT regardless of input type
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, r.columns[0].values[0].type);
+    TEST_ASSERT_EQUAL_INT64(3, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(2, r.columns[0].values[1].data.int_val);
+
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: COUNT on FLOAT data", "[public_api][aggregation]") {
+    ensure_init();
+
+    double vals[]     = {1.1, 2.2, 3.3, 4.4};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500};
+    TEST_ASSERT_TRUE(insert_float_vals("ecnt_f", "v", vals, ts, 4));
+
+    timeseries_query_result_t r;
+    TEST_ASSERT_TRUE(query_agg("ecnt_f", TSDB_AGGREGATION_COUNT, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
+
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, r.columns[0].values[0].type);
+    TEST_ASSERT_EQUAL_INT64(3, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(1, r.columns[0].values[1].data.int_val);
+
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: LAST on INT exact values", "[public_api][aggregation]") {
+    ensure_init();
+
+    // Window [1000,1500): values 10, 20, 30 → last = 30
+    // Window [1500,2000): values 40, 50, 60 → last = 60
+    int64_t vals[]    = {10, 20, 30, 40, 50, 60};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500, 1600, 1700};
+    TEST_ASSERT_TRUE(insert_ints("elast_i", "v", vals, ts, 6));
+
+    timeseries_query_result_t r;
+    TEST_ASSERT_TRUE(query_agg("elast_i", TSDB_AGGREGATION_LAST, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
+
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, r.columns[0].values[0].type);
+    TEST_ASSERT_EQUAL_INT64(30, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(60, r.columns[0].values[1].data.int_val);
+
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: LAST on FLOAT exact values", "[public_api][aggregation]") {
+    ensure_init();
+
+    double vals[]     = {1.1, 2.2, 3.3, 4.4, 5.5, 6.6};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500, 1600, 1700};
+    TEST_ASSERT_TRUE(insert_float_vals("elast_f", "v", vals, ts, 6));
+
+    timeseries_query_result_t r;
+    TEST_ASSERT_TRUE(query_agg("elast_f", TSDB_AGGREGATION_LAST, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
+
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_FLOAT, r.columns[0].values[0].type);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 3.3, r.columns[0].values[0].data.float_val);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 6.6, r.columns[0].values[1].data.float_val);
+
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: NONE with rollup acts as SUM", "[public_api][aggregation]") {
+    ensure_init();
+
+    // NONE with rollup falls through to SUM in finalize_aggregator
+    int64_t vals[]    = {1, 2, 3, 4, 5, 6};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500, 1600, 1700};
+    TEST_ASSERT_TRUE(insert_ints("enone", "v", vals, ts, 6));
+
+    timeseries_query_result_t r;
+    TEST_ASSERT_TRUE(query_agg("enone", TSDB_AGGREGATION_NONE, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
+
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, r.columns[0].values[0].type);
+    TEST_ASSERT_EQUAL_INT64(6, r.columns[0].values[0].data.int_val);   // 1+2+3
+    TEST_ASSERT_EQUAL_INT64(15, r.columns[0].values[1].data.int_val);  // 4+5+6
+
+    timeseries_query_free_result(&r);
+}
+
+// ============================================================================
+// Edge cases: single point, large rollup, gaps, bool data
+// ============================================================================
+
+TEST_CASE("public_api: single point per window", "[public_api][aggregation]") {
+    ensure_init();
+
+    // Each point is in its own window (rollup=100, points 200ms apart)
+    int64_t vals[]    = {100, 200, 300};
+    uint64_t ts[]     = {1000, 1200, 1400};
+    TEST_ASSERT_TRUE(insert_ints("esingle", "v", vals, ts, 3));
+
+    timeseries_query_result_t r;
+    TEST_ASSERT_TRUE(query_agg("esingle", TSDB_AGGREGATION_AVG, 100, &r));
+    TEST_ASSERT_EQUAL(3, r.num_points);
+
+    // AVG of a single point is the point itself
+    TEST_ASSERT_EQUAL_INT64(100, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(200, r.columns[0].values[1].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(300, r.columns[0].values[2].data.int_val);
+
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: rollup larger than data range", "[public_api][aggregation]") {
+    ensure_init();
+
+    // All data fits in one window (rollup=10000, data spans 200ms)
+    int64_t vals[]    = {10, 20, 30};
+    uint64_t ts[]     = {1000, 1100, 1200};
+    TEST_ASSERT_TRUE(insert_ints("ebig", "v", vals, ts, 3));
+
+    timeseries_query_result_t r;
+
+    // AVG: (10+20+30)/3 = 20
+    TEST_ASSERT_TRUE(query_agg("ebig", TSDB_AGGREGATION_AVG, 10000, &r));
+    TEST_ASSERT_EQUAL(1, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(20, r.columns[0].values[0].data.int_val);
+    timeseries_query_free_result(&r);
+
+    // MIN: 10
+    TEST_ASSERT_TRUE(query_agg("ebig", TSDB_AGGREGATION_MIN, 10000, &r));
+    TEST_ASSERT_EQUAL(1, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(10, r.columns[0].values[0].data.int_val);
+    timeseries_query_free_result(&r);
+
+    // MAX: 30
+    TEST_ASSERT_TRUE(query_agg("ebig", TSDB_AGGREGATION_MAX, 10000, &r));
+    TEST_ASSERT_EQUAL(1, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(30, r.columns[0].values[0].data.int_val);
+    timeseries_query_free_result(&r);
+
+    // SUM: 60
+    TEST_ASSERT_TRUE(query_agg("ebig", TSDB_AGGREGATION_SUM, 10000, &r));
+    TEST_ASSERT_EQUAL(1, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(60, r.columns[0].values[0].data.int_val);
+    timeseries_query_free_result(&r);
+
+    // COUNT: 3
+    TEST_ASSERT_TRUE(query_agg("ebig", TSDB_AGGREGATION_COUNT, 10000, &r));
+    TEST_ASSERT_EQUAL(1, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(3, r.columns[0].values[0].data.int_val);
+    timeseries_query_free_result(&r);
+
+    // LAST: 30
+    TEST_ASSERT_TRUE(query_agg("ebig", TSDB_AGGREGATION_LAST, 10000, &r));
+    TEST_ASSERT_EQUAL(1, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(30, r.columns[0].values[0].data.int_val);
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: empty windows are skipped", "[public_api][aggregation]") {
+    ensure_init();
+
+    // Data in window [1000,1500) and [5000,5500) with large gap between
+    // rollup=500 → many empty windows in the gap should be skipped
+    int64_t vals[]    = {10, 20, 30, 40};
+    uint64_t ts[]     = {1000, 1100, 5000, 5100};
+    TEST_ASSERT_TRUE(insert_ints("egap", "v", vals, ts, 4));
+
+    timeseries_query_result_t r;
+    TEST_ASSERT_TRUE(query_agg("egap", TSDB_AGGREGATION_AVG, 500, &r));
+
+    // Should get exactly 2 result points (empty windows skipped)
+    TEST_ASSERT_EQUAL(2, r.num_points);
+
+    // Window [1000,1500): avg(10,20) = 15
+    TEST_ASSERT_EQUAL_INT64(15, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_UINT64(1000, r.timestamps[0]);
+
+    // Window [5000,5500): avg(30,40) = 35
+    TEST_ASSERT_EQUAL_INT64(35, r.columns[0].values[1].data.int_val);
+    TEST_ASSERT_EQUAL_UINT64(5000, r.timestamps[1]);
+
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: AVG on BOOL data", "[public_api][aggregation]") {
+    ensure_init();
+
+    // Window [1000,1500): true, false, true → avg ≈ 0.67 → bool = true (>0.5)
+    // Window [1500,2000): false, false, true → avg ≈ 0.33 → bool = false (≤0.5)
+    bool vals[]       = {true, false, true, false, false, true};
+    uint64_t ts[]     = {1000, 1100, 1200, 1500, 1600, 1700};
+    TEST_ASSERT_TRUE(insert_bools("eavg_b", "v", vals, ts, 6));
+
+    timeseries_query_result_t r;
+    TEST_ASSERT_TRUE(query_agg("eavg_b", TSDB_AGGREGATION_AVG, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
+
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_BOOL, r.columns[0].values[0].type);
+    TEST_ASSERT_TRUE(r.columns[0].values[0].data.bool_val);   // 2/3 > 0.5
+    TEST_ASSERT_FALSE(r.columns[0].values[1].data.bool_val);  // 1/3 ≤ 0.5
+
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: MIN MAX on BOOL data", "[public_api][aggregation]") {
+    ensure_init();
+
+    // Window [1000,1500): true, false → min = false, max = true
+    // Window [1500,2000): true, true  → min = true, max = true
+    bool vals[]       = {true, false, true, true};
+    uint64_t ts[]     = {1000, 1100, 1500, 1600};
+    TEST_ASSERT_TRUE(insert_bools("emm_b", "v", vals, ts, 4));
+
+    timeseries_query_result_t r;
+
+    TEST_ASSERT_TRUE(query_agg("emm_b", TSDB_AGGREGATION_MIN, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_BOOL, r.columns[0].values[0].type);
+    TEST_ASSERT_FALSE(r.columns[0].values[0].data.bool_val);  // min(T,F) = F
+    TEST_ASSERT_TRUE(r.columns[0].values[1].data.bool_val);   // min(T,T) = T
+    timeseries_query_free_result(&r);
+
+    TEST_ASSERT_TRUE(query_agg("emm_b", TSDB_AGGREGATION_MAX, 500, &r));
+    TEST_ASSERT_EQUAL(2, r.num_points);
+    TEST_ASSERT_TRUE(r.columns[0].values[0].data.bool_val);   // max(T,F) = T
+    TEST_ASSERT_TRUE(r.columns[0].values[1].data.bool_val);   // max(T,T) = T
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: rollup_interval=0 returns raw points", "[public_api][aggregation]") {
+    ensure_init();
+
+    int64_t vals[]    = {10, 20, 30};
+    uint64_t ts[]     = {1000, 1100, 1200};
+    TEST_ASSERT_TRUE(insert_ints("eraw", "v", vals, ts, 3));
+
+    timeseries_query_result_t r;
+    TEST_ASSERT_TRUE(query_agg("eraw", TSDB_AGGREGATION_AVG, 0, &r));
+
+    // rollup_interval=0 → pass-through, all raw points returned
+    TEST_ASSERT_EQUAL(3, r.num_points);
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, r.columns[0].values[0].type);
+    TEST_ASSERT_EQUAL_INT64(10, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(20, r.columns[0].values[1].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(30, r.columns[0].values[2].data.int_val);
+
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: AVG rounding on INT", "[public_api][aggregation]") {
+    ensure_init();
+
+    // avg(1, 2) = 1.5 → rounds to 2 for INT (round to nearest)
+    int64_t vals[]    = {1, 2};
+    uint64_t ts[]     = {1000, 1100};
+    TEST_ASSERT_TRUE(insert_ints("eround", "v", vals, ts, 2));
+
+    timeseries_query_result_t r;
+    TEST_ASSERT_TRUE(query_agg("eround", TSDB_AGGREGATION_AVG, 500, &r));
+    TEST_ASSERT_EQUAL(1, r.num_points);
+    TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, r.columns[0].values[0].type);
+    TEST_ASSERT_EQUAL_INT64(2, r.columns[0].values[0].data.int_val);
+
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: three windows with unequal point counts", "[public_api][aggregation]") {
+    ensure_init();
+
+    // Window [1000,1500): 1 point  → value 100
+    // Window [1500,2000): 4 points → values 10, 20, 30, 40
+    // Window [2000,2500): 2 points → values 50, 60
+    int64_t vals[]    = {100, 10, 20, 30, 40, 50, 60};
+    uint64_t ts[]     = {1000, 1500, 1600, 1700, 1800, 2000, 2100};
+    TEST_ASSERT_TRUE(insert_ints("euneven", "v", vals, ts, 7));
+
+    timeseries_query_result_t r;
+
+    // AVG: 100, 25, 55
+    TEST_ASSERT_TRUE(query_agg("euneven", TSDB_AGGREGATION_AVG, 500, &r));
+    TEST_ASSERT_EQUAL(3, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(100, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(25, r.columns[0].values[1].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(55, r.columns[0].values[2].data.int_val);
+    timeseries_query_free_result(&r);
+
+    // COUNT: 1, 4, 2
+    TEST_ASSERT_TRUE(query_agg("euneven", TSDB_AGGREGATION_COUNT, 500, &r));
+    TEST_ASSERT_EQUAL(3, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(1, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(4, r.columns[0].values[1].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(2, r.columns[0].values[2].data.int_val);
+    timeseries_query_free_result(&r);
+
+    // SUM: 100, 100, 110
+    TEST_ASSERT_TRUE(query_agg("euneven", TSDB_AGGREGATION_SUM, 500, &r));
+    TEST_ASSERT_EQUAL(3, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(100, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(100, r.columns[0].values[1].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(110, r.columns[0].values[2].data.int_val);
+    timeseries_query_free_result(&r);
+
+    // MIN: 100, 10, 50
+    TEST_ASSERT_TRUE(query_agg("euneven", TSDB_AGGREGATION_MIN, 500, &r));
+    TEST_ASSERT_EQUAL(3, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(100, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(10, r.columns[0].values[1].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(50, r.columns[0].values[2].data.int_val);
+    timeseries_query_free_result(&r);
+
+    // MAX: 100, 40, 60
+    TEST_ASSERT_TRUE(query_agg("euneven", TSDB_AGGREGATION_MAX, 500, &r));
+    TEST_ASSERT_EQUAL(3, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(100, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(40, r.columns[0].values[1].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(60, r.columns[0].values[2].data.int_val);
+    timeseries_query_free_result(&r);
+
+    // LAST: 100, 40, 60
+    TEST_ASSERT_TRUE(query_agg("euneven", TSDB_AGGREGATION_LAST, 500, &r));
+    TEST_ASSERT_EQUAL(3, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(100, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(40, r.columns[0].values[1].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(60, r.columns[0].values[2].data.int_val);
+    timeseries_query_free_result(&r);
+}
+
+TEST_CASE("public_api: negative INT values aggregate correctly", "[public_api][aggregation]") {
+    ensure_init();
+
+    // Window [1000,1500): -10, -20, 5 → avg=-8(rounded), min=-20, max=5, sum=-25
+    int64_t vals[]    = {-10, -20, 5};
+    uint64_t ts[]     = {1000, 1100, 1200};
+    TEST_ASSERT_TRUE(insert_ints("eneg", "v", vals, ts, 3));
+
+    timeseries_query_result_t r;
+
+    TEST_ASSERT_TRUE(query_agg("eneg", TSDB_AGGREGATION_MIN, 500, &r));
+    TEST_ASSERT_EQUAL(1, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(-20, r.columns[0].values[0].data.int_val);
+    timeseries_query_free_result(&r);
+
+    TEST_ASSERT_TRUE(query_agg("eneg", TSDB_AGGREGATION_MAX, 500, &r));
+    TEST_ASSERT_EQUAL(1, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(5, r.columns[0].values[0].data.int_val);
+    timeseries_query_free_result(&r);
+
+    TEST_ASSERT_TRUE(query_agg("eneg", TSDB_AGGREGATION_SUM, 500, &r));
+    TEST_ASSERT_EQUAL(1, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(-25, r.columns[0].values[0].data.int_val);
+    timeseries_query_free_result(&r);
+
+    // AVG: (-10 + -20 + 5) / 3 = -8.333... → (int64_t)(-8.333+0.5) = (int64_t)(-7.833) = -7
+    TEST_ASSERT_TRUE(query_agg("eneg", TSDB_AGGREGATION_AVG, 500, &r));
+    TEST_ASSERT_EQUAL(1, r.num_points);
+    TEST_ASSERT_EQUAL_INT64(-7, r.columns[0].values[0].data.int_val);
     timeseries_query_free_result(&r);
 }
 
@@ -864,39 +1283,6 @@ TEST_CASE("public_api: delete then compact cleans up", "[public_api][delete]") {
 // ============================================================================
 // Additional edge case coverage
 // ============================================================================
-
-TEST_CASE("public_api: query with all aggregation methods on float", "[public_api][aggregation]") {
-    ensure_init();
-
-    // Insert float data: 1.0, 2.0, 3.0, 4.0, 5.0
-    TEST_ASSERT_TRUE(insert_floats("agg_float", "val", 10, 0, 100));
-
-    timeseries_aggregation_method_e methods[] = {
-        TSDB_AGGREGATION_MIN, TSDB_AGGREGATION_MAX, TSDB_AGGREGATION_AVG,
-        TSDB_AGGREGATION_SUM, TSDB_AGGREGATION_COUNT, TSDB_AGGREGATION_LAST
-    };
-    const char *names[] = {"MIN", "MAX", "AVG", "SUM", "COUNT", "LAST"};
-
-    for (int m = 0; m < 6; m++) {
-        timeseries_query_t q;
-        memset(&q, 0, sizeof(q));
-        q.measurement_name = "agg_float";
-        q.start_ms = 0;
-        q.end_ms = INT64_MAX;
-        q.rollup_interval = 500;
-        q.aggregate_method = methods[m];
-
-        timeseries_query_result_t r;
-        memset(&r, 0, sizeof(r));
-        bool ok = timeseries_query(&q, &r);
-        TEST_ASSERT_TRUE_MESSAGE(ok, names[m]);
-        TEST_ASSERT_TRUE(r.num_points > 0);
-        timeseries_query_free_result(&r);
-
-        ESP_LOGI(TAG, "Float %s: %" PRIu32 " aggregated points",
-                 names[m], (uint32_t)r.num_points);
-    }
-}
 
 TEST_CASE("public_api: clear_all then verify all APIs work", "[public_api][lifecycle]") {
     ensure_init();

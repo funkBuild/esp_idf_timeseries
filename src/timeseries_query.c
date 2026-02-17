@@ -812,9 +812,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
 
   size_t total_points_aggregated = 0;
 
-  // Example aggregator settings. In real usage, these might come from the
-  // query:
-  timeseries_aggregation_method_e agg_method = TSDB_AGGREGATION_AVG;
+  timeseries_aggregation_method_e agg_method = query->aggregate_method;
 
   for (size_t f = 0; f < num_fields; f++) {
     prof_temp = esp_timer_get_time();

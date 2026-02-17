@@ -36,22 +36,40 @@ static timeseries_db_t s_tsdb = {
 };
 static _Atomic bool s_init_in_progress = false;
 
-// Background compaction task
-static void tsdb_compaction_task(void *param) {
+// One-shot compaction task: runs compaction once, then exits
+static void tsdb_compaction_oneshot_task(void *param) {
     timeseries_db_t *db = (timeseries_db_t *)param;
-    ESP_LOGI(TAG, "Background compaction task started");
-    while (db->compaction_running) {
-        xSemaphoreTake(db->compaction_trigger, pdMS_TO_TICKS(30000));
-        if (!db->compaction_running) break;
-        atomic_store(&db->compaction_in_progress, true);
-        ESP_LOGI(TAG, "Background compaction triggered");
-        timeseries_compact_all_levels(db);
-        atomic_fetch_add(&db->compaction_generation, 1);
-        atomic_store(&db->compaction_in_progress, false);
-        ESP_LOGI(TAG, "Background compaction finished");
+    ESP_LOGI(TAG, "Compaction task started");
+    timeseries_compact_all_levels(db);
+    atomic_fetch_add(&db->compaction_generation, 1);
+    db->compaction_task_handle = NULL;
+    atomic_store(&db->compaction_in_progress, false);
+    ESP_LOGI(TAG, "Compaction task finished");
+
+    // Re-check L0 count - inserts during compaction may have accumulated new pages
+    size_t l0_count = tsdb_count_l0_pages(db);
+    if (l0_count >= MIN_PAGES_FOR_COMPACTION) {
+        ESP_LOGI(TAG, "Re-triggering compaction: %zu L0 pages accumulated", l0_count);
+        tsdb_launch_compaction(db);
     }
-    ESP_LOGI(TAG, "Background compaction task exiting");
+
     vTaskDelete(NULL);
+}
+
+bool tsdb_launch_compaction(timeseries_db_t *db) {
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&db->compaction_in_progress, &expected, true)) {
+        return false;  // already running
+    }
+    BaseType_t ret = xTaskCreate(tsdb_compaction_oneshot_task, "tsdb_compact",
+                                  12288, db, tskIDLE_PRIORITY + 1,
+                                  &db->compaction_task_handle);
+    if (ret != pdPASS) {
+        ESP_LOGW(TAG, "Failed to create compaction task");
+        atomic_store(&db->compaction_in_progress, false);
+        return false;
+    }
+    return true;
 }
 
 bool timeseries_init(void) {
@@ -86,8 +104,7 @@ bool timeseries_init(void) {
   s_tsdb.snapshot_mutex = xSemaphoreCreateMutex();
   s_tsdb.flash_write_mutex = xSemaphoreCreateMutex();
   s_tsdb.region_alloc_mutex = xSemaphoreCreateMutex();
-  s_tsdb.compaction_trigger = xSemaphoreCreateCounting(2, 0);
-  if (!s_tsdb.snapshot_mutex || !s_tsdb.flash_write_mutex || !s_tsdb.compaction_trigger || !s_tsdb.region_alloc_mutex) {
+  if (!s_tsdb.snapshot_mutex || !s_tsdb.flash_write_mutex || !s_tsdb.region_alloc_mutex) {
     ESP_LOGE(TAG, "Failed to create synchronization primitives");
     goto init_fail;
   }
@@ -151,20 +168,10 @@ bool timeseries_init(void) {
     s_tsdb.type_cache_size = 0;
   }
 
-  // Start background compaction task
-  s_tsdb.compaction_running = true;
+  // Initialize on-demand compaction state
   atomic_store(&s_tsdb.compaction_in_progress, false);
   atomic_store(&s_tsdb.compaction_generation, 0);
-  BaseType_t task_ret = xTaskCreate(tsdb_compaction_task, "tsdb_compact",
-                                     12288, &s_tsdb, tskIDLE_PRIORITY + 1,
-                                     &s_tsdb.compaction_task_handle);
-  if (task_ret != pdPASS) {
-    ESP_LOGW(TAG, "Failed to create background compaction task (will use synchronous compaction)");
-    s_tsdb.compaction_running = false;
-    s_tsdb.compaction_task_handle = NULL;
-  } else {
-    ESP_LOGI(TAG, "Background compaction task created");
-  }
+  s_tsdb.compaction_task_handle = NULL;
 
   s_tsdb.initialized = true;
   atomic_store(&s_init_in_progress, false);
@@ -189,10 +196,6 @@ init_fail:
   if (s_tsdb.region_alloc_mutex) {
     vSemaphoreDelete(s_tsdb.region_alloc_mutex);
     s_tsdb.region_alloc_mutex = NULL;
-  }
-  if (s_tsdb.compaction_trigger) {
-    vSemaphoreDelete(s_tsdb.compaction_trigger);
-    s_tsdb.compaction_trigger = NULL;
   }
   s_tsdb.partition = NULL;
   atomic_store(&s_init_in_progress, false);
@@ -350,9 +353,13 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
   ESP_LOGD(TAG, "Inserted %zu points in %zu fields for measurement '%s' in %.3f ms", data->num_points, data->num_fields,
            data->measurement_name, (end_time - start_time) / 1000.0);
 
-  // Suggest compaction for large inserts
-  if (data->num_points > 500) {
-    ESP_LOGI(TAG, "Large insert complete. Consider calling timeseries_compact() to optimize storage.");
+  // Auto-trigger background compaction when L0 page count is high enough
+  if (!any_field_failed && !atomic_load(&s_tsdb.compaction_in_progress)) {
+    size_t l0_count = tsdb_count_l0_pages(&s_tsdb);
+    if (l0_count >= MIN_PAGES_FOR_COMPACTION) {
+      ESP_LOGI(TAG, "Auto-triggering compaction: %zu L0 pages", l0_count);
+      tsdb_launch_compaction(&s_tsdb);
+    }
   }
 
   return !any_field_failed;
@@ -360,70 +367,39 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
 
 bool timeseries_compact(void) {
   if (!s_tsdb.initialized) {
-    ESP_LOGE(TAG, "Timeseries DB not initialized yet.");
     return false;
   }
-
-  if (s_tsdb.compaction_running && s_tsdb.compaction_task_handle) {
-    // Trigger background compaction
-    ESP_LOGV(TAG, "Triggering background compaction...");
-    xSemaphoreGive(s_tsdb.compaction_trigger);
-    return true;
-  }
-
-  // Fallback to synchronous compaction if background task isn't running
-  ESP_LOGV(TAG, "Starting synchronous compaction...");
-  if (!timeseries_compact_all_levels(&s_tsdb)) {
-    ESP_LOGE(TAG, "Compaction failed.");
-    return false;
-  }
-  ESP_LOGV(TAG, "Compaction complete.");
+  tsdb_launch_compaction(&s_tsdb);
   return true;
 }
 
 bool timeseries_compact_sync(void) {
   if (!s_tsdb.initialized) {
-    ESP_LOGE(TAG, "Timeseries DB not initialized yet.");
     return false;
   }
-
-  if (s_tsdb.compaction_running && s_tsdb.compaction_task_handle) {
-    // If compaction is already in-progress, we need to wait for TWO
-    // generation advances: the current in-flight run + our triggered run.
-    uint32_t gen_before = atomic_load(&s_tsdb.compaction_generation);
-    uint32_t wait_target = gen_before + 1;
-    if (atomic_load(&s_tsdb.compaction_in_progress)) {
-      wait_target = gen_before + 2;  // Wait for current + our run
-    }
-
-    // Trigger and wait for background compaction to complete
-    ESP_LOGV(TAG, "Triggering synchronous compaction via background task (gen=%u, target=%u)...",
-             gen_before, wait_target);
-    xSemaphoreGive(s_tsdb.compaction_trigger);
-
-    // Wait until the generation counter reaches the target
-    int timeout_ms = 60000;  // 60 second timeout
-    while (atomic_load(&s_tsdb.compaction_generation) < wait_target && timeout_ms > 0) {
+  // Wait for any in-progress compaction to finish
+  int timeout_ms = 60000;
+  while (atomic_load(&s_tsdb.compaction_in_progress) && timeout_ms > 0) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+    timeout_ms -= 10;
+  }
+  if (timeout_ms <= 0) {
+    return false;
+  }
+  // Claim the slot and run synchronously
+  bool expected = false;
+  if (!atomic_compare_exchange_strong(&s_tsdb.compaction_in_progress, &expected, true)) {
+    // Race: someone else claimed it. Wait for them.
+    while (atomic_load(&s_tsdb.compaction_in_progress) && timeout_ms > 0) {
       vTaskDelay(pdMS_TO_TICKS(10));
       timeout_ms -= 10;
     }
-    if (timeout_ms <= 0) {
-      ESP_LOGW(TAG, "compact_sync timed out waiting for compaction to complete");
-      return false;
-    }
-    ESP_LOGV(TAG, "Background compaction complete (sync wait done, gen=%u).",
-             atomic_load(&s_tsdb.compaction_generation));
-    return true;
+    return timeout_ms > 0;
   }
-
-  // Fallback to direct synchronous compaction
-  ESP_LOGV(TAG, "Starting synchronous compaction (no background task)...");
-  if (!timeseries_compact_all_levels(&s_tsdb)) {
-    ESP_LOGE(TAG, "Compaction failed.");
-    return false;
-  }
-  ESP_LOGV(TAG, "Compaction complete.");
-  return true;
+  bool ok = timeseries_compact_all_levels(&s_tsdb);
+  atomic_fetch_add(&s_tsdb.compaction_generation, 1);
+  atomic_store(&s_tsdb.compaction_in_progress, false);
+  return ok;
 }
 
 void timeseries_deinit(void) {
@@ -431,26 +407,14 @@ void timeseries_deinit(void) {
     return;
   }
 
-  // Stop background compaction task
-  if (s_tsdb.compaction_running && s_tsdb.compaction_task_handle) {
-    s_tsdb.compaction_running = false;
-    xSemaphoreGive(s_tsdb.compaction_trigger);  // Wake the task so it exits
-    // Wait for any in-progress compaction to finish, then for the task to exit
-    int wait_ms = 30000;
-    while (atomic_load(&s_tsdb.compaction_in_progress) && wait_ms > 0) {
-      vTaskDelay(pdMS_TO_TICKS(10));
-      wait_ms -= 10;
-    }
-    // Give the task a moment to call vTaskDelete after the loop exits
-    vTaskDelay(pdMS_TO_TICKS(50));
-    s_tsdb.compaction_task_handle = NULL;
+  // Wait for any in-progress compaction to finish
+  int wait_ms = 30000;
+  while (atomic_load(&s_tsdb.compaction_in_progress) && wait_ms > 0) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+    wait_ms -= 10;
   }
 
   // Delete synchronization primitives
-  if (s_tsdb.compaction_trigger) {
-    vSemaphoreDelete(s_tsdb.compaction_trigger);
-    s_tsdb.compaction_trigger = NULL;
-  }
   if (s_tsdb.flash_write_mutex) {
     vSemaphoreDelete(s_tsdb.flash_write_mutex);
     s_tsdb.flash_write_mutex = NULL;

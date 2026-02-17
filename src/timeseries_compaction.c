@@ -29,11 +29,6 @@
 static const char* TAG = "TimeseriesCompaction";
 
 /**
- * @brief Minimum number of pages needed at a level before compaction occurs.
- */
-#define MIN_PAGES_FOR_COMPACTION 4
-
-/**
  * @brief Maximum level we support in ascending compaction. Adjust as needed.
  */
 #define TSDB_MAX_LEVEL 4

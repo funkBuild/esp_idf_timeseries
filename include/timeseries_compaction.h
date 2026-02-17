@@ -37,6 +37,8 @@ typedef struct {
   uint32_t size;
 } tsdb_level_page_t;
 
+#define MIN_PAGES_FOR_COMPACTION 4
+
 typedef struct {
   uint32_t data_offset; // absolute offset to the record data (NOT including
                         // field_data_header_t)

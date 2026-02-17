@@ -179,20 +179,30 @@ finalize_aggregator(timeseries_aggregation_method_e method, double accumulator,
     }
     break;
 
-  case TSDB_AGGREGATION_AVG:
-    // always produce float
-    result.type = TIMESERIES_FIELD_TYPE_FLOAT;
-    result.data.float_val = accumulator / count;
+  case TSDB_AGGREGATION_AVG: {
+    double avg = accumulator / count;
+    // Preserve original type to match column type in query results
+    if (last_val->type == TIMESERIES_FIELD_TYPE_INT) {
+      result.type = TIMESERIES_FIELD_TYPE_INT;
+      result.data.int_val = (int64_t)(avg + 0.5); // round to nearest
+    } else if (last_val->type == TIMESERIES_FIELD_TYPE_BOOL) {
+      result.type = TIMESERIES_FIELD_TYPE_BOOL;
+      result.data.bool_val = (avg > 0.5);
+    } else {
+      result.type = TIMESERIES_FIELD_TYPE_FLOAT;
+      result.data.float_val = avg;
+    }
+    break;
+  }
+
+  case TSDB_AGGREGATION_COUNT:
+    result.type = TIMESERIES_FIELD_TYPE_INT;
+    result.data.int_val = (int64_t)count;
     break;
 
+  case TSDB_AGGREGATION_SUM:
   case TSDB_AGGREGATION_NONE:
-    // By convention, treat as SUM
-    // (you could do something else for "none")
-    /* fallthrough */
-  default:
-    // Summation
-    // If last_val was int or bool, produce an int sum (0 or 1 for bool).
-    // Otherwise float sum.
+    // Summation — preserve original type for int/bool
     if (last_val->type == TIMESERIES_FIELD_TYPE_INT ||
         last_val->type == TIMESERIES_FIELD_TYPE_BOOL) {
       int64_t sum_as_int = (int64_t)accumulator; // watch for overflow
@@ -202,6 +212,11 @@ finalize_aggregator(timeseries_aggregation_method_e method, double accumulator,
       result.type = TIMESERIES_FIELD_TYPE_FLOAT;
       result.data.float_val = accumulator;
     }
+    break;
+
+  default:
+    result.type = TIMESERIES_FIELD_TYPE_FLOAT;
+    result.data.float_val = accumulator;
     break;
   }
 
@@ -334,96 +349,110 @@ bool timeseries_multi_series_iterator_next(
 
   /*-----------------------------------------------------------------------------
    *  ENABLED ROLLUP => bucket-based aggregation
+   *  Skip empty windows — advance until we find a window with data or exhaust
+   *  all sub-iterators.
    *-----------------------------------------------------------------------------*/
-  uint64_t window_start = iter->current_window_start;
-  uint64_t window_end = iter->current_window_end;
+  while (true) {
+    uint64_t window_start = iter->current_window_start;
+    uint64_t window_end = iter->current_window_end;
 
-  double accumulator = 0.0;
-  double sample_count = 0.0;
-  double min_v = +1.0e38;
-  double max_v = -1.0e38;
-  timeseries_field_value_t last_val;
-  memset(&last_val, 0, sizeof(last_val));
+    double accumulator = 0.0;
+    double sample_count = 0.0;
+    double min_v = +1.0e38;
+    double max_v = -1.0e38;
+    timeseries_field_value_t last_val;
+    memset(&last_val, 0, sizeof(last_val));
 
-  // Gather points from each sub-iterator in [window_start, window_end)
-  for (size_t s = 0; s < iter->sub_count; s++) {
-    while (true) {
-      uint64_t ts_cur;
-      timeseries_field_value_t val_cur;
-      // Peek to check timestamp without consuming
-      if (!timeseries_multi_points_iterator_peek(iter->sub_iters[s], &ts_cur,
-                                                 &val_cur)) {
-        break;
-      }
-      if (ts_cur < window_start) {
-        // Skip old data -- consume the point and free any owned string
+    // Gather points from each sub-iterator in [window_start, window_end)
+    for (size_t s = 0; s < iter->sub_count; s++) {
+      while (true) {
+        uint64_t ts_cur;
+        timeseries_field_value_t val_cur;
+        // Peek to check timestamp without consuming
+        if (!timeseries_multi_points_iterator_peek(iter->sub_iters[s], &ts_cur,
+                                                   &val_cur)) {
+          break;
+        }
+        if (ts_cur < window_start) {
+          // Skip old data -- consume the point and free any owned string
+          (void)timeseries_multi_points_iterator_next(iter->sub_iters[s],
+                                                      &ts_cur, &val_cur);
+          if (val_cur.type == TIMESERIES_FIELD_TYPE_STRING) {
+            free(val_cur.data.string_val.str);
+            val_cur.data.string_val.str = NULL;
+          }
+          continue;
+        }
+        if (ts_cur >= window_end) {
+          break;
+        }
+
+        // Consume first to get properly deduplicated value with ownership,
+        // then feed to the aggregator.
         (void)timeseries_multi_points_iterator_next(iter->sub_iters[s], &ts_cur,
                                                     &val_cur);
-        if (val_cur.type == TIMESERIES_FIELD_TYPE_STRING) {
-          free(val_cur.data.string_val.str);
-          val_cur.data.string_val.str = NULL;
-        }
-        continue;
+
+        update_aggregator(iter->aggregator, &val_cur, &accumulator,
+                          &sample_count, &min_v, &max_v, &last_val);
       }
-      if (ts_cur >= window_end) {
-        break;
-      }
-
-      // Consume first to get properly deduplicated value with ownership,
-      // then feed to the aggregator.
-      (void)timeseries_multi_points_iterator_next(iter->sub_iters[s], &ts_cur,
-                                                  &val_cur);
-
-      update_aggregator(iter->aggregator, &val_cur, &accumulator, &sample_count,
-                        &min_v, &max_v, &last_val);
     }
-  }
 
-  // Finalize aggregator
-  timeseries_field_value_t aggregated = finalize_aggregator(
-      iter->aggregator, accumulator, sample_count, min_v, max_v, &last_val);
+    // Advance the window for the next call
+    iter->current_window_start += iter->rollup_interval;
+    iter->current_window_end += iter->rollup_interval;
 
-  // If the aggregator did not transfer last_val's string into the result
-  // (i.e. non-LAST aggregation on string data), free it to avoid a leak.
-  if (last_val.type == TIMESERIES_FIELD_TYPE_STRING &&
-      last_val.data.string_val.str != NULL) {
-    // Check if finalize_aggregator returned a different value (non-LAST path)
-    if (aggregated.type != TIMESERIES_FIELD_TYPE_STRING ||
-        aggregated.data.string_val.str != last_val.data.string_val.str) {
-      free(last_val.data.string_val.str);
-    }
-  }
-
-  // Output
-  if (out_ts) {
-    *out_ts = window_start;
-  }
-  if (out_val) {
-    *out_val = aggregated;
-  }
-
-  // Advance the window
-  iter->current_window_start += iter->rollup_interval;
-  iter->current_window_end += iter->rollup_interval;
-
-  // Check if there's more data
-  bool has_more_data = false;
-  for (size_t s = 0; s < iter->sub_count; s++) {
-    uint64_t ts_cur;
-    timeseries_field_value_t dummy;
-    if (timeseries_multi_points_iterator_peek(iter->sub_iters[s], &ts_cur,
-                                              &dummy)) {
-      if (ts_cur >= iter->current_window_start) {
+    // Check if there's more data beyond this window
+    bool has_more_data = false;
+    for (size_t s = 0; s < iter->sub_count; s++) {
+      uint64_t ts_cur;
+      timeseries_field_value_t dummy;
+      if (timeseries_multi_points_iterator_peek(iter->sub_iters[s], &ts_cur,
+                                                &dummy)) {
         has_more_data = true;
         break;
       }
     }
-  }
-  if (!has_more_data) {
-    iter->valid = false;
-  }
 
-  return true;
+    // If this window had no samples, skip it
+    if (sample_count <= 0 &&
+        iter->aggregator != TSDB_AGGREGATION_LAST) {
+      if (!has_more_data) {
+        iter->valid = false;
+        return false;
+      }
+      // Try the next window
+      continue;
+    }
+
+    // Finalize aggregator
+    timeseries_field_value_t aggregated = finalize_aggregator(
+        iter->aggregator, accumulator, sample_count, min_v, max_v, &last_val);
+
+    // If the aggregator did not transfer last_val's string into the result
+    // (i.e. non-LAST aggregation on string data), free it to avoid a leak.
+    if (last_val.type == TIMESERIES_FIELD_TYPE_STRING &&
+        last_val.data.string_val.str != NULL) {
+      // Check if finalize_aggregator returned a different value (non-LAST path)
+      if (aggregated.type != TIMESERIES_FIELD_TYPE_STRING ||
+          aggregated.data.string_val.str != last_val.data.string_val.str) {
+        free(last_val.data.string_val.str);
+      }
+    }
+
+    // Output
+    if (out_ts) {
+      *out_ts = window_start;
+    }
+    if (out_val) {
+      *out_val = aggregated;
+    }
+
+    if (!has_more_data) {
+      iter->valid = false;
+    }
+
+    return true;
+  }
 }
 
 /*-------------------------------------------------------------------------------------

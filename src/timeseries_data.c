@@ -12,6 +12,7 @@
 #include "freertos/task.h"
 
 #include <inttypes.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -78,8 +79,9 @@ bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
         tsdb_pagecache_batch_add(db->active_batch, region_ofs, &placeholder_hdr);
         tsdb_pagecache_batch_sort(db->active_batch);
     }
-    if (batch_snapshot && !db->active_batch) {
-        // Compaction is allocating but also needs the live snapshot updated
+    if (batch_snapshot) {
+        // Compaction is allocating - also register in live so insert's blank
+        // iterator sees the allocation and won't double-allocate the same region
         tsdb_pagecache_add_entry(db, region_ofs, &placeholder_hdr);
     }
 
@@ -263,14 +265,25 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
           ESP_LOGV(TAG, "No existing L0 pages => creating one...");
           uint32_t new_page_offset = 0;
           if (!create_level0_field_page(db, &new_page_offset)) {
-            // No space — trigger compaction and retry once
-            ESP_LOGW(TAG, "No space for L0 page, triggering compaction and retrying...");
+            // No space — run compaction synchronously and retry once
+            ESP_LOGW(TAG, "No space for L0 page, running compaction synchronously...");
             if (db->flash_write_mutex) {
               xSemaphoreGive(db->flash_write_mutex);
             }
-            if (db->compaction_trigger) {
-              xSemaphoreGive(db->compaction_trigger);
-              vTaskDelay(pdMS_TO_TICKS(100));
+            {
+              bool expected = false;
+              if (atomic_compare_exchange_strong(&db->compaction_in_progress, &expected, true)) {
+                timeseries_compact_all_levels(db);
+                atomic_fetch_add(&db->compaction_generation, 1);
+                atomic_store(&db->compaction_in_progress, false);
+              } else {
+                // Compaction already running, wait for it
+                int wait = 10000;
+                while (atomic_load(&db->compaction_in_progress) && wait > 0) {
+                  vTaskDelay(pdMS_TO_TICKS(10));
+                  wait -= 10;
+                }
+              }
             }
             if (db->flash_write_mutex) {
               xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
@@ -293,15 +306,25 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
                      count - remaining, count);
             uint32_t new_page_offset = 0;
             if (!create_level0_field_page(db, &new_page_offset)) {
-              // No space — trigger compaction and retry once
-              ESP_LOGW(TAG, "No space for new L0 page, triggering compaction and retrying...");
+              // No space — run compaction synchronously and retry once
+              ESP_LOGW(TAG, "No space for new L0 page, running compaction synchronously...");
               if (db->flash_write_mutex) {
                 xSemaphoreGive(db->flash_write_mutex);
               }
-              if (db->compaction_trigger) {
-                xSemaphoreGive(db->compaction_trigger);
-                // Wait briefly for compaction to free space
-                vTaskDelay(pdMS_TO_TICKS(100));
+              {
+                bool expected = false;
+                if (atomic_compare_exchange_strong(&db->compaction_in_progress, &expected, true)) {
+                  timeseries_compact_all_levels(db);
+                  atomic_fetch_add(&db->compaction_generation, 1);
+                  atomic_store(&db->compaction_in_progress, false);
+                } else {
+                  // Compaction already running, wait for it
+                  int wait = 10000;
+                  while (atomic_load(&db->compaction_in_progress) && wait > 0) {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    wait -= 10;
+                  }
+                }
               }
               if (db->flash_write_mutex) {
                 xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
@@ -345,6 +368,23 @@ static bool is_page_claimed_by_compaction(timeseries_db_t *db, uint32_t offset) 
         if (db->compaction_claimed_pages[i] == offset) return true;
     }
     return false;
+}
+
+size_t tsdb_count_l0_pages(timeseries_db_t *db) {
+    size_t count = 0;
+    timeseries_page_cache_iterator_t iter;
+    if (!timeseries_page_cache_iterator_init(db, &iter)) return 0;
+    timeseries_page_header_t hdr;
+    uint32_t offset, size;
+    while (timeseries_page_cache_iterator_next(&iter, &hdr, &offset, &size)) {
+        if (hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
+            hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE &&
+            hdr.field_data_level == 0) {
+            count++;
+        }
+    }
+    timeseries_page_cache_iterator_deinit(&iter);
+    return count;
 }
 
 /**
@@ -504,6 +544,18 @@ static bool create_level0_field_page(timeseries_db_t *db,
   // 3) Update the live snapshot cache entry with the real header
   // (replaces the placeholder registered by tsdb_reserve_blank_region)
   tsdb_pagecache_add_entry(db, blank_offset, &new_hdr);
+
+  // Also update the compaction batch if active, so the real header
+  // survives batch commit (tsdb_reserve_blank_region only wrote a placeholder)
+  if (db->region_alloc_mutex) {
+    xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
+  }
+  if (db->active_batch) {
+    tsdb_pagecache_batch_add(db->active_batch, blank_offset, &new_hdr);
+  }
+  if (db->region_alloc_mutex) {
+    xSemaphoreGive(db->region_alloc_mutex);
+  }
 
   *out_offset = blank_offset;
   ESP_LOGV(TAG, "Created new level-0 page @0x%08" PRIx32 " (size=%u bytes).",

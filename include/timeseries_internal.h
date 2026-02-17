@@ -229,10 +229,8 @@ typedef struct {
   uint32_t compaction_claimed_pages[TSDB_MAX_COMPACTION_CLAIMED_PAGES];
   size_t compaction_claimed_count;
 
-  // Background compaction
+  // On-demand compaction
   TaskHandle_t compaction_task_handle;
-  SemaphoreHandle_t compaction_trigger;
-  bool compaction_running;
   _Atomic bool compaction_in_progress;
   _Atomic uint32_t compaction_generation;  // Incremented after each compaction run
 
@@ -281,5 +279,12 @@ typedef struct {
   CompressedBuffer *cb;
   size_t offset;
 } DecoderContext;
+
+/**
+ * @brief Launch a one-shot compaction task (async).
+ * Returns false if compaction is already in progress or task creation fails.
+ */
+bool tsdb_launch_compaction(timeseries_db_t *db);
+size_t tsdb_count_l0_pages(timeseries_db_t *db);
 
 #endif // TIMESERIES_INTERNAL_H

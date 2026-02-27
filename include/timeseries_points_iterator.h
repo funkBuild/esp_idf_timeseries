@@ -50,9 +50,14 @@ typedef struct {
     string_array_t *string_array;
   };
 
-  // ********** ADD THESE FIELDS **********
-  // These store the decoding context so that incremental
-  // gorilla_decoder_get_* calls are valid across function calls.
+  // ALP decode state (non-NULL when encoding=ALP)
+  int64_t *alp_ts;
+  union {
+    double  *alp_float;
+    int64_t *alp_int;
+  };
+
+  // Gorilla decoder context (stores state across incremental decode calls)
   DecoderContext ts_decoder_context;
   DecoderContext val_decoder_context;
   CompressedBuffer ts_cb_storage;
@@ -67,7 +72,8 @@ typedef struct {
  */
 bool timeseries_points_iterator_init(
     timeseries_db_t *db, uint32_t record_data_offset, uint32_t record_length,
-    uint16_t record_count, timeseries_field_type_e series_type, bool compressed,
+    uint16_t record_count, timeseries_field_type_e series_type,
+    uint8_t data_flags,       // raw fd_hdr.flags byte (replaces bool compressed)
     timeseries_points_iterator_t *iter);
 
 /**

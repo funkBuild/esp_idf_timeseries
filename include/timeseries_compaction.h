@@ -39,13 +39,20 @@ typedef struct {
 
 #define MIN_PAGES_FOR_COMPACTION 4
 
+/* Maximum points per ALP record written during compaction.
+ * Bounded by the uint16_t record_count field in field_data_header_t.
+ * Configurable via Kconfig (CONFIG_TIMESERIES_ALP_CHUNK_MAX_POINTS) so test
+ * builds can use a small value to exercise the chunking code path without
+ * needing 65535+ data points. */
+#define TSDB_ALP_CHUNK_MAX_POINTS CONFIG_TIMESERIES_ALP_CHUNK_MAX_POINTS
+
 typedef struct {
   uint32_t data_offset; // absolute offset to the record data (NOT including
                         // field_data_header_t)
   uint16_t record_length;
   uint16_t record_count;
   timeseries_field_type_e field_type;
-  bool is_compressed;
+  uint8_t data_flags; // raw fd_hdr.flags byte (replaces bool is_compressed)
   uint32_t page_seq; // for multi-iterator merging
 } tsdb_record_descriptor_t;
 

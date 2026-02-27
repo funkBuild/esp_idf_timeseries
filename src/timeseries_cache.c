@@ -1,5 +1,6 @@
 #include "timeseries_cache.h"
 #include "esp_log.h"
+#include <inttypes.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -76,7 +77,7 @@ bool tsdb_cache_lookup_series_id(timeseries_db_t *db, const char *key,
       db->cache_stats.hits++;
 #endif
 
-      ESP_LOGV(TAG, "Cache HIT for key: %.32s... (index=%u)", key, index);
+      ESP_LOGV(TAG, "Cache HIT for key: %.32s... (index=%" PRIu32 ")", key, index);
       return true;
     }
 
@@ -115,7 +116,7 @@ void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
 #ifdef CONFIG_TIMESERIES_CACHE_USE_LRU
       entry->last_access = ++db->cache_access_counter;
 #endif
-      ESP_LOGV(TAG, "Cache UPDATE for key: %.32s... (index=%u)", key, index);
+      ESP_LOGV(TAG, "Cache UPDATE for key: %.32s... (index=%" PRIu32 ")", key, index);
       return;
     }
 
@@ -145,7 +146,7 @@ void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
       db->cache_stats.insertions++;
 #endif
 
-      ESP_LOGV(TAG, "Cache INSERT for key: %.32s... (index=%u)", key, index);
+      ESP_LOGV(TAG, "Cache INSERT for key: %.32s... (index=%" PRIu32 ")", key, index);
       return;
     }
   }
@@ -166,7 +167,7 @@ void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
 
   // Safety check: if no valid entries found, use start_index as fallback
   if (lru_index == SERIES_ID_CACHE_SIZE) {
-    ESP_LOGW(TAG, "No valid entries for LRU eviction, using start index %u", start_index);
+    ESP_LOGW(TAG, "No valid entries for LRU eviction, using start index %" PRIu32, start_index);
     lru_index = start_index;
   }
 #else
@@ -184,7 +185,7 @@ void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
   // Evict and replace
   series_id_cache_entry_t *entry = &db->series_cache[lru_index];
   if (entry->valid) {
-    ESP_LOGV(TAG, "Cache EVICT key: %.32s... from index=%u", entry->key, lru_index);
+    ESP_LOGV(TAG, "Cache EVICT key: %.32s... from index=%" PRIu32, entry->key, lru_index);
   }
 
   strncpy(entry->key, key, sizeof(entry->key) - 1);
@@ -200,7 +201,7 @@ void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
   db->cache_stats.insertions++;
 #endif
 
-  ESP_LOGV(TAG, "Cache INSERT after eviction for key: %.32s... (index=%u)", key, lru_index);
+  ESP_LOGV(TAG, "Cache INSERT after eviction for key: %.32s... (index=%" PRIu32 ")", key, lru_index);
 }
 
 void tsdb_cache_clear(timeseries_db_t *db) {
@@ -250,11 +251,11 @@ void tsdb_cache_log_stats(const timeseries_db_t *db) {
     (100.0f * db->cache_stats.hits / total_accesses) : 0.0f;
 
   ESP_LOGI(TAG, "Cache Statistics:");
-  ESP_LOGI(TAG, "  Hits:       %u", db->cache_stats.hits);
-  ESP_LOGI(TAG, "  Misses:     %u", db->cache_stats.misses);
+  ESP_LOGI(TAG, "  Hits:       %" PRIu32, db->cache_stats.hits);
+  ESP_LOGI(TAG, "  Misses:     %" PRIu32, db->cache_stats.misses);
   ESP_LOGI(TAG, "  Hit Rate:   %.1f%%", hit_rate);
-  ESP_LOGI(TAG, "  Insertions: %u", db->cache_stats.insertions);
-  ESP_LOGI(TAG, "  Evictions:  %u", db->cache_stats.evictions);
+  ESP_LOGI(TAG, "  Insertions: %" PRIu32, db->cache_stats.insertions);
+  ESP_LOGI(TAG, "  Evictions:  %" PRIu32, db->cache_stats.evictions);
 
   // Count valid entries
   uint32_t valid_entries = 0;
@@ -265,7 +266,7 @@ void tsdb_cache_log_stats(const timeseries_db_t *db) {
       }
     }
   }
-  ESP_LOGI(TAG, "  Occupancy:  %u/%d (%.1f%%)", valid_entries, SERIES_ID_CACHE_SIZE,
+  ESP_LOGI(TAG, "  Occupancy:  %" PRIu32 "/%d (%.1f%%)", valid_entries, SERIES_ID_CACHE_SIZE,
            100.0f * valid_entries / SERIES_ID_CACHE_SIZE);
 }
 #endif

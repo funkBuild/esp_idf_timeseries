@@ -10,16 +10,18 @@
 extern "C" {
 #endif
 
-// FillCallback: Called to fill the BitReader’s buffer.
+// FillCallback: Called to fill the BitReader's buffer.
 typedef bool (*FillCallback)(void *ctx, uint8_t *buffer, size_t len,
                              size_t *filled);
 
-// BitReader structure: manages bit-level input from a fill callback.
+// BitReader structure: manages bit-level input using a 64-bit window register.
+// The window holds the next bits to be read in its MSB positions.
 typedef struct {
-  uint8_t buffer[64]; // Internal buffer for up to 64 bytes (512 bits)
-  int buf_size;       // Number of bytes currently available in the buffer.
-  int byte_index;     // Current index into the buffer.
-  int bit_index;      // Bit offset in the current byte (0..7).
+  uint64_t window;    // bit window, MSB-first: next bit to read = bit 63
+  int window_bits;    // number of valid bits in window (in MSB positions)
+  uint8_t buffer[64]; // backing buffer from fill_cb
+  int buf_size;       // bytes available in buffer
+  int buf_byte;       // current read position in buffer
   FillCallback fill_cb;
   void *fill_ctx;
 } BitReader;
@@ -27,22 +29,77 @@ typedef struct {
 // Initialize the BitReader.
 void bitreader_init(BitReader *br, FillCallback fill_cb, void *fill_ctx);
 
-// Returns the number of bits available in the BitReader.
+// Returns the number of bits available in the BitReader (window + buffer).
 static inline int bitreader_available(const BitReader *br) {
-  return ((br->buf_size - br->byte_index) * 8) - br->bit_index;
+  return br->window_bits + (br->buf_size - br->buf_byte) * 8;
 }
 
-// Refill the BitReader’s buffer.
-// Moves any unread bytes to the beginning and then calls fill_cb
-// to load additional data.
+static inline bool br_next_byte(BitReader *br, uint8_t *b) {
+  if (br->buf_byte >= br->buf_size) {
+    size_t filled = 0;
+    if (!br->fill_cb(br->fill_ctx, br->buffer, 64, &filled))
+      return false;
+    if (filled == 0)
+      return false;
+    br->buf_size = (int)filled;
+    br->buf_byte = 0;
+  }
+  *b = br->buffer[br->buf_byte++];
+  return true;
+}
+
+static inline bool br_load_byte(BitReader *br) {
+  uint8_t b;
+  if (!br_next_byte(br, &b))
+    return false;
+  br->window |= ((uint64_t)b << (56 - br->window_bits));
+  br->window_bits += 8;
+  return true;
+}
+
+static inline bool br_fill_window(BitReader *br, int nbits) {
+  while (br->window_bits < nbits && br->window_bits <= 56) {
+    if (!br_load_byte(br))
+      return br->window_bits >= nbits;
+  }
+  return br->window_bits >= nbits;
+}
+
+static inline bool bitreader_read(BitReader *br, int nbits, uint64_t *out) {
+  if (nbits <= 0 || nbits > 64)
+    return false;
+  if (!br_fill_window(br, nbits)) {
+    int have = br->window_bits;
+    int need = nbits - have;
+    if (have <= 0)
+      return false;
+    uint64_t high_part = br->window >> (64 - have);
+    br->window = 0;
+    br->window_bits = 0;
+    if (!br_load_byte(br))
+      return false;
+    uint64_t low_part = br->window >> (64 - need);
+    br->window <<= need;
+    br->window_bits -= need;
+    *out = (high_part << need) | low_part;
+    return true;
+  }
+  if (nbits == 64) {
+    *out = br->window;
+    br->window = 0;
+  } else {
+    *out = br->window >> (64 - nbits);
+    br->window <<= nbits;
+  }
+  br->window_bits -= nbits;
+  return true;
+}
+
+// Refill the BitReader's buffer from the fill callback.
 bool bitreader_refill(BitReader *br);
 
 // Ensure that at least nbits are available in the BitReader.
 bool bitreader_ensure(BitReader *br, int nbits);
-
-// Read the next nbits (1 to 64) from the BitReader and store the result in
-// *out. Bits are read in the order they were written (MSB first).
-bool bitreader_read(BitReader *br, int nbits, uint64_t *out);
 
 // Peek at the next nbits without consuming them.
 bool bitreader_peek(BitReader *br, int nbits, uint64_t *out);

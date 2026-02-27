@@ -14,6 +14,7 @@
  * - Edge cases and error handling
  */
 
+#include <inttypes.h>
 #include "esp_log.h"
 #include "timeseries.h"
 #include "timeseries_internal.h"
@@ -934,7 +935,7 @@ TEST_CASE("cache behavior under stress test", "[cache][stress]") {
     TEST_ASSERT_LESS_OR_EQUAL(SERIES_ID_CACHE_SIZE, count_valid_cache_entries(db));
 
 #ifdef CONFIG_TIMESERIES_ENABLE_CACHE_STATS
-    ESP_LOGI(TAG, "Stress test stats - Hits: %u, Misses: %u, Insertions: %u, Evictions: %u",
+    ESP_LOGI(TAG, "Stress test stats - Hits: %" PRIu32 ", Misses: %" PRIu32 ", Insertions: %" PRIu32 ", Evictions: %" PRIu32,
              db->cache_stats.hits, db->cache_stats.misses,
              db->cache_stats.insertions, db->cache_stats.evictions);
 #endif

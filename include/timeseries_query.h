@@ -20,7 +20,7 @@ typedef struct field_record_info_t {
   uint64_t end_time;
   uint16_t record_count;
   uint16_t record_length;
-  bool compressed;
+  uint8_t data_flags;  // raw fd_hdr.flags byte (replaces bool compressed)
   struct field_record_info_t* next;
 } field_record_info_t;
 

@@ -91,4 +91,18 @@ bool timeseries_page_stream_writer_finalize(
 bool timeseries_page_stream_writer_finalize_timestamp(
     timeseries_page_stream_writer_t *writer);
 
+/**
+ * Write a pre-encoded ALP series directly to the page.
+ * Sets COMPRESSED flag and clears ENCODING_ALP flag bit in the field_data_header.
+ * Call instead of begin_series/write_timestamp/finalize_timestamp/write_value/end_series.
+ */
+bool timeseries_page_stream_writer_write_alp_series(
+    timeseries_page_stream_writer_t *sw,
+    const uint8_t series_id[16],
+    const uint8_t *ts_buf,  size_t ts_len,   // alp_encode_int output
+    const uint8_t *val_buf, size_t val_len,  // alp_encode / alp_encode_int output
+    uint16_t record_count,
+    uint64_t start_time,
+    uint64_t end_time);
+
 #endif // TIMESERIES_PAGE_STREAM_WRITER_H

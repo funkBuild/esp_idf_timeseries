@@ -165,10 +165,13 @@ static bool ensure_capacity(timeseries_page_stream_writer_t* writer, size_t need
     return true;  // enough space already
   }
 
-  // Need to relocate. Double capacity
+  // Need to relocate. Grow to exactly fit the request, rounded up to 4096.
+  // Invariant: needed_from_base > old_size (we only arrive here when
+  // end_needed > region_end), so new_size is always strictly > old_size.
   uint32_t old_offset = writer->base_offset;
   uint32_t old_size = writer->capacity;
-  uint32_t new_size = old_size + 4096;
+  uint32_t needed_from_base = end_needed - writer->base_offset;
+  uint32_t new_size = (needed_from_base + 4095u) & ~4095u;
   uint32_t new_offset = 0;
 
   ESP_LOGV(TAG, "Relocation needed: old=0x%08" PRIx32 " size %u => %u",
@@ -599,6 +602,87 @@ bool timeseries_page_stream_writer_end_series(timeseries_page_stream_writer_t* w
     ESP_LOGE(TAG, "Failed patching field_data_header");
     return false;
   }
+
+  return true;
+}
+
+bool timeseries_page_stream_writer_write_alp_series(
+    timeseries_page_stream_writer_t *sw,
+    const uint8_t series_id[16],
+    const uint8_t *ts_buf,  size_t ts_len,
+    const uint8_t *val_buf, size_t val_len,
+    uint16_t record_count,
+    uint64_t start_time,
+    uint64_t end_time) {
+  if (!sw || sw->finalized) {
+    return false;
+  }
+
+  // Validate record_length fits in uint16_t before touching flash.
+  uint32_t total_col = (uint32_t)(sizeof(timeseries_col_data_header_t) + ts_len + val_len);
+  if (total_col > 0xFFFF) {
+    ESP_LOGE(TAG, "ALP series record_length %u exceeds 16-bit limit", (unsigned)total_col);
+    return false;
+  }
+
+  size_t total = sizeof(timeseries_field_data_header_t) +
+                 sizeof(timeseries_col_data_header_t) + ts_len + val_len;
+
+  if (!ensure_capacity(sw, total)) {
+    ESP_LOGE(TAG, "ensure_capacity failed for ALP series (need %zu bytes)", total);
+    return false;
+  }
+
+  // Prepare field_data_header
+  timeseries_field_data_header_t fd_hdr;
+  memset(&fd_hdr, 0xff, sizeof(fd_hdr));
+  memcpy(fd_hdr.series_id, series_id, 16);
+  fd_hdr.record_count  = record_count;
+  fd_hdr.start_time    = start_time;
+  fd_hdr.end_time      = end_time;
+  fd_hdr.record_length = (uint16_t)total_col;
+  // Clear COMPRESSED bit (0 = compressed) and ENCODING_ALP bit (0 = ALP)
+  fd_hdr.flags &= ~(TSDB_FIELDDATA_FLAG_COMPRESSED | TSDB_FIELDDATA_FLAG_ENCODING_ALP);
+
+  // Write fd_hdr
+  uint32_t fd_offset = sw->write_ptr;
+  if (esp_partition_write(sw->db->partition, fd_offset, &fd_hdr, sizeof(fd_hdr)) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed writing ALP fd_hdr @0x%08" PRIx32, fd_offset);
+    return false;
+  }
+  sw->write_ptr += sizeof(fd_hdr);
+
+  // Write col_hdr
+  timeseries_col_data_header_t col_hdr;
+  col_hdr.ts_len  = (uint32_t)ts_len;
+  col_hdr.val_len = (uint32_t)val_len;
+  if (esp_partition_write(sw->db->partition, sw->write_ptr, &col_hdr, sizeof(col_hdr)) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed writing ALP col_hdr");
+    return false;
+  }
+  sw->write_ptr += sizeof(col_hdr);
+
+  // Write ALP timestamp blob
+  if (ts_len > 0) {
+    if (esp_partition_write(sw->db->partition, sw->write_ptr, ts_buf, ts_len) != ESP_OK) {
+      ESP_LOGE(TAG, "Failed writing ALP timestamp blob");
+      return false;
+    }
+    sw->write_ptr += ts_len;
+  }
+
+  // Write ALP value blob
+  if (val_len > 0) {
+    if (esp_partition_write(sw->db->partition, sw->write_ptr, val_buf, val_len) != ESP_OK) {
+      ESP_LOGE(TAG, "Failed writing ALP value blob");
+      return false;
+    }
+    sw->write_ptr += val_len;
+  }
+
+  ESP_LOGD(TAG, "ALP series %02X%02X%02X%02X: count=%u, ts_len=%zu, val_len=%zu, times=[%" PRIu64 "-%" PRIu64 "]",
+           series_id[0], series_id[1], series_id[2], series_id[3],
+           record_count, ts_len, val_len, start_time, end_time);
 
   return true;
 }

@@ -117,6 +117,10 @@ typedef struct {
  */
 #define TSDB_FIELDDATA_FLAG_DELETED 0x01
 #define TSDB_FIELDDATA_FLAG_COMPRESSED 0x02
+/* Encoding discriminator (NOR-flash convention: bit erased=1 → Gorilla, cleared=0 → ALP).
+ * Bit 2 = 1 (erased default) → Gorilla (all pre-existing pages, backward compat)
+ * Bit 2 = 0 (cleared)        → ALP (int64 timestamps + float64/int64 values) */
+#define TSDB_FIELDDATA_FLAG_ENCODING_ALP  0x04
 
 /**
  * @brief Header stored at the start of each *field data* record

@@ -23,6 +23,7 @@
 #include "timeseries_iterator.h"
 #include "timeseries_points_iterator.h"
 #include "unity.h"
+#include <inttypes.h>
 #include <math.h>
 #include <string.h>
 
@@ -239,7 +240,7 @@ TEST_CASE("iterator: page iterator with single page", "[iterator]") {
                      header.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA);
     TEST_ASSERT_TRUE(size > 0);
 
-    ESP_LOGI(TAG, "Found page: offset=0x%08X, size=%u, type=%u", offset, size,
+    ESP_LOGI(TAG, "Found page: offset=0x%08" PRIX32 ", size=%" PRIu32 ", type=%u", offset, size,
              header.page_type);
   }
 
@@ -584,7 +585,7 @@ TEST_CASE("iterator: blank iterator on empty database", "[iterator]") {
 
   while (timeseries_blank_iterator_next(&iter, &offset, &size)) {
     blank_count++;
-    ESP_LOGI(TAG, "Blank region %d: offset=0x%08X, size=%u", blank_count,
+    ESP_LOGI(TAG, "Blank region %d: offset=0x%08" PRIX32 ", size=%" PRIu32, blank_count,
              offset, size);
     TEST_ASSERT_TRUE(size >= 4096);
   }
@@ -611,7 +612,7 @@ TEST_CASE("iterator: blank iterator after data insertion", "[iterator]") {
 
   while (timeseries_blank_iterator_next(&iter, &offset, &size)) {
     blank_count++;
-    ESP_LOGI(TAG, "Blank region after insert: offset=0x%08X, size=%u", offset,
+    ESP_LOGI(TAG, "Blank region after insert: offset=0x%08" PRIX32 ", size=%" PRIu32, offset,
              size);
     TEST_ASSERT_TRUE(size >= 8192);
   }
@@ -636,7 +637,7 @@ TEST_CASE("iterator: blank iterator with large min_size", "[iterator]") {
   while (timeseries_blank_iterator_next(&iter, &offset, &size)) {
     blank_count++;
     TEST_ASSERT_TRUE(size >= large_min_size);
-    ESP_LOGI(TAG, "Large blank region: offset=0x%08X, size=%u", offset, size);
+    ESP_LOGI(TAG, "Large blank region: offset=0x%08" PRIX32 ", size=%" PRIu32, offset, size);
   }
 
   ESP_LOGI(TAG, "Large blank regions: %d", blank_count);
@@ -708,7 +709,7 @@ TEST_CASE("iterator: page cache iterator with data", "[iterator]") {
   while (timeseries_page_cache_iterator_next(&iter, &header, &offset, &size)) {
     active_pages++;
     TEST_ASSERT_EQUAL(TIMESERIES_PAGE_STATE_ACTIVE, header.page_state);
-    ESP_LOGI(TAG, "Active page %d: offset=0x%08X, size=%u, type=%u",
+    ESP_LOGI(TAG, "Active page %d: offset=0x%08" PRIX32 ", size=%" PRIu32 ", type=%u",
              active_pages, offset, size, header.page_type);
   }
 
@@ -1041,7 +1042,7 @@ TEST_CASE("iterator: detect off-by-one in page iteration", "[iterator][bug]") {
   while (timeseries_page_iterator_next(&iter, &header, &offset, &size)) {
     if (expected_next_offset > 0) {
       // Check for gaps or overlaps
-      ESP_LOGI(TAG, "Expected offset: 0x%08X, Actual: 0x%08X",
+      ESP_LOGI(TAG, "Expected offset: 0x%08" PRIX32 ", Actual: 0x%08" PRIX32,
                expected_next_offset, offset);
     }
     expected_next_offset = offset + size;
@@ -1104,7 +1105,7 @@ TEST_CASE("iterator: blank iterator contiguity check", "[iterator][bug]") {
 
   while (timeseries_blank_iterator_next(&iter, &offset, &size)) {
     region_count++;
-    ESP_LOGI(TAG, "Blank region %d: [0x%08X - 0x%08X] size=%u", region_count,
+    ESP_LOGI(TAG, "Blank region %d: [0x%08" PRIX32 " - 0x%08" PRIX32 "] size=%" PRIu32, region_count,
              offset, offset + size, size);
 
     // Blank regions should not overlap

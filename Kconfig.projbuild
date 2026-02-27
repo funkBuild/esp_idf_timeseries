@@ -49,4 +49,22 @@ menu "ESP IDF Timeseries Configuration"
             This buffer will grow as needed but starts at this size.
             Larger values reduce reallocations but use more memory.
 
+    config TIMESERIES_ALP_CHUNK_MAX_POINTS
+        int "Maximum points per ALP compaction record"
+        range 16 65535
+        default 1024
+        help
+            Maximum number of data points written into a single ALP-encoded
+            field_data record during compaction. The on-disk record_count field
+            is uint16_t, so 65535 is the hard upper limit. Lowering this value
+            causes the compaction code to split large series into multiple
+            consecutive records (chunking). This value also controls the peak
+            RAM used during compaction: the encoder allocates two arrays of
+            this many int64/double values (~16 bytes per point). At 1024 points
+            the peak allocation is ~16 KB for inputs plus ~18 KB for the encoded
+            output buffers — acceptable for ESP32 targets without PSRAM. Raising
+            this reduces the number of ALP records per series but increases
+            transient RAM use proportionally. Test builds may set a lower value
+            (e.g. 200) to exercise the chunking code path with small datasets.
+
 endmenu

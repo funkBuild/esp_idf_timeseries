@@ -5,6 +5,9 @@
 #include "gorilla/gorilla_stream_decoder.h"
 #include "timeseries_compression.h"
 #include "timeseries_data.h"
+#include "timeseries_internal.h"
+#include "alp/alp_decoder.h"
+#include "alp/alp_int_codec.h"
 
 #include <inttypes.h>
 #include <math.h>
@@ -41,7 +44,8 @@ static bool decoder_fill_callback(void *context, uint8_t *buffer,
  * --------------------------------------------------------------------------*/
 bool timeseries_points_iterator_init(
     timeseries_db_t *db, uint32_t record_data_offset, uint32_t record_length,
-    uint16_t record_count, timeseries_field_type_e series_type, bool compressed,
+    uint16_t record_count, timeseries_field_type_e series_type,
+    uint8_t data_flags,
     timeseries_points_iterator_t *iter) {
   if (!db || !iter) {
     return false;
@@ -52,6 +56,8 @@ bool timeseries_points_iterator_init(
   iter->ts_count = record_count;
   iter->series_type = series_type;
   iter->is_column_format = true;
+  // Derive compressed from flags: bit1=0 means compressed, bit1=1 means raw
+  bool compressed = (data_flags & TSDB_FIELDDATA_FLAG_COMPRESSED) == 0;
   iter->is_compressed = compressed;
   iter->current_idx = 0;
 
@@ -166,6 +172,100 @@ bool timeseries_points_iterator_init(
       iter->val_comp_buf = NULL;
       iter->valid = false;
       return false;
+    }
+
+    // Check if this record uses ALP encoding (bit2=0 means ALP)
+    bool use_alp = (data_flags & TSDB_FIELDDATA_FLAG_ENCODING_ALP) == 0;
+
+    if (use_alp) {
+      /* --- ALP decode path --- */
+      iter->alp_ts = (int64_t *)malloc(record_count * sizeof(int64_t));
+      if (!iter->alp_ts) {
+        ESP_LOGE(TAG, "OOM for ALP timestamp array of size %u", record_count);
+        free(iter->ts_comp_buf);
+        free(iter->val_comp_buf);
+        iter->ts_comp_buf = NULL;
+        iter->val_comp_buf = NULL;
+        iter->valid = false;
+        return false;
+      }
+      if (!alp_decode_int(iter->ts_comp_buf, iter->ts_comp_len,
+                          iter->alp_ts, record_count)) {
+        ESP_LOGE(TAG, "ALP timestamp decode failed");
+        free(iter->alp_ts);
+        free(iter->ts_comp_buf);
+        free(iter->val_comp_buf);
+        iter->alp_ts = NULL;
+        iter->ts_comp_buf = NULL;
+        iter->val_comp_buf = NULL;
+        iter->valid = false;
+        return false;
+      }
+
+      if (series_type == TIMESERIES_FIELD_TYPE_FLOAT) {
+        iter->alp_float = (double *)malloc(record_count * sizeof(double));
+        if (!iter->alp_float) {
+          ESP_LOGE(TAG, "OOM for ALP float array of size %u", record_count);
+          free(iter->alp_ts);
+          free(iter->ts_comp_buf);
+          free(iter->val_comp_buf);
+          iter->alp_ts = NULL;
+          iter->ts_comp_buf = NULL;
+          iter->val_comp_buf = NULL;
+          iter->valid = false;
+          return false;
+        }
+        if (!alp_decode(iter->val_comp_buf, iter->val_comp_len,
+                        iter->alp_float, record_count)) {
+          ESP_LOGE(TAG, "ALP float value decode failed");
+          free(iter->alp_ts);
+          free(iter->alp_float);
+          free(iter->ts_comp_buf);
+          free(iter->val_comp_buf);
+          iter->alp_ts = NULL;
+          iter->alp_float = NULL;
+          iter->ts_comp_buf = NULL;
+          iter->val_comp_buf = NULL;
+          iter->valid = false;
+          return false;
+        }
+      } else { /* INT */
+        iter->alp_int = (int64_t *)malloc(record_count * sizeof(int64_t));
+        if (!iter->alp_int) {
+          ESP_LOGE(TAG, "OOM for ALP int array of size %u", record_count);
+          free(iter->alp_ts);
+          free(iter->ts_comp_buf);
+          free(iter->val_comp_buf);
+          iter->alp_ts = NULL;
+          iter->ts_comp_buf = NULL;
+          iter->val_comp_buf = NULL;
+          iter->valid = false;
+          return false;
+        }
+        if (!alp_decode_int(iter->val_comp_buf, iter->val_comp_len,
+                            iter->alp_int, record_count)) {
+          ESP_LOGE(TAG, "ALP int value decode failed");
+          free(iter->alp_ts);
+          free(iter->alp_int);
+          free(iter->ts_comp_buf);
+          free(iter->val_comp_buf);
+          iter->alp_ts = NULL;
+          iter->alp_int = NULL;
+          iter->ts_comp_buf = NULL;
+          iter->val_comp_buf = NULL;
+          iter->valid = false;
+          return false;
+        }
+      }
+
+      // Compressed buffers consumed; free them now
+      free(iter->ts_comp_buf);
+      free(iter->val_comp_buf);
+      iter->ts_comp_buf = NULL;
+      iter->val_comp_buf = NULL;
+
+      ESP_LOGD(TAG, "Iterator init: ALP, record_count=%u", record_count);
+      return iter->valid;
     }
 
     // Now initialize Gorilla decoders (timestamps + values)
@@ -474,7 +574,11 @@ bool timeseries_points_iterator_next_timestamp(
     return false;
   }
 
-  if (iter->is_compressed) {
+  if (iter->alp_ts) {
+    // ALP path: read from decoded array; index advances in next_value
+    *out_timestamp = (uint64_t)iter->alp_ts[iter->current_idx];
+    return true;
+  } else if (iter->is_compressed) {
     // Gorilla-decoded approach
     if (!gorilla_decoder_get_timestamp(&iter->ts_decoder, out_timestamp)) {
       ESP_LOGE(TAG, "Failed to decode next timestamp at idx=%u",
@@ -487,7 +591,7 @@ bool timeseries_points_iterator_next_timestamp(
     *out_timestamp = iter->ts_array[iter->current_idx];
   }
 
-  // Bump index
+  // Bump index (Gorilla and raw paths; ALP index is bumped in next_value)
   iter->current_idx++;
   return true;
 }
@@ -500,17 +604,32 @@ bool timeseries_points_iterator_next_value(
   if (!iter || !iter->valid) {
     return false;
   }
-
-  // The simplest approach: we treat the last read TS index as current_idx - 1
-  uint16_t idx = (uint16_t)(iter->current_idx - 1);
-  if (idx >= iter->ts_count) {
-    return false;
-  }
   if (!out_value) {
     return false;
   }
 
   out_value->type = iter->series_type;
+
+  // ALP path: check BEFORE idx computation because next_timestamp does not
+  // advance current_idx for ALP (it advances in next_value instead).
+  if (iter->alp_ts) {
+    if (iter->current_idx >= iter->ts_count) {
+      return false;
+    }
+    size_t i = iter->current_idx++;
+    if (iter->series_type == TIMESERIES_FIELD_TYPE_FLOAT) {
+      out_value->data.float_val = iter->alp_float[i];
+    } else {
+      out_value->data.int_val = iter->alp_int[i];
+    }
+    return true;
+  }
+
+  // For non-ALP paths, next_timestamp already advanced current_idx.
+  uint16_t idx = (uint16_t)(iter->current_idx - 1);
+  if (idx >= iter->ts_count) {
+    return false;
+  }
 
   // If uncompressed:
   if (!iter->is_compressed) {
@@ -625,8 +744,17 @@ void timeseries_points_iterator_deinit(timeseries_points_iterator_t *iter) {
     return;
   }
 
-  if (iter->is_compressed) {
-    // Deinit gorilla decoders + free buffers
+  if (iter->alp_ts) {
+    // ALP path: free decoded arrays (comp bufs were freed in init)
+    free(iter->alp_ts);
+    iter->alp_ts = NULL;
+    if (iter->alp_float) {
+      // Union covers alp_int too; only one free needed
+      free(iter->alp_float);
+      iter->alp_float = NULL;
+    }
+  } else if (iter->is_compressed) {
+    // Gorilla path: deinit decoders + free buffers
     gorilla_decoder_deinit(&iter->ts_decoder);
     gorilla_decoder_deinit(&iter->val_decoder);
     if (iter->ts_comp_buf) {

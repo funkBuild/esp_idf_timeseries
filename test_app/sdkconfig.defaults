@@ -41,3 +41,8 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # Compiler Optimization - Use O2 for performance testing
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# ALP chunk size: lowered from 65535 to 200 so tests can exercise the chunking
+# code path (series split across multiple ALP records) without needing 65535+
+# data points per compaction run.
+CONFIG_TIMESERIES_ALP_CHUNK_MAX_POINTS=200

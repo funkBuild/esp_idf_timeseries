@@ -38,6 +38,7 @@ FloatStreamEncoder *float_stream_encoder_create(FlushCallback flush_cb,
   return enc;
 }
 
+__attribute__((optimize("O3")))
 bool float_stream_encoder_add_value(FloatStreamEncoder *enc, double value) {
   if (!enc)
     return false;
@@ -76,14 +77,14 @@ bool float_stream_encoder_add_value(FloatStreamEncoder *enc, double value) {
 
       enc->data_bits = 64 - lzb - tzb;
 
-      if (!bitwriter_write(&enc->bw, 0b11, 2)) {
-        return false;
-      }
-
       uint64_t header = (((uint64_t)lzb) << 6) |
                         (((enc->data_bits != 64) ? enc->data_bits : 0) & 0x3F);
 
-      if (!bitwriter_write(&enc->bw, header, 11))
+      /* Merge 2-bit control (0b11) and 11-bit header into one 13-bit write.
+       * Bit layout (MSB first in stream): [11][11][header_10..header_0]
+       * Control bits occupy the top 2 positions; header occupies bits 10:0. */
+      uint64_t ctrl_hdr = (0b11ULL << 11) | (header & 0x7FFULL);
+      if (!bitwriter_write(&enc->bw, ctrl_hdr, 13))
         return false;
 
       enc->prev_lzb = lzb;

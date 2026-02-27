@@ -38,6 +38,7 @@ FloatStreamDecoder *float_stream_decoder_create(FillCallback fill_cb,
   return dec;
 }
 
+__attribute__((optimize("O3")))
 bool float_stream_decoder_get_value(FloatStreamDecoder *dec, double *value) {
   if (!dec || !value)
     return false;
@@ -51,12 +52,13 @@ bool float_stream_decoder_get_value(FloatStreamDecoder *dec, double *value) {
     return true;
   }
 
-  // Read the first control bit.
-  uint64_t flag;
-  if (!bitreader_read(&dec->br, 1, &flag))
+  // Read two control bits at once for efficiency.
+  // Codes: 0x (first bit 0) => XOR==0; 10 => reuse header; 11 => new header.
+  uint64_t ctrl;
+  if (!bitreader_read(&dec->br, 1, &ctrl))
     return false;
 
-  if (flag == 0) {
+  if (ctrl == 0) {
     // Control bit 0: XOR==0, no change.
     // Nothing further to read.
   } else {

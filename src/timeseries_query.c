@@ -10,6 +10,7 @@
 
 #include "esp_log.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -580,7 +581,7 @@ static bool field_record_list_append(field_record_info_t **list,
   new_node->end_time = fdh->end_time;
   new_node->record_count = fdh->record_count;
   new_node->record_length = fdh->record_length;
-  new_node->compressed = (fdh->flags & TSDB_FIELDDATA_FLAG_COMPRESSED) == 0;
+  new_node->data_flags = fdh->flags;
   new_node->next = NULL;
 
   // 4) Insert into singly linked list in ascending order by start_time
@@ -930,11 +931,11 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
           continue;
         }
         // Debug: log the actual offset being used
-        ESP_LOGV(TAG, "Initializing points_iter: absolute_offset=0x%08X, length=%u, count=%u",
+        ESP_LOGV(TAG, "Initializing points_iter: absolute_offset=0x%08" PRIX32 ", length=%" PRIu16 ", count=%" PRIu16,
                  rec->record_offset, rec->record_length, rec->record_count);
         bool ok = timeseries_points_iterator_init(
             db, rec->record_offset, rec->record_length,
-            rec->record_count, field_type, rec->compressed, pit);
+            rec->record_count, field_type, rec->data_flags, pit);
         if (!ok) {
           ESP_LOGW(TAG, "Failed init of points_iter offset=0x%08X, length=%u, count=%u, type=%d",
                    (unsigned)(rec->record_offset),

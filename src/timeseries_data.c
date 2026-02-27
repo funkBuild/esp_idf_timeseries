@@ -243,7 +243,7 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
       if (find_level0_page_with_space(db, bytes_needed, &any_l0_exists,
                                       &page_offset, &used_offset)) {
         // We have space => write
-        ESP_LOGV(TAG, "Writing %zu points to page @0x%08X (bytes needed: %zu)",
+        ESP_LOGV(TAG, "Writing %zu points to page @0x%08" PRIX32 " (bytes needed: %zu)",
                  npoints_possible, page_offset, bytes_needed);
         if (!write_points_to_page(db, page_offset, used_offset, series_id,
                                   timestamps + idx, values + idx,
@@ -337,7 +337,7 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
                 return false;
               }
             }
-            ESP_LOGV(TAG, "Created new L0 page @0x%08X", new_page_offset);
+            ESP_LOGV(TAG, "Created new L0 page @0x%08" PRIX32, new_page_offset);
             continue;
           } else {
             // reduce npoints_possible

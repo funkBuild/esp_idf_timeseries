@@ -20,6 +20,7 @@
 #include "timeseries_iterator.h"
 #include "timeseries_page_cache.h"
 #include "unity.h"
+#include <inttypes.h>
 #include <string.h>
 
 static const char *TAG = "ExpirationTest";
@@ -189,7 +190,7 @@ static float get_current_usage(timeseries_db_t *db) {
 /**
  * @brief Count how many field data records have been marked as deleted
  */
-static size_t count_deleted_records(timeseries_db_t *db) {
+static size_t __attribute__((unused)) count_deleted_records(timeseries_db_t *db) {
   size_t count = 0;
 
   timeseries_page_cache_iterator_t page_iter;
@@ -664,7 +665,7 @@ TEST_CASE("expiration: storage reclamation verification", "[expiration]") {
   uint32_t used_before = tsdb_pagecache_get_total_active_size(db);
   size_t records_before = count_active_field_data_records(db);
 
-  ESP_LOGI(TAG, "Used space before: %u bytes, Records: %zu", used_before,
+  ESP_LOGI(TAG, "Used space before: %" PRIu32 " bytes, Records: %zu", used_before,
            records_before);
 
   // Run expiration with threshold below actual usage
@@ -685,9 +686,9 @@ TEST_CASE("expiration: storage reclamation verification", "[expiration]") {
   uint32_t used_after = tsdb_pagecache_get_total_active_size(db);
   size_t records_after = count_active_field_data_records(db);
 
-  ESP_LOGI(TAG, "Used space after: %u bytes, Records: %zu", used_after,
+  ESP_LOGI(TAG, "Used space after: %" PRIu32 " bytes, Records: %zu", used_after,
            records_after);
-  ESP_LOGI(TAG, "Space reclaimed: %u bytes", used_before - used_after);
+  ESP_LOGI(TAG, "Space reclaimed: %" PRIu32 " bytes", used_before - used_after);
 
   // After compaction, used space should be less (deleted records removed)
   // Note: Space might not reduce if pages are still partially full

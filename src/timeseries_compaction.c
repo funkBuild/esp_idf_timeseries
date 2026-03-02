@@ -165,6 +165,48 @@ bool timeseries_compact_all_levels(timeseries_db_t* db) {
   return true;
 }
 
+bool timeseries_compact_all_levels_force(timeseries_db_t* db) {
+  if (!db) {
+    return false;
+  }
+
+  for (uint8_t from_level = 0; from_level < TSDB_MAX_LEVEL; from_level++) {
+    uint8_t to_level = (uint8_t)(from_level + 1);
+
+    tsdb_level_page_t* pages = NULL;
+    size_t page_count = 0;
+    if (!tsdb_find_level_pages(db, from_level, &pages, &page_count)) {
+      free(pages);
+      ESP_LOGE(TAG, "Failed listing pages at level %u", from_level);
+      return false;
+    }
+
+    if (page_count < 1) {
+      free(pages);
+      continue;
+    }
+    free(pages);
+
+    int64_t start_time = esp_timer_get_time();
+
+    if (!timeseries_compact_level_pages(db, from_level, to_level)) {
+      ESP_LOGE(TAG, "Force compaction from level %u to %u failed.", from_level, to_level);
+      return false;
+    }
+
+    int64_t end_time = esp_timer_get_time();
+    ESP_LOGI(TAG, "Force compaction from level %u to %u took %.3f ms", from_level, to_level,
+             (end_time - start_time) / 1000.0);
+  }
+
+  uint32_t used_space = tsdb_pagecache_get_total_active_size(db);
+  ESP_LOGI(TAG, "Total used space after force compact: %u KB, %.2f%%",
+           (unsigned int)(used_space / 1024),
+           100.0f * used_space / db->partition->size);
+
+  return true;
+}
+
 static bool gather_unique_series_ids(timeseries_db_t* db, const tsdb_level_page_t* pages, size_t page_count,
                                      tsdb_series_id_list_t* out_ids) {
   memset(out_ids, 0, sizeof(*out_ids));
@@ -189,6 +231,7 @@ static bool gather_unique_series_ids(timeseries_db_t* db, const tsdb_level_page_
                fd_hdr.flags, fd_hdr.record_count, pg->offset);
       append_if_not_found_in_list(&out_ids->list, &out_ids->count, &out_ids->capacity, fd_hdr.series_id);
     }
+    timeseries_fielddata_iterator_deinit(&f_iter);
   }
   return true;
 }
@@ -254,6 +297,7 @@ static bool collect_points_for_series(timeseries_db_t* db, const tsdb_level_page
               }
             }
             timeseries_points_iterator_deinit(&pts_iter);
+            timeseries_fielddata_iterator_deinit(&f_iter);
             return false;
           }
           *out_pts = tmp;
@@ -269,6 +313,7 @@ static bool collect_points_for_series(timeseries_db_t* db, const tsdb_level_page
       }
       timeseries_points_iterator_deinit(&pts_iter);
     }
+    timeseries_fielddata_iterator_deinit(&f_iter);
   }
   return true;
 }
@@ -821,6 +866,11 @@ static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t sour
         tsdb_pagecache_remove_entry(db, pofs);
       }
 
+      // Decrement tracked L0 page count
+      if (source_level == 0) {
+        atomic_fetch_sub(&db->l0_page_count, 1);
+      }
+
       ESP_LOGI(TAG, "Removed page @0x%08" PRIx32 " from cache", pofs);
     } else {
       ESP_LOGW(TAG, "Skipping page @0x%08" PRIx32 " (not an active level-%u field-data page).", pofs, source_level);
@@ -967,6 +1017,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
             size_t newcap = (S->record_capacity == 0) ? 4 : (S->record_capacity * 2);
             tsdb_record_descriptor_t* grow = realloc(S->records, newcap * sizeof(tsdb_record_descriptor_t));
             if (!grow) {
+              timeseries_fielddata_iterator_deinit(&f_iter);
               goto series_map_cleanup;
             }
             S->records = grow;
@@ -984,6 +1035,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
           size_t newcap = (series_map_cap == 0) ? 4 : (series_map_cap * 2);
           tsdb_series_descriptors_t* grow = realloc(series_map, newcap * sizeof(tsdb_series_descriptors_t));
           if (!grow) {
+            timeseries_fielddata_iterator_deinit(&f_iter);
             goto series_map_cleanup;
           }
           series_map = grow;
@@ -995,6 +1047,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
         series_map[series_map_used].record_capacity = 4;
         series_map[series_map_used].records = calloc(4, sizeof(tsdb_record_descriptor_t));
         if (!series_map[series_map_used].records) {
+          timeseries_fielddata_iterator_deinit(&f_iter);
           goto series_map_cleanup;
         }
         series_map[series_map_used].records[0] = desc;
@@ -1004,6 +1057,7 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
       ESP_LOGV(TAG, "Added seriesId=%.2X%.2X%.2X%.2X... to map", fd_hdr.series_id[0], fd_hdr.series_id[1],
                fd_hdr.series_id[2], fd_hdr.series_id[3]);
     }  // end while
+    timeseries_fielddata_iterator_deinit(&f_iter);
 
     ESP_LOGV(TAG, "Read %u records from page", records_read);
   }
@@ -1376,6 +1430,7 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_
              (unsigned int)old_page_ofs, (unsigned int)fd_hdr.record_count, (unsigned int)fd_hdr.record_length,
              (unsigned int)f_iter.current_record_offset);
   }
+  timeseries_fielddata_iterator_deinit(&f_iter);
 
   ESP_LOGI(TAG, "Page @0x%08X: total_records=%u, total_data_size=%u", (unsigned int)old_page_ofs,
            (unsigned int)total_records, (unsigned int)total_data_size);
@@ -1410,11 +1465,13 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_
       // Write the record into the new page.
       if (!timeseries_page_rewriter_write_field_data(&rewriter, old_page_ofs, f_iter.current_record_offset, &fd_hdr)) {
         ESP_LOGE(TAG, "Failed writing field data to new page @0x%08X", (unsigned int)rewriter.base_offset);
+        timeseries_fielddata_iterator_deinit(&f_iter);
         timeseries_page_rewriter_abort(&rewriter);
         if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
         return false;
       }
     }
+    timeseries_fielddata_iterator_deinit(&f_iter);
 
     // 6) Finalize the new page.
     if (!timeseries_page_rewriter_finalize(&rewriter)) {
@@ -1436,6 +1493,11 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_
 
   // Remove the old page from the cache.
   tsdb_pagecache_remove_entry(db, old_page_ofs);
+
+  // Decrement tracked L0 page count
+  if (level == 0) {
+    atomic_fetch_sub(&db->l0_page_count, 1);
+  }
 
   ESP_LOGI(TAG, "Page @0x%08X compacted into new page", (unsigned int)old_page_ofs);
   return true;

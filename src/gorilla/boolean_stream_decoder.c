@@ -14,6 +14,18 @@ BooleanStreamDecoder *boolean_stream_decoder_create(FillCallback fill_cb,
   return dec;
 }
 
+BooleanStreamDecoder *boolean_stream_decoder_create_direct(const uint8_t *data,
+                                                           size_t size) {
+  if (!data || size == 0)
+    return NULL;
+  BooleanStreamDecoder *dec =
+      (BooleanStreamDecoder *)malloc(sizeof(BooleanStreamDecoder));
+  if (!dec)
+    return NULL;
+  bitreader_init_direct(&dec->br, data, size);
+  return dec;
+}
+
 bool boolean_stream_decoder_get_value(BooleanStreamDecoder *dec, bool *value) {
   if (!dec || !value)
     return false;

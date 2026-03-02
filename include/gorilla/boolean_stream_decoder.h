@@ -18,6 +18,10 @@ typedef struct {
 BooleanStreamDecoder *boolean_stream_decoder_create(FillCallback fill_cb,
                                                     void *fill_ctx);
 
+// Creates a BooleanStreamDecoder in direct pointer mode (zero-copy).
+BooleanStreamDecoder *boolean_stream_decoder_create_direct(const uint8_t *data,
+                                                           size_t size);
+
 // Reads a single boolean value (1 bit) into *value.
 // Returns true on success, false on failure.
 bool boolean_stream_decoder_get_value(BooleanStreamDecoder *dec, bool *value);

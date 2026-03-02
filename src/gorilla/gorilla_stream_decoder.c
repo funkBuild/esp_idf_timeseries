@@ -54,6 +54,39 @@ bool gorilla_decoder_init(gorilla_decoder_stream_t *decoder,
   return true;
 }
 
+bool gorilla_decoder_init_direct(gorilla_decoder_stream_t *decoder,
+                                 gorilla_stream_type_t stream_type,
+                                 const uint8_t *data, size_t size) {
+  if (!decoder || !data || size == 0) {
+    return false;
+  }
+
+  decoder->stream_type = stream_type;
+  decoder->fill_cb = NULL;
+  decoder->fill_ctx = NULL;
+  decoder->decoder_impl = NULL;
+
+  if (stream_type == GORILLA_STREAM_INT) {
+    decoder->decoder_impl =
+        (void *)integer_stream_decoder_create_direct(data, size);
+  } else if (stream_type == GORILLA_STREAM_FLOAT) {
+    decoder->decoder_impl =
+        (void *)float_stream_decoder_create_direct(data, size);
+  } else if (stream_type == GORILLA_STREAM_BOOL) {
+    decoder->decoder_impl =
+        (void *)boolean_stream_decoder_create_direct(data, size);
+  } else if (stream_type == GORILLA_STREAM_STRING) {
+    // String decoder uses zlib + its own fill callback — no direct mode yet
+    ESP_LOGE(TAG, "Direct mode not supported for STRING streams");
+    return false;
+  }
+
+  if (!decoder->decoder_impl) {
+    return false;
+  }
+  return true;
+}
+
 bool gorilla_decoder_get_timestamp(gorilla_decoder_stream_t *decoder,
                                    uint64_t *timestamp) {
   if (!decoder || !timestamp) {

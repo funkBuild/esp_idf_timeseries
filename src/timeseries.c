@@ -47,9 +47,9 @@ static void tsdb_compaction_oneshot_task(void *param) {
     ESP_LOGI(TAG, "Compaction task finished");
 
     // Re-check L0 count - inserts during compaction may have accumulated new pages
-    size_t l0_count = tsdb_count_l0_pages(db);
+    uint32_t l0_count = atomic_load(&db->l0_page_count);
     if (l0_count >= MIN_PAGES_FOR_COMPACTION) {
-        ESP_LOGI(TAG, "Re-triggering compaction: %zu L0 pages accumulated", l0_count);
+        ESP_LOGI(TAG, "Re-triggering compaction: %" PRIu32 " L0 pages accumulated", l0_count);
         tsdb_launch_compaction(db);
     }
 
@@ -127,6 +127,9 @@ bool timeseries_init(void) {
   s_tsdb.last_l0_page_offset = 0;
   s_tsdb.last_l0_used_offset = 0;
 
+  // Initialize L0 page count from loaded snapshot
+  atomic_store(&s_tsdb.l0_page_count, (uint32_t)tsdb_count_l0_pages(&s_tsdb));
+
   // Restore next_measurement_id from persisted metadata
   uint32_t max_id = 0;
   if (tsdb_find_max_measurement_id(&s_tsdb, &max_id)) {
@@ -138,6 +141,10 @@ bool timeseries_init(void) {
   if (!tsdb_cache_init(&s_tsdb)) {
     ESP_LOGW(TAG, "Failed to initialize series ID cache (continuing without cache)");
   }
+
+  // Allocate measurement ID cache
+  s_tsdb.meas_cache = (meas_cache_entry_t *)calloc(MEAS_ID_CACHE_SIZE, sizeof(meas_cache_entry_t));
+  s_tsdb.meas_cache_next = 0;
 
   // Pre-allocate write buffer
 #ifdef CONFIG_TIMESERIES_CHUNK_BUFFER_SIZE
@@ -222,23 +229,46 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
 
   uint64_t start_time = esp_timer_get_time();
 
-  // 1) Find or create measurement ID (under mutex to prevent duplicate creation)
+  // 1) Find or create measurement ID (LRU cache avoids per-insert flash scan)
   uint32_t measurement_id = 0;
-  if (!tsdb_find_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
-    if (s_tsdb.flash_write_mutex) {
-      xSemaphoreTake(s_tsdb.flash_write_mutex, portMAX_DELAY);
-    }
-    // Double-check after acquiring mutex (another task may have created it)
-    if (!tsdb_find_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
-      if (!tsdb_create_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
-        if (s_tsdb.flash_write_mutex) {
-          xSemaphoreGive(s_tsdb.flash_write_mutex);
-        }
-        return false;
+  bool meas_cached = false;
+  if (s_tsdb.meas_cache) {
+    for (int mc = 0; mc < MEAS_ID_CACHE_SIZE; mc++) {
+      if (s_tsdb.meas_cache[mc].valid &&
+          strcmp(data->measurement_name, s_tsdb.meas_cache[mc].name) == 0) {
+        measurement_id = s_tsdb.meas_cache[mc].id;
+        meas_cached = true;
+        break;
       }
     }
-    if (s_tsdb.flash_write_mutex) {
-      xSemaphoreGive(s_tsdb.flash_write_mutex);
+  }
+  if (!meas_cached) {
+    if (!tsdb_find_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
+      if (s_tsdb.flash_write_mutex) {
+        xSemaphoreTake(s_tsdb.flash_write_mutex, portMAX_DELAY);
+      }
+      // Double-check after acquiring mutex (another task may have created it)
+      if (!tsdb_find_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
+        if (!tsdb_create_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
+          if (s_tsdb.flash_write_mutex) {
+            xSemaphoreGive(s_tsdb.flash_write_mutex);
+          }
+          return false;
+        }
+      }
+      if (s_tsdb.flash_write_mutex) {
+        xSemaphoreGive(s_tsdb.flash_write_mutex);
+      }
+    }
+    // Cache the result (round-robin eviction)
+    if (s_tsdb.meas_cache) {
+      uint8_t slot = s_tsdb.meas_cache_next;
+      strncpy(s_tsdb.meas_cache[slot].name, data->measurement_name,
+              sizeof(s_tsdb.meas_cache[slot].name) - 1);
+      s_tsdb.meas_cache[slot].name[sizeof(s_tsdb.meas_cache[slot].name) - 1] = '\0';
+      s_tsdb.meas_cache[slot].id = measurement_id;
+      s_tsdb.meas_cache[slot].valid = true;
+      s_tsdb.meas_cache_next = (slot + 1) % MEAS_ID_CACHE_SIZE;
     }
   }
 
@@ -248,36 +278,46 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
              data->num_points, data->num_fields, data->num_points * data->num_fields);
   }
 
-  // Pre-compute the common prefix (measurement + tags) for MD5 optimization.
-  // Size matches cache_key to avoid truncation for valid inputs.
+  // Pre-compute the common prefix (measurement + tags) using memcpy.
   char prefix_buffer[256];
-  size_t prefix_len = snprintf(prefix_buffer, sizeof(prefix_buffer), "%s", data->measurement_name);
-  if (prefix_len >= sizeof(prefix_buffer)) {
+  size_t meas_len = strlen(data->measurement_name);
+  if (meas_len >= sizeof(prefix_buffer)) {
     ESP_LOGE(TAG, "Measurement name too long for prefix buffer");
     return false;
   }
+  memcpy(prefix_buffer, data->measurement_name, meas_len);
+  size_t prefix_len = meas_len;
   for (size_t t = 0; t < data->num_tags; t++) {
-    size_t remaining = sizeof(prefix_buffer) - prefix_len;
-    size_t written = snprintf(prefix_buffer + prefix_len, remaining,
-                          ":%s:%s", data->tag_keys[t], data->tag_values[t]);
-    prefix_len += written;
-    if (prefix_len >= sizeof(prefix_buffer)) {
+    size_t tk_len = strlen(data->tag_keys[t]);
+    size_t tv_len = strlen(data->tag_values[t]);
+    size_t need = 1 + tk_len + 1 + tv_len; // ":key:val"
+    if (prefix_len + need >= sizeof(prefix_buffer)) {
       ESP_LOGE(TAG, "Prefix buffer overflow");
       return false;
     }
+    prefix_buffer[prefix_len++] = ':';
+    memcpy(prefix_buffer + prefix_len, data->tag_keys[t], tk_len);
+    prefix_len += tk_len;
+    prefix_buffer[prefix_len++] = ':';
+    memcpy(prefix_buffer + prefix_len, data->tag_values[t], tv_len);
+    prefix_len += tv_len;
   }
 
   // For each field i => build the series_id => store all points in one shot
   bool any_field_failed = false;
   for (size_t i = 0; i < data->num_fields; i++) {
-    // Build the cache key string
+    // Build the cache key string using memcpy
     char cache_key[256];
-    size_t key_len = snprintf(cache_key, sizeof(cache_key), "%s:%s",
-                              prefix_buffer, data->field_names[i]);
+    size_t fn_len = strlen(data->field_names[i]);
+    size_t key_len = prefix_len + 1 + fn_len; // "prefix:field"
     if (key_len >= sizeof(cache_key)) {
       ESP_LOGE(TAG, "Cache key buffer overflow for field '%s'", data->field_names[i]);
       return false;
     }
+    memcpy(cache_key, prefix_buffer, prefix_len);
+    cache_key[prefix_len] = ':';
+    memcpy(cache_key + prefix_len + 1, data->field_names[i], fn_len);
+    cache_key[key_len] = '\0';
 
     unsigned char series_id[16];
     bool found_in_cache = false;
@@ -355,9 +395,9 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
 
   // Auto-trigger background compaction when L0 page count is high enough
   if (!any_field_failed && !atomic_load(&s_tsdb.compaction_in_progress)) {
-    size_t l0_count = tsdb_count_l0_pages(&s_tsdb);
+    uint32_t l0_count = atomic_load(&s_tsdb.l0_page_count);
     if (l0_count >= MIN_PAGES_FOR_COMPACTION) {
-      ESP_LOGI(TAG, "Auto-triggering compaction: %zu L0 pages", l0_count);
+      ESP_LOGI(TAG, "Auto-triggering compaction: %" PRIu32 " L0 pages", l0_count);
       tsdb_launch_compaction(&s_tsdb);
     }
   }
@@ -402,6 +442,32 @@ bool timeseries_compact_sync(void) {
   return ok;
 }
 
+bool timeseries_compact_force_sync(void) {
+  if (!s_tsdb.initialized) {
+    return false;
+  }
+  int timeout_ms = 60000;
+  while (atomic_load(&s_tsdb.compaction_in_progress) && timeout_ms > 0) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+    timeout_ms -= 10;
+  }
+  if (timeout_ms <= 0) {
+    return false;
+  }
+  bool expected = false;
+  if (!atomic_compare_exchange_strong(&s_tsdb.compaction_in_progress, &expected, true)) {
+    while (atomic_load(&s_tsdb.compaction_in_progress) && timeout_ms > 0) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      timeout_ms -= 10;
+    }
+    return timeout_ms > 0;
+  }
+  bool ok = timeseries_compact_all_levels_force(&s_tsdb);
+  atomic_fetch_add(&s_tsdb.compaction_generation, 1);
+  atomic_store(&s_tsdb.compaction_in_progress, false);
+  return ok;
+}
+
 void timeseries_deinit(void) {
   if (!s_tsdb.initialized) {
     return;
@@ -440,6 +506,12 @@ void timeseries_deinit(void) {
     free(s_tsdb.write_buffer);
     s_tsdb.write_buffer = NULL;
     s_tsdb.write_buffer_capacity = 0;
+  }
+
+  // Free measurement ID cache
+  if (s_tsdb.meas_cache) {
+    free(s_tsdb.meas_cache);
+    s_tsdb.meas_cache = NULL;
   }
 
   // Free type cache
@@ -562,10 +634,18 @@ bool timeseries_clear_all() {
   s_tsdb.last_l0_page_offset = 0;
   s_tsdb.last_l0_used_offset = 0;
   s_tsdb.compaction_claimed_count = 0;
+  atomic_store(&s_tsdb.l0_page_count, 0);
 
   // Reset metadata page cache
   s_tsdb.cached_metadata_valid = false;
   s_tsdb.cached_metadata_count = 0;
+
+  // Reset measurement ID cache
+  if (s_tsdb.meas_cache) {
+    for (int mc = 0; mc < MEAS_ID_CACHE_SIZE; mc++) {
+      s_tsdb.meas_cache[mc].valid = false;
+    }
+  }
 
   // Add back the metadata page
   timeseries_metadata_create_page(&s_tsdb);
@@ -719,6 +799,16 @@ bool timeseries_get_usage_summary(tsdb_usage_summary_t* summary) {
 bool timeseries_delete_measurement(const char* measurement_name) {
   if (!s_tsdb.initialized || !measurement_name) {
     return false;
+  }
+  // Invalidate measurement ID cache entry if deleting a cached measurement
+  if (s_tsdb.meas_cache) {
+    for (int mc = 0; mc < MEAS_ID_CACHE_SIZE; mc++) {
+      if (s_tsdb.meas_cache[mc].valid &&
+          strcmp(measurement_name, s_tsdb.meas_cache[mc].name) == 0) {
+        s_tsdb.meas_cache[mc].valid = false;
+        break;
+      }
+    }
   }
   return timeseries_delete_by_measurement(&s_tsdb, measurement_name);
 }

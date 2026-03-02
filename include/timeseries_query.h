@@ -13,20 +13,20 @@ extern "C" {
 #include "timeseries_id_list.h"
 #include "timeseries_metadata.h"
 
-typedef struct field_record_info_t {
-  uint32_t page_offset;    // start of the page (if needed)
-  uint32_t record_offset;  // offset (within the page) for this record
+typedef struct {
   uint64_t start_time;
   uint64_t end_time;
+  uint32_t record_offset;  // absolute offset for this record
   uint16_t record_count;
   uint16_t record_length;
-  uint8_t data_flags;  // raw fd_hdr.flags byte (replaces bool compressed)
-  struct field_record_info_t* next;
+  uint8_t data_flags;  // raw fd_hdr.flags byte
 } field_record_info_t;
 
 typedef struct series_record_list_t {
   timeseries_series_id_t series_id;
-  field_record_info_t* records_head;
+  field_record_info_t* records;  // growable array
+  size_t count;
+  size_t capacity;
 } series_record_list_t;
 
 typedef struct {

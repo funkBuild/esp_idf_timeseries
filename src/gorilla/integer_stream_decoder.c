@@ -5,9 +5,11 @@
 #include "gorilla/zigzag_stream.h"
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
+#include "esp_log.h"
 #include <stdlib.h>
 #include <string.h>
+
+static const char *TAG = "IntStreamDecoder";
 
 /* Structure definition for the integer stream decoder.
    This structure is intentionally opaque in the header. */
@@ -53,6 +55,25 @@ integer_stream_decoder_create(gorilla_decoder_fill_cb fill_cb, void *fill_ctx) {
   return decoder;
 }
 
+IntegerStreamDecoder *
+integer_stream_decoder_create_direct(const uint8_t *data, size_t size) {
+  if (!data || size == 0) {
+    return NULL;
+  }
+
+  IntegerStreamDecoder *decoder = malloc(sizeof(IntegerStreamDecoder));
+  if (!decoder)
+    return NULL;
+  memset(decoder, 0, sizeof(IntegerStreamDecoder));
+
+  decoder->simple8b_decoder = simple8b_stream_decoder_create_direct(data, size);
+  if (!decoder->simple8b_decoder) {
+    free(decoder);
+    return NULL;
+  }
+  return decoder;
+}
+
 /**
  * @brief Destroy an IntegerStreamDecoder and free all resources.
  *
@@ -91,7 +112,7 @@ bool integer_stream_decoder_get_value(IntegerStreamDecoder *decoder,
   uint64_t encoded;
   // Read the next encoded value from the underlying Simple8b decoder.
   if (!simple8b_stream_decoder_get(decoder->simple8b_decoder, &encoded)) {
-    printf("Failed to get value from simple8b decoder\n");
+    ESP_LOGE(TAG, "Failed to get value from simple8b decoder");
     return false;
   }
 

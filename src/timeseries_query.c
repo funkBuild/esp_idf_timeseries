@@ -116,11 +116,12 @@ static void
 intersect_series_id_lists(timeseries_series_id_list_t *out_list,
                           const timeseries_series_id_list_t *new_list);
 
-static void free_record_list(field_record_info_t *head) {
-  while (head) {
-    field_record_info_t *next = head->next;
-    free(head);
-    head = next;
+static void free_record_array(series_record_list_t *srl) {
+  if (srl && srl->records) {
+    free(srl->records);
+    srl->records = NULL;
+    srl->count = 0;
+    srl->capacity = 0;
   }
 }
 
@@ -292,7 +293,9 @@ bool timeseries_query_execute(timeseries_db_t *db,
 
     for (size_t s = 0; s < field_series.count; ++s) {
       fi->series_lists[s].series_id = field_series.ids[s];
-      fi->series_lists[s].records_head = NULL;
+      fi->series_lists[s].records = NULL;
+      fi->series_lists[s].count = 0;
+      fi->series_lists[s].capacity = 0;
     }
     ++actual_fields_count;
   }
@@ -329,9 +332,7 @@ bool timeseries_query_execute(timeseries_db_t *db,
 
   start_time = esp_timer_get_time();
 
-  size_t points_fetched = fetch_series_data(db, fields_array, actual_fields_count, query,
-                         result);
-  // Note: 0 points is a valid result, not an error
+  fetch_series_data(db, fields_array, actual_fields_count, query, result);
 
   ok = true; /* At this point the function succeeded – result is valid */
 
@@ -345,9 +346,9 @@ cleanup:
 
   if (fields_array) {
     for (size_t i = 0; i < actual_fields_count; ++i) {
-      /* 6a. free record chains generated in fetch_series_data */
+      /* 6a. free record arrays generated in fetch_series_data */
       for (size_t s = 0; s < fields_array[i].num_series; ++s) {
-        free_record_list(fields_array[i].series_lists[s].records_head);
+        free_record_array(&fields_array[i].series_lists[s]);
       }
 
       /* 6b. free per-field arrays & lists */
@@ -377,7 +378,8 @@ cleanup:
  */
 static size_t find_or_create_column(timeseries_query_result_t *result,
                                     const char *field_name,
-                                    timeseries_field_type_e field_type) {
+                                    timeseries_field_type_e field_type,
+                                    size_t result_capacity) {
   // A) Search for an existing column with the same name
   for (size_t c = 0; c < result->num_columns; c++) {
     if (strcmp(result->columns[c].name, field_name) == 0) {
@@ -412,11 +414,14 @@ static size_t find_or_create_column(timeseries_query_result_t *result,
   }
   result->columns[new_col_index].type = field_type;
 
-  // Because we already have 'result->num_points' rows, we must allocate
-  // enough space for that many values in this new column.
-  if (result->num_points) {
+  // Allocate values array at the current result capacity (which may have been
+  // pre-allocated during estimation). This avoids the need for NULL checks on
+  // every ensure_result_capacity call.
+  size_t alloc_size = result_capacity > result->num_points
+                          ? result_capacity : result->num_points;
+  if (alloc_size > 0) {
     result->columns[new_col_index].values =
-        calloc(result->num_points, sizeof(timeseries_field_value_t));
+        calloc(alloc_size, sizeof(timeseries_field_value_t));
     if (!result->columns[new_col_index].values) {
       free((void *)result->columns[new_col_index].name);
       result->columns[new_col_index].name = NULL;
@@ -432,58 +437,85 @@ static size_t find_or_create_column(timeseries_query_result_t *result,
 }
 
 /**
+ * @brief Ensure the result has capacity for at least one more row.
+ *        Grows by doubling to amortize allocation cost.
+ */
+static bool ensure_result_capacity(timeseries_query_result_t *result,
+                                   size_t *capacity) {
+  if (result->num_points < *capacity) {
+    return true;
+  }
+  size_t new_cap = *capacity ? *capacity * 2 : 64;
+  uint64_t *new_ts = realloc(result->timestamps, new_cap * sizeof(uint64_t));
+  if (!new_ts) {
+    ESP_LOGE(TAG, "OOM expanding timestamps capacity to %zu", new_cap);
+    return false;
+  }
+  result->timestamps = new_ts;
+
+  for (size_t c = 0; c < result->num_columns; c++) {
+    timeseries_field_value_t *new_vals =
+        realloc(result->columns[c].values,
+                new_cap * sizeof(timeseries_field_value_t));
+    if (!new_vals) {
+      ESP_LOGE(TAG, "OOM expanding column %zu capacity to %zu", c, new_cap);
+      return false;
+    }
+    result->columns[c].values = new_vals;
+  }
+  *capacity = new_cap;
+  return true;
+}
+
+/**
  * @brief Find a row index with the given timestamp; if none, add a new row.
- *        Ensures all columns' .values arrays are expanded by 1 if a new row is
- * added.
+ *
+ * Timestamps are always produced in ascending order. For the first field,
+ * this is always an append. For subsequent fields, we use binary search
+ * on the existing sorted timestamps array.
  *
  * @param[in,out] result   The query result
  * @param[in]     ts       The timestamp to match
  * @return The row index corresponding to this timestamp
  */
 static size_t find_or_create_row(timeseries_query_result_t *result,
-                                 uint64_t ts) {
-  // A) Check if it already exists
-  for (size_t r = 0; r < result->num_points; r++) {
-    if (result->timestamps[r] == ts) {
-      return r; // Found existing row
+                                 uint64_t ts, size_t *capacity) {
+  // Fast path: check if it matches the last row (common for multi-field)
+  if (result->num_points > 0 &&
+      result->timestamps[result->num_points - 1] == ts) {
+    return result->num_points - 1;
+  }
+
+  // Binary search on sorted timestamps
+  if (result->num_points > 0) {
+    size_t lo = 0, hi = result->num_points;
+    while (lo < hi) {
+      size_t mid = lo + (hi - lo) / 2;
+      if (result->timestamps[mid] < ts) {
+        lo = mid + 1;
+      } else if (result->timestamps[mid] > ts) {
+        hi = mid;
+      } else {
+        return mid;
+      }
     }
   }
 
-  // B) Not found => create a new row at index = result->num_points
-  size_t new_row_index = result->num_points;
-
-  // Expand the timestamps array by 1
-  size_t new_count = result->num_points + 1;
-  uint64_t *new_ts_array =
-      realloc(result->timestamps, new_count * sizeof(uint64_t));
-  if (!new_ts_array) {
-    ESP_LOGE(TAG, "Out of memory expanding timestamps");
+  // Not found — append new row
+  if (!ensure_result_capacity(result, capacity)) {
     return SIZE_MAX;
   }
-  result->timestamps = new_ts_array;
+
+  size_t new_row_index = result->num_points;
   result->timestamps[new_row_index] = ts;
 
-  // Expand each column's values array by 1
+  // Zero-initialize the new cell in each column
   for (size_t c = 0; c < result->num_columns; c++) {
-    timeseries_field_value_t *new_values =
-        realloc(result->columns[c].values,
-                new_count * sizeof(timeseries_field_value_t));
-    if (!new_values) {
-      ESP_LOGE(TAG, "Out of memory expanding column=%zu", c);
-      // Rollback: shrink timestamps back and don't increment num_points
-      // Already-expanded columns have harmless extra capacity
-      return SIZE_MAX;
-    }
-    result->columns[c].values = new_values;
-
-    // Initialize the new cell to type=0
     memset(&result->columns[c].values[new_row_index], 0,
            sizeof(timeseries_field_value_t));
   }
 
-  // Only increment num_points after all columns are successfully expanded
-  result->num_points = new_count;
-
+  result->num_points = new_row_index + 1;
   return new_row_index;
 }
 
@@ -508,13 +540,20 @@ intersect_series_id_lists(timeseries_series_id_list_t *out,
   qsort(out->ids, out->count, sizeof(timeseries_series_id_t),
         cmp_series_id_asc);
 
-  /* We must not modify 'other'; make a heap copy to sort */
-  timeseries_series_id_t *tmp =
-      malloc(other->count * sizeof(timeseries_series_id_t));
-  if (!tmp) {
-    ESP_LOGE(TAG, "OOM in intersect_series_id_lists (%zu entries)", other->count);
-    tsdb_series_id_list_clear(out);
-    return;
+  /* We must not modify 'other'; copy to sort. Use stack for small counts. */
+  timeseries_series_id_t stack_tmp[16]; /* 256 bytes on stack */
+  timeseries_series_id_t *tmp;
+  bool tmp_on_heap = false;
+  if (other->count <= 16) {
+    tmp = stack_tmp;
+  } else {
+    tmp = malloc(other->count * sizeof(timeseries_series_id_t));
+    if (!tmp) {
+      ESP_LOGE(TAG, "OOM in intersect_series_id_lists (%zu entries)", other->count);
+      tsdb_series_id_list_clear(out);
+      return;
+    }
+    tmp_on_heap = true;
   }
   memcpy(tmp, other->ids, other->count * sizeof(timeseries_series_id_t));
   qsort(tmp, other->count, sizeof(timeseries_series_id_t), cmp_series_id_asc);
@@ -537,7 +576,7 @@ intersect_series_id_lists(timeseries_series_id_list_t *out,
     }
   }
 
-  free(tmp);
+  if (tmp_on_heap) free(tmp);
 
   /* Replace 'out' with the intersection */
   tsdb_series_id_list_clear(out);
@@ -545,139 +584,66 @@ intersect_series_id_lists(timeseries_series_id_list_t *out,
   tsdb_series_id_list_free(&result);
 }
 
+static int cmp_record_by_start_time(const void *a, const void *b) {
+  const field_record_info_t *ra = (const field_record_info_t *)a;
+  const field_record_info_t *rb = (const field_record_info_t *)b;
+  if (ra->start_time < rb->start_time) return -1;
+  if (ra->start_time > rb->start_time) return 1;
+  return 0;
+}
+
 /**
- * @brief Create a new node from \p fdh and insert it into the linked list
- *        in ascending order by start_time.
- *
- * @param[in,out] list    Pointer to the HEAD pointer of the linked list.
- *                        If *list == NULL, we'll become the first node.
- * @param[in] fdh         The field data header to create a new node from.
- * @param[in] limit       The maximum # of data points, used if you want to skip
- *                        insertion if limit is already met. (In this example,
- *                        we always insert, and rely on prune() to remove.)
- * @return true if appended, false if skipped
+ * @brief Append a record to the growable array (unsorted).
+ *        Sorting is deferred to a single qsort after all records are collected.
  */
-static bool field_record_list_append(field_record_info_t **list,
-                                     const timeseries_field_data_header_t *fdh,
-                                     uint32_t absolute_offset,
-                                     unsigned int limit) {
-  // 1) Check if we already have coverage >= limit => skip?
-  //    Alternatively, we can always insert and let prune() handle it.
-  //    We'll show "always insert" to let the pruning step do the removal:
-  //    If you'd prefer to skip immediately if coverage >= limit, add coverage
-  //    logic here.
-
-  // 2) Allocate a new node
-  field_record_info_t *new_node =
-      (field_record_info_t *)malloc(sizeof(field_record_info_t));
-  if (!new_node) {
-    return false; // out of memory
-  }
-  memset(new_node, 0, sizeof(*new_node));
-
-  new_node->page_offset = 0;  // Not used anymore
-  new_node->record_offset = absolute_offset;
-  new_node->start_time = fdh->start_time;
-  new_node->end_time = fdh->end_time;
-  new_node->record_count = fdh->record_count;
-  new_node->record_length = fdh->record_length;
-  new_node->data_flags = fdh->flags;
-  new_node->next = NULL;
-
-  // 4) Insert into singly linked list in ascending order by start_time
-  if (*list == NULL) {
-    // Empty list => we're the head
-    *list = new_node;
-    return true;
-  }
-
-  // If the new record’s start_time is earlier than the head => prepend
-  if (new_node->start_time < (*list)->start_time) {
-    new_node->next = *list;
-    *list = new_node;
-    return true;
-  }
-
-  // Otherwise, find the insertion spot
-  field_record_info_t *prev = *list;
-  field_record_info_t *curr = prev->next;
-  while (curr) {
-    if (new_node->start_time < curr->start_time) {
-      // insert here
-      break;
+static bool field_record_array_append(series_record_list_t *srl,
+                                      const timeseries_field_data_header_t *fdh,
+                                      uint32_t absolute_offset,
+                                      unsigned int limit) {
+  if (srl->count >= srl->capacity) {
+    size_t new_cap = srl->capacity ? srl->capacity * 2 : 8;
+    field_record_info_t *new_arr =
+        realloc(srl->records, new_cap * sizeof(field_record_info_t));
+    if (!new_arr) {
+      return false;
     }
-    prev = curr;
-    curr = curr->next;
+    srl->records = new_arr;
+    srl->capacity = new_cap;
   }
-  // Insert after 'prev'
-  new_node->next = curr;
-  prev->next = new_node;
 
+  field_record_info_t *rec = &srl->records[srl->count++];
+  rec->record_offset = absolute_offset;
+  rec->start_time = fdh->start_time;
+  rec->end_time = fdh->end_time;
+  rec->record_count = fdh->record_count;
+  rec->record_length = fdh->record_length;
+  rec->data_flags = fdh->flags;
   return true;
 }
 
 /**
- * @brief Traverse the list in ascending order, summing record_count
- *        until we reach 'limit'. Then we keep any record that
- *        might overlap older data (start_time <= last_included_start),
- *        and drop the rest.
- *
- * @param[in,out] list   The HEAD pointer to the linked list
- * @param[in]     limit  The max # of data points we want
+ * @brief Sort the record array by start_time, then prune to keep only
+ *        enough records to cover `limit` data points.
  */
-static void field_record_list_prune(field_record_info_t **list,
-                                    unsigned int limit) {
-  if (!list || !(*list) || limit == 0) {
-    return; // no limit => keep everything
-  }
+static void field_record_array_sort_and_prune(series_record_list_t *srl,
+                                              unsigned int limit) {
+  if (!srl || srl->count == 0) return;
 
-  // 1) Summation pass: find how many points from the earliest nodes
-  //    we need to get coverage >= limit
+  qsort(srl->records, srl->count, sizeof(field_record_info_t),
+        cmp_record_by_start_time);
+
+  if (limit == 0) return; /* no limit => keep everything */
+
   uint64_t coverage = 0;
-  uint64_t last_included_start = 0;
-
-  field_record_info_t *cur = *list;
-  while (cur) {
-    coverage += cur->record_count;
-    last_included_start = cur->start_time;
+  size_t keep = srl->count;
+  for (size_t i = 0; i < srl->count; i++) {
+    coverage += srl->records[i].record_count;
     if (coverage >= limit) {
-      // We have enough coverage => note the start_time
-      // of the last included record
+      keep = i + 1;
       break;
     }
-    cur = cur->next;
   }
-
-  if (coverage < limit) {
-    // coverage never reached limit => keep all
-    return;
-  }
-  // else we only keep records that start_time <= last_included_start
-
-  // 2) Build the new list by skipping records that
-  //    have start_time > last_included_start
-  field_record_info_t dummy_head; // dummy node
-  dummy_head.next = *list;
-
-  field_record_info_t *prev = &dummy_head;
-  cur = dummy_head.next;
-
-  while (cur) {
-    if (cur->start_time > last_included_start) {
-      // remove
-      field_record_info_t *to_remove = cur;
-      prev->next = cur->next;
-      cur = cur->next;
-      free(to_remove);
-    } else {
-      // keep
-      prev = cur;
-      cur = cur->next;
-    }
-  }
-
-  // done => new HEAD
-  *list = dummy_head.next;
+  srl->count = keep;
 }
 
 static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
@@ -688,6 +654,8 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     ESP_LOGW(TAG, "Invalid input to fetch_series_data");
     return 0;
   }
+
+  size_t result_capacity = 0; /* local capacity tracker (thread-safe) */
 
   // Profiling timers for Phase 3 optimization
   uint64_t prof_start, prof_end;
@@ -722,6 +690,10 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
   int field_data_pages = 0;
   int records_found = 0;
 
+  // Shared page buffer — avoids malloc/free per field-data page
+  uint8_t *shared_page_buf = NULL;
+  uint32_t shared_page_buf_cap = 0;
+
   while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &page_offset,
                                              &page_size)) {
     pages_processed++;
@@ -735,9 +707,20 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     ESP_LOGD(TAG, "Scanning FIELD_DATA page @0x%08X size=%u level=%u state=%u",
              (unsigned int)page_offset, (unsigned int)page_size, hdr.field_data_level, hdr.page_state);
 
+    // Grow shared buffer if this page is larger
+    uint32_t data_size = page_size - sizeof(timeseries_page_header_t);
+    if (data_size > shared_page_buf_cap) {
+      uint8_t *new_buf = realloc(shared_page_buf, data_size);
+      if (new_buf) {
+        shared_page_buf = new_buf;
+        shared_page_buf_cap = data_size;
+      }
+    }
+
     timeseries_fielddata_iterator_t fdata_iter;
-    if (!timeseries_fielddata_iterator_init(db, page_offset, page_size,
-                                            &fdata_iter)) {
+    if (!timeseries_fielddata_iterator_init_with_buffer(
+            db, page_offset, page_size, shared_page_buf,
+            shared_page_buf_cap, &fdata_iter)) {
       ESP_LOGW(TAG, "Failed to init fielddata_iterator on page @0x%08X",
                (unsigned int)page_offset);
       continue;
@@ -763,14 +746,17 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
       /* Fast path: single probe instead of nested loops */
       series_record_list_t *srl = series_lookup_find(&srl_tbl, fdh.series_id);
       if (srl) {
+        // Skip records entirely outside the query time range
+        if (query->end_ms > 0 && fdh.start_time > (uint64_t)query->end_ms) continue;
+        if (query->start_ms > 0 && fdh.end_time < (uint64_t)query->start_ms) continue;
         records_found++;
         page_records_matched++;
         bool is_compressed = (fdh.flags & TSDB_FIELDDATA_FLAG_COMPRESSED) == 0;
         ESP_LOGD(TAG, "MATCH: series %02X%02X%02X%02X... @0x%08X count=%u len=%u compressed=%d",
                  fdh.series_id[0], fdh.series_id[1], fdh.series_id[2], fdh.series_id[3],
                  (unsigned int)absolute_offset, fdh.record_count, fdh.record_length, is_compressed);
-        field_record_list_append(&srl->records_head, &fdh, absolute_offset,
-                                 query->limit);
+        field_record_array_append(srl, &fdh, absolute_offset,
+                                  query->limit);
       } else {
         ESP_LOGD(TAG, "No match for series %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X (flags=0x%02X, records=%u)",
                  fdh.series_id[0], fdh.series_id[1], fdh.series_id[2], fdh.series_id[3],
@@ -780,10 +766,12 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
                  fdh.flags, fdh.record_count);
       }
     } // end while fielddata_iterator
+    timeseries_fielddata_iterator_deinit(&fdata_iter);
     ESP_LOGD(TAG, "Page @0x%08X: %d records scanned, %d matched",
              (unsigned int)page_offset, page_records, page_records_matched);
   } // end while page_iterator
   timeseries_page_cache_iterator_deinit(&page_iter);
+  free(shared_page_buf);
 
   prof_end = esp_timer_get_time();
   ESP_LOGD(TAG, "[PROFILE] Page scanning: %.3f ms (%d pages, %d field_data pages, %d records)",
@@ -793,11 +781,34 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
   prof_start = esp_timer_get_time();
   for (size_t f = 0; f < num_fields; f++) {
     for (size_t s = 0; s < fields_array[f].num_series; s++) {
-      field_record_list_prune(&fields_array[f].series_lists[s].records_head, query->limit);
+      field_record_array_sort_and_prune(&fields_array[f].series_lists[s], query->limit);
     }
   }
   prof_end = esp_timer_get_time();
   ESP_LOGD(TAG, "[PROFILE] Prune lists: %.3f ms", (prof_end - prof_start) / 1000.0);
+
+  // Pre-estimate result capacity from collected record counts
+  {
+    size_t estimated_points = 0;
+    for (size_t f = 0; f < num_fields; f++) {
+      for (size_t s = 0; s < fields_array[f].num_series; s++) {
+        for (size_t i = 0; i < fields_array[f].series_lists[s].count; i++) {
+          estimated_points += fields_array[f].series_lists[s].records[i].record_count;
+        }
+      }
+    }
+    if (query->limit > 0 && estimated_points > (size_t)query->limit) {
+      estimated_points = (size_t)query->limit;
+    }
+    if (estimated_points > 0) {
+      result_capacity = estimated_points;
+      result->timestamps = malloc(result_capacity * sizeof(uint64_t));
+      if (!result->timestamps) {
+        ESP_LOGE(TAG, "OOM pre-allocating %zu timestamps", result_capacity);
+        result_capacity = 0;
+      }
+    }
+  }
 
   // --------------------------------------------------------------------------
   // PART B: Verify that all series in each field share the same type
@@ -874,7 +885,8 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     // We'll create a column in `result` for this field (if not already
     // present). This is the column we'll store all aggregated points into.
     size_t col_index =
-        find_or_create_column(result, fld->field_name, field_type);
+        find_or_create_column(result, fld->field_name, field_type,
+                              result_capacity);
 
     if (col_index == SIZE_MAX) {
       /* Fatal for this field – skip it but keep processing others */
@@ -885,11 +897,21 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     // so we can respect the `query->limit` per-field (as requested).
     size_t inserted_for_this_field = 0;
 
-    // Build a multi_points_iterator for each series
+    // Build a multi_points_iterator for each series.
+    // Batch-allocate iterators to reduce malloc count and heap fragmentation.
     timeseries_multi_points_iterator_t **series_multi_iters =
         calloc(fld->num_series, sizeof(*series_multi_iters));
-    if (!series_multi_iters) {
-      ESP_LOGE(TAG, "OOM: cannot allocate multi-iter array for field='%s'",
+    // Batch allocation for all multi_points_iterators (one per series)
+    timeseries_multi_points_iterator_t *mpit_batch =
+        calloc(fld->num_series, sizeof(timeseries_multi_points_iterator_t));
+    // Per-series batch pointers for points_iterators
+    timeseries_points_iterator_t **pit_batches =
+        calloc(fld->num_series, sizeof(timeseries_points_iterator_t *));
+    if (!series_multi_iters || !mpit_batch || !pit_batches) {
+      free(series_multi_iters);
+      free(mpit_batch);
+      free(pit_batches);
+      ESP_LOGE(TAG, "OOM: cannot allocate iterator arrays for field='%s'",
                fld->field_name);
       continue;
     }
@@ -897,40 +919,33 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     for (size_t s = 0; s < fld->num_series; s++) {
       series_record_list_t *srl = &fld->series_lists[s];
 
-      // Count how many record-info nodes we have
-      size_t record_count = 0;
-      field_record_info_t *rec = srl->records_head;
-      while (rec) {
-        record_count++;
-        rec = rec->next;
-      }
+      size_t record_count = srl->count;
       if (record_count == 0) {
         continue;
       }
 
-      // Prepare arrays for sub-iterators
+      // Batch-allocate all points_iterators for this series in one calloc
+      timeseries_points_iterator_t *pit_batch =
+          calloc(record_count, sizeof(timeseries_points_iterator_t));
+      // Temporary pointer/seq arrays for multi_points_iterator_init
       timeseries_points_iterator_t **sub_iters =
           calloc(record_count, sizeof(*sub_iters));
       uint32_t *page_seqs = calloc(record_count, sizeof(uint32_t));
-      if (!sub_iters || !page_seqs) {
+      if (!pit_batch || !sub_iters || !page_seqs) {
+        free(pit_batch);
         free(sub_iters);
         free(page_seqs);
         ESP_LOGE(TAG, "OOM building sub-iter structures for field='%s'",
                  fld->field_name);
         continue;
       }
+      pit_batches[s] = pit_batch;
 
-      // Initialize each record's points_iterator
-      rec = srl->records_head;
+      // Initialize each record's points_iterator from the batch
       size_t idx = 0;
-      while (rec) {
-        timeseries_points_iterator_t *pit = calloc(1, sizeof(timeseries_points_iterator_t));
-        if (!pit) {
-          ESP_LOGW(TAG, "OOM creating sub-iterator for '%s'", fld->field_name);
-          rec = rec->next;
-          continue;
-        }
-        // Debug: log the actual offset being used
+      for (size_t ri = 0; ri < record_count; ri++) {
+        field_record_info_t *rec = &srl->records[ri];
+        timeseries_points_iterator_t *pit = &pit_batch[ri];
         ESP_LOGV(TAG, "Initializing points_iter: absolute_offset=0x%08" PRIX32 ", length=%" PRIu16 ", count=%" PRIu16,
                  rec->record_offset, rec->record_length, rec->record_count);
         bool ok = timeseries_points_iterator_init(
@@ -940,32 +955,26 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
           ESP_LOGW(TAG, "Failed init of points_iter offset=0x%08X, length=%u, count=%u, type=%d",
                    (unsigned)(rec->record_offset),
                    rec->record_length, rec->record_count, field_type);
-          free(pit);
-          rec = rec->next;
           continue;
         }
+        // Trim decoded arrays to query time range (ALP & uncompressed only)
+        timeseries_points_iterator_set_time_range(pit, query->start_ms, query->end_ms);
         sub_iters[idx] = pit;
-        page_seqs[idx] = 0; // or rec->page_seq if you track that
+        page_seqs[idx] = 0;
         idx++;
-        rec = rec->next;
       }
 
-      // Merge them into one multi_points_iterator
+      // Merge them into one multi_points_iterator (from the batch)
       if (idx > 0) {
-        timeseries_multi_points_iterator_t *mpit =
-            calloc(1, sizeof(timeseries_multi_points_iterator_t));
-        if (mpit && timeseries_multi_points_iterator_init(sub_iters, page_seqs,
-                                                          idx, mpit)) {
+        timeseries_multi_points_iterator_t *mpit = &mpit_batch[s];
+        if (timeseries_multi_points_iterator_init(sub_iters, page_seqs,
+                                                   idx, mpit)) {
           series_multi_iters[s] = mpit;
         } else {
-          // Cleanup partial
-          if (mpit) {
-            free(mpit);
-          }
+          // Cleanup partial — deinit initialized iterators (don't free individually)
           for (size_t i2 = 0; i2 < idx; i2++) {
             if (sub_iters[i2]) {
               timeseries_points_iterator_deinit(sub_iters[i2]);
-              free(sub_iters[i2]);
             }
           }
         }
@@ -1024,7 +1033,8 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
         }
 
         // Actually store this aggregator result into the result struct
-        size_t row_index = find_or_create_row(result, rollup_ts);
+        size_t row_index = find_or_create_row(result, rollup_ts,
+                                                    &result_capacity);
 
         if (row_index == SIZE_MAX) {
           ESP_LOGE(TAG, "OOM inserting new result row – aborting field '%s'",
@@ -1061,25 +1071,27 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
       timeseries_multi_series_iterator_deinit(&ms_iter);
     }
 
-    // Cleanup each multi_points_iterator
+    // Cleanup: deinit iterators, then free batch allocations
     for (size_t s = 0; s < fld->num_series; s++) {
       if (series_multi_iters[s]) {
-        /* First clean up every sub-iterator we created */
+        /* Deinit each sub-iterator (don't free — they're from pit_batches) */
         for (size_t i_sub = 0; i_sub < series_multi_iters[s]->sub_count;
              ++i_sub) {
           timeseries_points_iterator_t *pit =
               series_multi_iters[s]->subs[i_sub].sub_iter;
           if (pit) {
             timeseries_points_iterator_deinit(pit);
-            free(pit);
           }
         }
-        /* Then free the multi-iterator itself */
+        /* Free multi-iterator internals (don't free struct — it's from mpit_batch) */
         timeseries_multi_points_iterator_deinit(series_multi_iters[s]);
-        free(series_multi_iters[s]);
       }
+      /* Free the per-series points_iterator batch */
+      free(pit_batches[s]);
     }
     free(series_multi_iters);
+    free(mpit_batch);
+    free(pit_batches);
   } // end for each field
 
   prof_end = esp_timer_get_time();

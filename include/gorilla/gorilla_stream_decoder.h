@@ -47,6 +47,16 @@ bool gorilla_decoder_init(gorilla_decoder_stream_t *decoder,
                           gorilla_decoder_fill_cb fill_cb, void *fill_ctx);
 
 /**
+ * @brief Initialize in direct pointer mode (zero-copy).
+ *
+ * For data already in RAM (e.g. after a single flash read).
+ * Avoids fill callback overhead and intermediate copies.
+ */
+bool gorilla_decoder_init_direct(gorilla_decoder_stream_t *decoder,
+                                 gorilla_stream_type_t stream_type,
+                                 const uint8_t *data, size_t size);
+
+/**
  * @brief Retrieve the next integer value from the Gorilla decoder stream.
  *
  * For streams of type GORILLA_STREAM_INT, this function uses the underlying

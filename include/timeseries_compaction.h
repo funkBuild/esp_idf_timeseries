@@ -96,6 +96,14 @@ size_t timeseries_field_value_serialize(const timeseries_field_value_t *val,
 
 bool timeseries_compact_all_levels(timeseries_db_t *db);
 
+/**
+ * @brief Force compaction of all levels, ignoring MIN_PAGES_FOR_COMPACTION.
+ *
+ * Compacts any level that has >= 1 page. Useful for benchmarking where all
+ * L0 pages must be compacted regardless of how many remain after auto-compaction.
+ */
+bool timeseries_compact_all_levels_force(timeseries_db_t *db);
+
 bool timeseries_compact_level_pages(timeseries_db_t *db, uint8_t from_level,
                                     uint8_t to_level);
 

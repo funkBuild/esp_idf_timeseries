@@ -22,6 +22,14 @@ Simple8bStreamDecoder *
 simple8b_stream_decoder_create(gorilla_decoder_fill_cb fill_cb, void *fill_ctx);
 
 /**
+ * @brief Create a new Simple8bStreamDecoder in direct pointer mode.
+ *
+ * Zero-copy: reads 64-bit words directly from data already in RAM.
+ */
+Simple8bStreamDecoder *
+simple8b_stream_decoder_create_direct(const uint8_t *data, size_t size);
+
+/**
  * @brief Destroy the Simple8bStreamDecoder and free all associated resources.
  *
  * @param decoder The decoder instance to destroy.

@@ -38,6 +38,25 @@ FloatStreamDecoder *float_stream_decoder_create(FillCallback fill_cb,
   return dec;
 }
 
+FloatStreamDecoder *float_stream_decoder_create_direct(const uint8_t *data,
+                                                       size_t size) {
+  if (!data || size == 0)
+    return NULL;
+  FloatStreamDecoder *dec = malloc(sizeof(FloatStreamDecoder));
+  if (!dec)
+    return NULL;
+  memset(dec, 0, sizeof(FloatStreamDecoder));
+  dec->fill_cb = NULL;
+  dec->fill_ctx = NULL;
+  bitreader_init_direct(&dec->br, data, size);
+
+  dec->has_first = false;
+  dec->prev_lzb = -1;
+  dec->prev_tzb = -1;
+  dec->data_bits = 0;
+  return dec;
+}
+
 __attribute__((optimize("O3")))
 bool float_stream_decoder_get_value(FloatStreamDecoder *dec, double *value) {
   if (!dec || !value)

@@ -215,6 +215,13 @@ typedef struct {
 // Forward declaration of snapshot type
 typedef struct tsdb_page_cache_snapshot tsdb_page_cache_snapshot_t;
 
+// Measurement ID cache entry
+typedef struct {
+  char name[64];
+  uint32_t id;
+  bool valid;
+} meas_cache_entry_t;
+
 typedef struct {
   bool initialized;
   uint32_t next_measurement_id;
@@ -237,11 +244,13 @@ typedef struct {
   TaskHandle_t compaction_task_handle;
   _Atomic bool compaction_in_progress;
   _Atomic uint32_t compaction_generation;  // Incremented after each compaction run
+  _Atomic uint32_t l0_page_count;          // Tracked atomically to avoid per-insert scan
 
   // Last used L0 page/offset
   bool last_l0_cache_valid;
   uint32_t last_l0_page_offset;
   uint32_t last_l0_used_offset;
+  uint32_t last_l0_page_size;
 
 #ifdef CONFIG_TIMESERIES_USE_SERIES_ID_CACHE
   // Series ID cache
@@ -267,6 +276,11 @@ typedef struct {
 
   // Chunk size for large inserts (default 300)
   size_t chunk_size;
+
+  // Measurement ID cache (avoids per-insert flash scan)
+#define MEAS_ID_CACHE_SIZE 4
+  meas_cache_entry_t *meas_cache; // heap-allocated array of MEAS_ID_CACHE_SIZE
+  uint8_t meas_cache_next;        // round-robin eviction index
 
   // Metadata mmap cache for fast read access
   metadata_mmap_entry_t metadata_mmap_cache[METADATA_MMAP_CACHE_SIZE];

@@ -72,10 +72,10 @@ bool alp_decode(const uint8_t * restrict data, size_t data_len,
     if (scheme != ALP_SCHEME_ALP) return false;
 
     /* ------------------------------------------------------------------ */
-    /* Single scratch allocation for all temporary buffers                */
+    /* Stack scratch for all temporary buffers (3328 B — fits in query    */
+    /* task stack, avoids malloc/free overhead per decode call)            */
     /* ------------------------------------------------------------------ */
-    uint8_t *scratch = (uint8_t *)malloc(SCRATCH_TOTAL);
-    if (!scratch) return false;
+    uint8_t scratch[SCRATCH_TOTAL] __attribute__((aligned(8)));
 
     int64_t  *decoded_ints  = (int64_t  *)(scratch);
     uint64_t *packed_data   = (uint64_t *)(scratch + SCRATCH_INT_SZ);
@@ -197,10 +197,8 @@ bool alp_decode(const uint8_t * restrict data, size_t data_len,
         }
     }
 
-    free(scratch);
     return (out_idx == count);
 
 fail:
-    free(scratch);
     return false;
 }

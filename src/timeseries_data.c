@@ -402,45 +402,35 @@ static bool find_level0_page_with_space(timeseries_db_t *db,
   *out_any_l0_exists = false;
 
   // ---------------------------------------
-  // 1) Quick check against cached L0 page
+  // 1) Quick check against cached L0 page (no flash read needed)
   // ---------------------------------------
   if (db->last_l0_cache_valid) {
-    timeseries_page_header_t hdr;
-    esp_err_t err = esp_partition_read(db->partition, db->last_l0_page_offset,
-                                       &hdr, sizeof(hdr));
-    if (err == ESP_OK) {
-      // Confirm the cached page is still a valid, active L0 field-data page
-      if (hdr.magic_number == TIMESERIES_MAGIC_NUM &&
-          hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
-          hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE &&
-          hdr.field_data_level == 0) {
-        *out_any_l0_exists = true;          // At least one L0 page exists
+    // Check if this page is claimed by compaction
+    if (is_page_claimed_by_compaction(db, db->last_l0_page_offset)) {
+      db->last_l0_cache_valid = false;
+      // fall through to full scan
+    } else {
+      *out_any_l0_exists = true;
+      uint32_t free_space = db->last_l0_page_size - db->last_l0_used_offset;
 
-        // Check if this page is claimed by compaction
-        if (is_page_claimed_by_compaction(db, db->last_l0_page_offset)) {
-          db->last_l0_cache_valid = false;
-          // fall through to full scan
-        } else {
-          uint32_t page_size = hdr.page_size; // from the header
-          uint32_t free_space = page_size - db->last_l0_used_offset;
-
-          if (free_space >= bytes_needed) {
-            // We can use the cached page immediately
-            *out_page_offset = db->last_l0_page_offset;
-            *out_used_offset = db->last_l0_used_offset;
-            return true;
-          }
-        }
+      if (free_space >= bytes_needed) {
+        // We can use the cached page immediately
+        *out_page_offset = db->last_l0_page_offset;
+        *out_used_offset = db->last_l0_used_offset;
+        return true;
       }
+      // Page too full — invalidate and scan for another
+      db->last_l0_cache_valid = false;
     }
-    // If we got here, the cached page is invalid or no longer suitable
-    // => fallback to the full scan below
-    db->last_l0_cache_valid = false;
   }
 
   // ---------------------------------------
   // 2) Fallback: scan all pages in the cache
+  //    Skip the expensive field-data iteration for the page we just
+  //    determined is full (db->last_l0_page_offset before invalidation).
   // ---------------------------------------
+  uint32_t skip_page = db->last_l0_page_offset; // page we just checked
+
   timeseries_page_cache_iterator_t page_iter;
   if (!timeseries_page_cache_iterator_init(db, &page_iter)) {
     return false;
@@ -458,12 +448,32 @@ static bool find_level0_page_with_space(timeseries_db_t *db,
         hdr.field_data_level == 0) {
       *out_any_l0_exists = true; // We have at least one L0 page
 
-      // Determine how many bytes have been used in this L0 page
-      // by iterating its field-data records (the existing method):
+      // Skip pages claimed by compaction early (before expensive scan)
+      if (is_page_claimed_by_compaction(db, page_offset)) {
+        continue;
+      }
+
+      // Skip the page we already know is full from the cache check
+      if (page_offset == skip_page) {
+        continue;
+      }
+
+      // Determine how many bytes have been used in this L0 page.
+      // Reuse db->write_buffer to avoid per-scan malloc (safe: caller holds flash_write_mutex).
       timeseries_fielddata_iterator_t f_iter;
-      if (!timeseries_fielddata_iterator_init(db, page_offset, page_size,
-                                              &f_iter)) {
-        continue; // skip on error
+      uint32_t data_size = page_size - sizeof(timeseries_page_header_t);
+      if (db->write_buffer && db->write_buffer_capacity >= data_size) {
+        if (!timeseries_fielddata_iterator_init_with_buffer(
+                db, page_offset, page_size,
+                db->write_buffer, (uint32_t)db->write_buffer_capacity,
+                &f_iter)) {
+          continue;
+        }
+      } else {
+        if (!timeseries_fielddata_iterator_init(db, page_offset, page_size,
+                                                &f_iter)) {
+          continue;
+        }
       }
 
       uint32_t last_offset = sizeof(timeseries_page_header_t);
@@ -472,14 +482,10 @@ static bool find_level0_page_with_space(timeseries_db_t *db,
       while (timeseries_fielddata_iterator_next(&f_iter, &f_hdr)) {
         last_offset = f_iter.offset;
       }
+      timeseries_fielddata_iterator_deinit(&f_iter);
 
       uint32_t free_space = page_size - last_offset;
       if (free_space >= bytes_needed) {
-        // Check if this page is claimed by compaction
-        if (is_page_claimed_by_compaction(db, page_offset)) {
-          continue; // Skip claimed pages
-        }
-
         // Found a suitable page
         *out_page_offset = page_offset;
         *out_used_offset = last_offset;
@@ -489,6 +495,7 @@ static bool find_level0_page_with_space(timeseries_db_t *db,
         db->last_l0_cache_valid = true;
         db->last_l0_page_offset = page_offset;
         db->last_l0_used_offset = last_offset;
+        db->last_l0_page_size = page_size;
         break;
       }
     }
@@ -565,6 +572,10 @@ static bool create_level0_field_page(timeseries_db_t *db,
   db->last_l0_cache_valid = true;
   db->last_l0_page_offset = blank_offset;
   db->last_l0_used_offset = sizeof(timeseries_page_header_t);
+  db->last_l0_page_size = l0_size;
+
+  // 5) Increment tracked L0 page count
+  atomic_fetch_add(&db->l0_page_count, 1);
 
   return true;
 }
@@ -614,66 +625,54 @@ static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
 
   // 3) Use pre-allocated buffer if available, otherwise allocate.
   //    SAFETY: write_buffer is shared state, safe here because caller holds flash_write_mutex.
-  uint8_t *col_buf = NULL;
+  //    Buffer includes fhdr + col_hdr + timestamps + values (single flash write).
+  size_t total_write = sizeof(fhdr) + total_col_data;
+  uint8_t *write_buf = NULL;
   bool using_preallocated = false;
 
-  if (db->write_buffer && db->write_buffer_capacity >= total_col_data) {
-    // Use pre-allocated buffer
-    col_buf = db->write_buffer;
+  if (db->write_buffer && db->write_buffer_capacity >= total_write) {
+    write_buf = db->write_buffer;
     using_preallocated = true;
-    ESP_LOGV(TAG, "Using pre-allocated buffer (%zu bytes needed, %zu available)",
-             total_col_data, db->write_buffer_capacity);
-  } else if (db->write_buffer && total_col_data <= 64 * 1024) { // Don't grow beyond 64KB
-    // Try to grow the pre-allocated buffer
-    uint8_t *new_buffer = (uint8_t *)realloc(db->write_buffer, total_col_data);
+  } else if (db->write_buffer && total_write <= 64 * 1024) {
+    uint8_t *new_buffer = (uint8_t *)realloc(db->write_buffer, total_write);
     if (new_buffer) {
       db->write_buffer = new_buffer;
-      db->write_buffer_capacity = total_col_data;
-      col_buf = db->write_buffer;
+      db->write_buffer_capacity = total_write;
+      write_buf = db->write_buffer;
       using_preallocated = true;
-      ESP_LOGV(TAG, "Grew pre-allocated buffer to %zu bytes", total_col_data);
     }
   }
 
-  if (!col_buf) {
-    // Fall back to malloc for very large writes or if no pre-allocated buffer
-    col_buf = (uint8_t *)malloc(total_col_data);
-    if (!col_buf) {
+  if (!write_buf) {
+    write_buf = (uint8_t *)malloc(total_write);
+    if (!write_buf) {
       return false;
     }
-    ESP_LOGV(TAG, "Using malloc for buffer (%zu bytes)", total_col_data);
   }
 
-  // 4) Fill col_buf
+  // 4) Fill write_buf: fhdr + col_hdr + timestamps + values
   size_t buf_offset = 0;
-  memcpy(col_buf + buf_offset, &col_hdr, sizeof(col_hdr));
+  memcpy(write_buf + buf_offset, &fhdr, sizeof(fhdr));
+  buf_offset += sizeof(fhdr);
+
+  memcpy(write_buf + buf_offset, &col_hdr, sizeof(col_hdr));
   buf_offset += sizeof(col_hdr);
 
-  memcpy(col_buf + buf_offset, timestamps, ts_size);
+  memcpy(write_buf + buf_offset, timestamps, ts_size);
   buf_offset += ts_size;
 
   for (size_t i = 0; i < npoints; i++) {
     buf_offset +=
-        field_value_write_uncompressed(&vals[i], col_buf + buf_offset);
+        field_value_write_uncompressed(&vals[i], write_buf + buf_offset);
   }
 
-  // 5) Write fhdr + col_buf to flash
+  // 5) Single flash write for fhdr + column data
   uint32_t write_addr = page_offset + used_offset;
   esp_err_t err =
-      esp_partition_write(db->partition, write_addr, &fhdr, sizeof(fhdr));
-  if (err != ESP_OK) {
-    if (!using_preallocated) {
-      free(col_buf);
-    }
-    return false;
-  }
-  write_addr += sizeof(fhdr);
+      esp_partition_write(db->partition, write_addr, write_buf, total_write);
 
-  err = esp_partition_write(db->partition, write_addr, col_buf, total_col_data);
-
-  // Only free if we allocated it (not using pre-allocated buffer)
   if (!using_preallocated) {
-    free(col_buf);
+    free(write_buf);
   }
 
   if (err != ESP_OK) {

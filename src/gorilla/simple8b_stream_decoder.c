@@ -4,9 +4,11 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h> // Optional: for debugging
+#include "esp_log.h"
 #include <stdlib.h>
 #include <string.h>
+
+static const char *TAG = "S8bDecoder";
 
 /* --- Internal Definitions --- */
 
@@ -33,6 +35,10 @@ static const Simple8bSelector selectors[] = {
 struct Simple8bStreamDecoder {
   gorilla_decoder_stream_t
       decoder; // Underlying decoder state (fill callback and context)
+  // Direct pointer mode (zero-copy)
+  const uint8_t *direct_data;
+  size_t direct_size;
+  size_t direct_offset;
   // Decoding state for the current block:
   uint8_t current_selector; // The selector index (0..15)
   uint64_t current_n;       // Number of values in this block.
@@ -50,15 +56,24 @@ struct Simple8bStreamDecoder {
  * A temporary 8-byte buffer is allocated on the stack and filled.
  */
 static bool read_word(Simple8bStreamDecoder *decoder, uint64_t *word) {
+  if (decoder->direct_data) {
+    if (decoder->direct_offset + 8 > decoder->direct_size) {
+      ESP_LOGE(TAG, "No more data in direct buffer");
+      return false;
+    }
+    memcpy(word, decoder->direct_data + decoder->direct_offset, 8);
+    decoder->direct_offset += 8;
+    return true;
+  }
   uint8_t buffer[8];
   size_t filled = 0;
   if (!decoder->decoder.fill_cb(decoder->decoder.fill_ctx, buffer,
                                 sizeof(buffer), &filled)) {
-    printf("Failed to fill buffer\n");
+    ESP_LOGE(TAG, "Failed to fill buffer");
     return false;
   }
   if (filled < sizeof(buffer)) {
-    printf("Failed to read full word\n");
+    ESP_LOGE(TAG, "Failed to read full word");
     return false;
   }
   memcpy(word, buffer, sizeof(buffer));
@@ -121,6 +136,25 @@ simple8b_stream_decoder_create(gorilla_decoder_fill_cb fill_cb,
   return decoder;
 }
 
+Simple8bStreamDecoder *
+simple8b_stream_decoder_create_direct(const uint8_t *data, size_t size) {
+  if (!data || size == 0) {
+    return NULL;
+  }
+
+  Simple8bStreamDecoder *decoder = malloc(sizeof(Simple8bStreamDecoder));
+  if (!decoder)
+    return NULL;
+  memset(decoder, 0, sizeof(Simple8bStreamDecoder));
+
+  decoder->direct_data = data;
+  decoder->direct_size = size;
+  decoder->direct_offset = 0;
+  decoder->current_n = 0;
+  decoder->current_index = 0;
+  return decoder;
+}
+
 /*
  * simple8b_stream_decoder_destroy
  *
@@ -142,7 +176,7 @@ void simple8b_stream_decoder_destroy(Simple8bStreamDecoder *decoder) {
 bool simple8b_stream_decoder_get(Simple8bStreamDecoder *decoder,
                                  uint64_t *value) {
   if (!decoder || !value) {
-    printf("Invalid decoder or value");
+    ESP_LOGE(TAG, "Invalid decoder or value");
     return false;
   }
 
@@ -150,11 +184,11 @@ bool simple8b_stream_decoder_get(Simple8bStreamDecoder *decoder,
   if (decoder->current_index >= decoder->current_n) {
     uint64_t word;
     if (!read_word(decoder, &word)) {
-      printf("Failed to read word from decoder");
+      ESP_LOGE(TAG, "Failed to read word from decoder");
       return false;
     }
     if (!load_block(decoder, word)) {
-      printf("Failed to read word from decoder");
+      ESP_LOGE(TAG, "Failed to load block from word");
       return false;
     }
   }

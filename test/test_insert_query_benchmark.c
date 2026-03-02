@@ -40,7 +40,7 @@ static uint64_t lcg_rand(void) {
 }
 
 /* =========================================================================
- * Data generators
+ * Data generators (float)
  * ========================================================================= */
 
 typedef double (*gen_fn_t)(size_t i, double prev);
@@ -59,6 +59,28 @@ static double gen_centered(size_t i, double prev) {
     double val = prev + (25.0 - prev) * 0.1 + noise;
     if (val < 10.0) val = 10.0;
     if (val > 40.0) val = 40.0;
+    return val;
+}
+
+/* =========================================================================
+ * Data generators (integer)
+ * ========================================================================= */
+
+typedef int64_t (*gen_int_fn_t)(size_t i, int64_t prev);
+
+/* Integer counter: monotonically increasing, ~25 ± 5 per step */
+static int64_t gen_int_counter(size_t i, int64_t prev) {
+    if (i == 0) return 0;
+    return prev + 25 + ((int64_t)(lcg_rand() % 11) - 5);
+}
+
+/* Integer centered: mean-reverting around 2500, range ~[1000,4000] */
+static int64_t gen_int_centered(size_t i, int64_t prev) {
+    if (i == 0) return 2500;
+    int64_t noise = ((int64_t)(lcg_rand() % 601) - 300);
+    int64_t val = prev + (2500 - prev) / 10 + noise;
+    if (val < 1000) val = 1000;
+    if (val > 4000) val = 4000;
     return val;
 }
 
@@ -131,9 +153,9 @@ static scenario_result_t run_scenario(const char *stream_name,
     int64_t t_insert_end = esp_timer_get_time();
     r.insert_ms = (t_insert_end - t_insert_start) / 1000;
 
-    /* 3. Compact */
+    /* 3. Force-compact all remaining L0 pages (ignores threshold) */
     int64_t t_compact_start = esp_timer_get_time();
-    TEST_ASSERT_TRUE_MESSAGE(timeseries_compact_sync(), "compact_sync failed");
+    TEST_ASSERT_TRUE_MESSAGE(timeseries_compact_force_sync(), "compact_force_sync failed");
     int64_t t_compact_end = esp_timer_get_time();
     r.compact_ms = (t_compact_end - t_compact_start) / 1000;
 
@@ -188,7 +210,115 @@ static scenario_result_t run_scenario(const char *stream_name,
 }
 
 /* =========================================================================
- * Benchmark test
+ * Run a single integer scenario
+ * ========================================================================= */
+
+static scenario_result_t run_int_scenario(const char *stream_name,
+                                          uint32_t interval_minutes,
+                                          gen_int_fn_t generate) {
+    scenario_result_t r;
+    memset(&r, 0, sizeof(r));
+    r.stream_name = stream_name;
+    r.interval_minutes = interval_minutes;
+
+    uint64_t interval_ms = (uint64_t)interval_minutes * MS_PER_MINUTE;
+    size_t num_points = SEVEN_DAYS_MINUTES / interval_minutes;
+    r.num_points = num_points;
+
+    /* 1. Clear */
+    TEST_ASSERT_TRUE_MESSAGE(timeseries_clear_all(), "clear_all failed");
+
+    /* 2. Insert — one point at a time */
+    const char *field_names[] = {"value"};
+
+    lcg_seed(42);
+    int64_t prev = 0;
+
+    int64_t t_insert_start = esp_timer_get_time();
+
+    for (size_t i = 0; i < num_points; i++) {
+        int64_t val = generate(i, prev);
+        prev = val;
+
+        uint64_t ts = BASE_TIMESTAMP_MS + i * interval_ms;
+        timeseries_field_value_t fv = {
+            .type = TIMESERIES_FIELD_TYPE_INT,
+            .data.int_val = val,
+        };
+        timeseries_insert_data_t ins = {
+            .measurement_name = "bench",
+            .tag_keys = NULL,
+            .tag_values = NULL,
+            .num_tags = 0,
+            .field_names = field_names,
+            .field_values = &fv,
+            .num_fields = 1,
+            .timestamps_ms = &ts,
+            .num_points = 1,
+        };
+        TEST_ASSERT_TRUE_MESSAGE(timeseries_insert(&ins), "insert failed");
+    }
+
+    int64_t t_insert_end = esp_timer_get_time();
+    r.insert_ms = (t_insert_end - t_insert_start) / 1000;
+
+    /* 3. Force-compact */
+    int64_t t_compact_start = esp_timer_get_time();
+    TEST_ASSERT_TRUE_MESSAGE(timeseries_compact_force_sync(), "compact_force_sync failed");
+    int64_t t_compact_end = esp_timer_get_time();
+    r.compact_ms = (t_compact_end - t_compact_start) / 1000;
+
+    uint64_t end_time = BASE_TIMESTAMP_MS + (uint64_t)(num_points - 1) * interval_ms;
+
+    /* 4. Query 24h */
+    {
+        timeseries_query_t q;
+        memset(&q, 0, sizeof(q));
+        q.measurement_name = "bench";
+        q.start_ms = (int64_t)(end_time - 24 * MS_PER_HOUR);
+        q.end_ms = (int64_t)end_time;
+        q.rollup_interval = (uint32_t)MS_PER_HOUR;
+        q.aggregate_method = TSDB_AGGREGATION_AVG;
+
+        timeseries_query_result_t result;
+        memset(&result, 0, sizeof(result));
+
+        int64_t t0 = esp_timer_get_time();
+        TEST_ASSERT_TRUE_MESSAGE(timeseries_query(&q, &result), "query 24h failed");
+        int64_t t1 = esp_timer_get_time();
+
+        r.query_24h_ms = (t1 - t0) / 1000;
+        r.query_24h_pts = result.num_points;
+        timeseries_query_free_result(&result);
+    }
+
+    /* 5. Query 72h */
+    {
+        timeseries_query_t q;
+        memset(&q, 0, sizeof(q));
+        q.measurement_name = "bench";
+        q.start_ms = (int64_t)(end_time - 72 * MS_PER_HOUR);
+        q.end_ms = (int64_t)end_time;
+        q.rollup_interval = (uint32_t)MS_PER_HOUR;
+        q.aggregate_method = TSDB_AGGREGATION_AVG;
+
+        timeseries_query_result_t result;
+        memset(&result, 0, sizeof(result));
+
+        int64_t t0 = esp_timer_get_time();
+        TEST_ASSERT_TRUE_MESSAGE(timeseries_query(&q, &result), "query 72h failed");
+        int64_t t1 = esp_timer_get_time();
+
+        r.query_72h_ms = (t1 - t0) / 1000;
+        r.query_72h_pts = result.num_points;
+        timeseries_query_free_result(&result);
+    }
+
+    return r;
+}
+
+/* =========================================================================
+ * Benchmark tests
  * ========================================================================= */
 
 TEST_CASE("Insert & Query Benchmark (7 days)", "[benchmark][insert][query]") {
@@ -223,6 +353,60 @@ TEST_CASE("Insert & Query Benchmark (7 days)", "[benchmark][insert][query]") {
     /* Print results table */
     printf("\n");
     printf("=== Insert & Query Benchmark (7 days) ===\n");
+    printf("%-16s | %8s | %7s | %9s | %10s | %7s | %7s | %8s | %8s\n",
+           "Stream", "Interval", "Points", "Insert ms", "Compact ms",
+           "Q24h ms", "Q72h ms", "Q24h pts", "Q72h pts");
+    printf("-----------------+----------+---------+-----------+");
+    printf("------------+---------+---------+----------+---------\n");
+
+    for (size_t i = 0; i < total; i++) {
+        scenario_result_t *r = &results[i];
+        printf("%-16s | %5" PRIu32 "min | %7zu | %9" PRId64 " | %10" PRId64 " | %7" PRId64 " | %7" PRId64 " | %8zu | %8zu\n",
+               r->stream_name,
+               r->interval_minutes,
+               r->num_points,
+               r->insert_ms,
+               r->compact_ms,
+               r->query_24h_ms,
+               r->query_72h_ms,
+               r->query_24h_pts,
+               r->query_72h_pts);
+    }
+    printf("\n");
+}
+
+TEST_CASE("Insert & Query Benchmark INT (7 days)", "[int_benchmark]") {
+    TEST_ASSERT_TRUE_MESSAGE(timeseries_init(), "timeseries_init failed");
+
+    typedef struct {
+        const char *name;
+        gen_int_fn_t gen;
+    } int_stream_def_t;
+
+    static const int_stream_def_t streams[] = {
+        { "IntCounter",  gen_int_counter  },
+        { "IntCentered", gen_int_centered },
+    };
+
+    static const uint32_t intervals[] = { 1, 5, 15 };  /* minutes */
+
+    const size_t num_streams = sizeof(streams) / sizeof(streams[0]);
+    const size_t num_intervals = sizeof(intervals) / sizeof(intervals[0]);
+    const size_t total = num_streams * num_intervals;
+
+    scenario_result_t results[6];
+    size_t idx = 0;
+
+    for (size_t s = 0; s < num_streams; s++) {
+        for (size_t iv = 0; iv < num_intervals; iv++) {
+            results[idx] = run_int_scenario(streams[s].name, intervals[iv], streams[s].gen);
+            idx++;
+        }
+    }
+
+    /* Print results table */
+    printf("\n");
+    printf("=== Insert & Query Benchmark INT (7 days) ===\n");
     printf("%-16s | %8s | %7s | %9s | %10s | %7s | %7s | %8s | %8s\n",
            "Stream", "Interval", "Points", "Insert ms", "Compact ms",
            "Q24h ms", "Q72h ms", "Q24h pts", "Q72h pts");

@@ -63,6 +63,9 @@ typedef struct {
   uint32_t offset;  // next read offset relative to page_offset
   uint32_t current_record_offset;
   bool valid;
+  uint8_t* page_buf;       // bulk-read page buffer (NULL if alloc failed, falls back to flash reads)
+  uint32_t page_buf_size;  // size of the buffered region (page_size - header)
+  bool owns_page_buf;      // true if we allocated page_buf (deinit frees it)
 } timeseries_fielddata_iterator_t;
 
 /**
@@ -108,6 +111,22 @@ typedef struct {
  */
 bool timeseries_fielddata_iterator_init(timeseries_db_t* db, uint32_t page_offset, uint32_t page_size,
                                         timeseries_fielddata_iterator_t* f_iter);
+
+/**
+ * @brief Initialize using a caller-owned buffer instead of allocating one.
+ *
+ * The buffer must be at least (page_size - header_size) bytes.
+ * The caller is responsible for freeing the buffer after deinit.
+ */
+bool timeseries_fielddata_iterator_init_with_buffer(timeseries_db_t* db, uint32_t page_offset,
+                                                     uint32_t page_size, uint8_t* buf,
+                                                     uint32_t buf_capacity,
+                                                     timeseries_fielddata_iterator_t* f_iter);
+
+/**
+ * @brief Free resources held by the field-data iterator (page buffer).
+ */
+void timeseries_fielddata_iterator_deinit(timeseries_fielddata_iterator_t* f_iter);
 
 /**
  * @brief Move to the next field-data record in the page, returning its header.

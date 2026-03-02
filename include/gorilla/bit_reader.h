@@ -24,10 +24,17 @@ typedef struct {
   int buf_byte;       // current read position in buffer
   FillCallback fill_cb;
   void *fill_ctx;
+  // Direct pointer mode (zero-copy when data is already in RAM)
+  const uint8_t *direct_data;
+  size_t direct_size;
+  size_t direct_offset;
 } BitReader;
 
-// Initialize the BitReader.
+// Initialize the BitReader with a fill callback.
 void bitreader_init(BitReader *br, FillCallback fill_cb, void *fill_ctx);
+
+// Initialize the BitReader in direct pointer mode (zero-copy).
+void bitreader_init_direct(BitReader *br, const uint8_t *data, size_t size);
 
 // Returns the number of bits available in the BitReader (window + buffer).
 static inline int bitreader_available(const BitReader *br) {
@@ -35,6 +42,12 @@ static inline int bitreader_available(const BitReader *br) {
 }
 
 static inline bool br_next_byte(BitReader *br, uint8_t *b) {
+  if (br->direct_data) {
+    if (br->direct_offset >= br->direct_size)
+      return false;
+    *b = br->direct_data[br->direct_offset++];
+    return true;
+  }
   if (br->buf_byte >= br->buf_size) {
     size_t filled = 0;
     if (!br->fill_cb(br->fill_ctx, br->buffer, 64, &filled))

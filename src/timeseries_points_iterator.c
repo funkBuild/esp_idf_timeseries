@@ -87,117 +87,74 @@ bool timeseries_points_iterator_init(
     return false;
   }
 
-  prof_start = esp_timer_get_time();
+  // 1) Read col_data_header — for compressed path, read entire record in one go
   timeseries_col_data_header_t col_hdr;
-  esp_err_t err = esp_partition_read(db->partition, record_data_offset,
-                                     &col_hdr, sizeof(col_hdr));
-  prof_end = esp_timer_get_time();
-  prof_hdr_read = prof_end - prof_start;
 
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed reading col_header at 0x%08X (err=0x%x)",
-             (unsigned)record_data_offset, err);
-    iter->valid = false;
-    return false;
-  }
-
-  // Offsets for the two blocks
-  uint32_t ts_offset = record_data_offset + sizeof(col_hdr);
-  uint32_t val_offset = ts_offset + col_hdr.ts_len;
-
-  // Basic boundary check
-  if (val_offset + col_hdr.val_len > db->partition->size) {
-    ESP_LOGE(TAG, "Column data extends out of partition");
-    iter->valid = false;
-    return false;
-  }
-
-  // 2) If compressed => load Gorilla blocks into memory
+  // 2) If compressed => single flash read for header + ts + val blocks
   if (compressed) {
-    iter->ts_comp_len = col_hdr.ts_len;
-
     prof_start = esp_timer_get_time();
-    iter->ts_comp_buf = (uint8_t *)malloc(col_hdr.ts_len);
+    uint8_t *record_buf = (uint8_t *)malloc(record_length);
     prof_end = esp_timer_get_time();
     prof_ts_malloc = prof_end - prof_start;
 
-    if (!iter->ts_comp_buf) {
-      ESP_LOGE(TAG, "OOM for timestamp buffer of size %u",
-               (unsigned)col_hdr.ts_len);
+    if (!record_buf) {
+      ESP_LOGE(TAG, "OOM for record buffer of size %u",
+               (unsigned)record_length);
       iter->valid = false;
       return false;
     }
 
     prof_start = esp_timer_get_time();
-    err = esp_partition_read(db->partition, ts_offset, iter->ts_comp_buf,
-                             col_hdr.ts_len);
+    esp_err_t err = esp_partition_read(db->partition, record_data_offset,
+                                       record_buf, record_length);
     prof_end = esp_timer_get_time();
-    prof_ts_read = prof_end - prof_start;
+    prof_hdr_read = prof_end - prof_start;
 
     if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed reading timestamp block (err=0x%x)", err);
-      free(iter->ts_comp_buf);
-      iter->ts_comp_buf = NULL;
+      ESP_LOGE(TAG, "Failed reading record at 0x%08X (err=0x%x)",
+               (unsigned)record_data_offset, err);
+      free(record_buf);
       iter->valid = false;
       return false;
     }
 
+    memcpy(&col_hdr, record_buf, sizeof(col_hdr));
+
+    // Basic boundary check
+    uint32_t val_end = (uint32_t)sizeof(col_hdr) + col_hdr.ts_len + col_hdr.val_len;
+    if (val_end > record_length ||
+        record_data_offset + val_end > db->partition->size) {
+      ESP_LOGE(TAG, "Column data extends out of partition");
+      free(record_buf);
+      iter->valid = false;
+      return false;
+    }
+
+    // Pointers into the single buffer
+    uint8_t *ts_data = record_buf + sizeof(col_hdr);
+    uint8_t *val_data = record_buf + sizeof(col_hdr) + col_hdr.ts_len;
+
+    iter->ts_comp_len = col_hdr.ts_len;
     iter->val_comp_len = col_hdr.val_len;
-
-    prof_start = esp_timer_get_time();
-    iter->val_comp_buf = (uint8_t *)malloc(col_hdr.val_len);
-    prof_end = esp_timer_get_time();
-    prof_val_malloc = prof_end - prof_start;
-
-    if (!iter->val_comp_buf) {
-      ESP_LOGE(TAG, "OOM for value buffer of size %u",
-               (unsigned)col_hdr.val_len);
-      free(iter->ts_comp_buf);
-      iter->ts_comp_buf = NULL;
-      iter->valid = false;
-      return false;
-    }
-
-    prof_start = esp_timer_get_time();
-    err = esp_partition_read(db->partition, val_offset, iter->val_comp_buf,
-                             col_hdr.val_len);
-    prof_end = esp_timer_get_time();
-    prof_val_read = prof_end - prof_start;
-
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed reading value block (err=0x%x)", err);
-      free(iter->ts_comp_buf);
-      free(iter->val_comp_buf);
-      iter->ts_comp_buf = NULL;
-      iter->val_comp_buf = NULL;
-      iter->valid = false;
-      return false;
-    }
 
     // Check if this record uses ALP encoding (bit2=0 means ALP)
     bool use_alp = (data_flags & TSDB_FIELDDATA_FLAG_ENCODING_ALP) == 0;
 
     if (use_alp) {
-      /* --- ALP decode path --- */
+      /* --- ALP decode path: decode directly from record_buf, then free it --- */
       iter->alp_ts = (int64_t *)malloc(record_count * sizeof(int64_t));
       if (!iter->alp_ts) {
         ESP_LOGE(TAG, "OOM for ALP timestamp array of size %u", record_count);
-        free(iter->ts_comp_buf);
-        free(iter->val_comp_buf);
-        iter->ts_comp_buf = NULL;
-        iter->val_comp_buf = NULL;
+        free(record_buf);
         iter->valid = false;
         return false;
       }
-      if (!alp_decode_int(iter->ts_comp_buf, iter->ts_comp_len,
+      if (!alp_decode_int(ts_data, col_hdr.ts_len,
                           iter->alp_ts, record_count)) {
         ESP_LOGE(TAG, "ALP timestamp decode failed");
         free(iter->alp_ts);
-        free(iter->ts_comp_buf);
-        free(iter->val_comp_buf);
+        free(record_buf);
         iter->alp_ts = NULL;
-        iter->ts_comp_buf = NULL;
-        iter->val_comp_buf = NULL;
         iter->valid = false;
         return false;
       }
@@ -207,25 +164,19 @@ bool timeseries_points_iterator_init(
         if (!iter->alp_float) {
           ESP_LOGE(TAG, "OOM for ALP float array of size %u", record_count);
           free(iter->alp_ts);
-          free(iter->ts_comp_buf);
-          free(iter->val_comp_buf);
+          free(record_buf);
           iter->alp_ts = NULL;
-          iter->ts_comp_buf = NULL;
-          iter->val_comp_buf = NULL;
           iter->valid = false;
           return false;
         }
-        if (!alp_decode(iter->val_comp_buf, iter->val_comp_len,
+        if (!alp_decode(val_data, col_hdr.val_len,
                         iter->alp_float, record_count)) {
           ESP_LOGE(TAG, "ALP float value decode failed");
           free(iter->alp_ts);
           free(iter->alp_float);
-          free(iter->ts_comp_buf);
-          free(iter->val_comp_buf);
+          free(record_buf);
           iter->alp_ts = NULL;
           iter->alp_float = NULL;
-          iter->ts_comp_buf = NULL;
-          iter->val_comp_buf = NULL;
           iter->valid = false;
           return false;
         }
@@ -234,69 +185,46 @@ bool timeseries_points_iterator_init(
         if (!iter->alp_int) {
           ESP_LOGE(TAG, "OOM for ALP int array of size %u", record_count);
           free(iter->alp_ts);
-          free(iter->ts_comp_buf);
-          free(iter->val_comp_buf);
+          free(record_buf);
           iter->alp_ts = NULL;
-          iter->ts_comp_buf = NULL;
-          iter->val_comp_buf = NULL;
           iter->valid = false;
           return false;
         }
-        if (!alp_decode_int(iter->val_comp_buf, iter->val_comp_len,
+        if (!alp_decode_int(val_data, col_hdr.val_len,
                             iter->alp_int, record_count)) {
           ESP_LOGE(TAG, "ALP int value decode failed");
           free(iter->alp_ts);
           free(iter->alp_int);
-          free(iter->ts_comp_buf);
-          free(iter->val_comp_buf);
+          free(record_buf);
           iter->alp_ts = NULL;
           iter->alp_int = NULL;
-          iter->ts_comp_buf = NULL;
-          iter->val_comp_buf = NULL;
           iter->valid = false;
           return false;
         }
       }
 
-      // Compressed buffers consumed; free them now
-      free(iter->ts_comp_buf);
-      free(iter->val_comp_buf);
-      iter->ts_comp_buf = NULL;
-      iter->val_comp_buf = NULL;
+      // Single record buffer consumed; free it now
+      free(record_buf);
 
       ESP_LOGD(TAG, "Iterator init: ALP, record_count=%u", record_count);
       return iter->valid;
     }
 
-    // Now initialize Gorilla decoders (timestamps + values)
+    // Gorilla path: keep record_buf alive; ts_comp_buf owns the allocation
+    iter->ts_comp_buf = record_buf;   // base allocation (includes col_hdr prefix)
+    iter->val_comp_buf = NULL;        // val data is inside record_buf
+
+    // Now initialize Gorilla decoders (timestamps + values) in zero-copy mode
     prof_start = esp_timer_get_time();
 
-    iter->ts_cb_storage.data = iter->ts_comp_buf;
-    iter->ts_cb_storage.size = iter->ts_comp_len;
-    iter->ts_cb_storage.capacity = iter->ts_comp_len;
-
-    iter->ts_decoder_context.cb = &iter->ts_cb_storage;
-    iter->ts_decoder_context.offset = 0;
-
-    if (!gorilla_decoder_init(&iter->ts_decoder, GORILLA_STREAM_INT,
-                              decoder_fill_callback,
-                              &iter->ts_decoder_context)) {
+    if (!gorilla_decoder_init_direct(&iter->ts_decoder, GORILLA_STREAM_INT,
+                                     ts_data, col_hdr.ts_len)) {
       ESP_LOGE(TAG, "Failed to init Gorilla ts_decoder.");
       free(iter->ts_comp_buf);
-      free(iter->val_comp_buf);
       iter->ts_comp_buf = NULL;
-      iter->val_comp_buf = NULL;
       iter->valid = false;
       return false;
     }
-
-    // Values
-    iter->val_cb_storage.data = iter->val_comp_buf;
-    iter->val_cb_storage.size = iter->val_comp_len;
-    iter->val_cb_storage.capacity = iter->val_comp_len;
-
-    iter->val_decoder_context.cb = &iter->val_cb_storage;
-    iter->val_decoder_context.offset = 0;
 
     gorilla_stream_type_t val_mode;
     switch (series_type) {
@@ -314,18 +242,60 @@ bool timeseries_points_iterator_init(
       break;
     }
 
-    if (!gorilla_decoder_init(&iter->val_decoder, val_mode,
-                              decoder_fill_callback,
-                              &iter->val_decoder_context)) {
+    // String type still needs fill callback (uses zlib internally)
+    bool val_init_ok;
+    if (val_mode == GORILLA_STREAM_STRING) {
+      iter->val_cb_storage.data = val_data;
+      iter->val_cb_storage.size = col_hdr.val_len;
+      iter->val_cb_storage.capacity = col_hdr.val_len;
+      iter->val_decoder_context.cb = &iter->val_cb_storage;
+      iter->val_decoder_context.offset = 0;
+      val_init_ok = gorilla_decoder_init(&iter->val_decoder, val_mode,
+                                         decoder_fill_callback,
+                                         &iter->val_decoder_context);
+    } else {
+      val_init_ok = gorilla_decoder_init_direct(&iter->val_decoder, val_mode,
+                                                val_data, col_hdr.val_len);
+    }
+
+    if (!val_init_ok) {
       ESP_LOGE(TAG, "Failed to init Gorilla val_decoder.");
       gorilla_decoder_deinit(&iter->ts_decoder);
-      free(iter->ts_comp_buf);
-      free(iter->val_comp_buf);
+      free(iter->ts_comp_buf);  // frees the single record_buf allocation
       iter->ts_comp_buf = NULL;
-      iter->val_comp_buf = NULL;
       iter->valid = false;
       return false;
     }
+
+    // Batch-decode all Gorilla timestamps into an array so we can
+    // random-access them (enables time-range pruning via binary search).
+    iter->gorilla_batch_ts = (int64_t *)malloc(record_count * sizeof(int64_t));
+    if (!iter->gorilla_batch_ts) {
+      ESP_LOGE(TAG, "OOM for gorilla_batch_ts of size %u", record_count);
+      gorilla_decoder_deinit(&iter->ts_decoder);
+      gorilla_decoder_deinit(&iter->val_decoder);
+      free(iter->ts_comp_buf);
+      iter->ts_comp_buf = NULL;
+      iter->valid = false;
+      return false;
+    }
+    for (uint16_t i = 0; i < record_count; i++) {
+      uint64_t ts;
+      if (!gorilla_decoder_get_timestamp(&iter->ts_decoder, &ts)) {
+        ESP_LOGE(TAG, "Gorilla batch ts decode failed at i=%u", i);
+        free(iter->gorilla_batch_ts);
+        iter->gorilla_batch_ts = NULL;
+        gorilla_decoder_deinit(&iter->ts_decoder);
+        gorilla_decoder_deinit(&iter->val_decoder);
+        free(iter->ts_comp_buf);
+        iter->ts_comp_buf = NULL;
+        iter->valid = false;
+        return false;
+      }
+      iter->gorilla_batch_ts[i] = (int64_t)ts;
+    }
+    // ts_decoder is fully consumed — deinit it
+    gorilla_decoder_deinit(&iter->ts_decoder);
 
     prof_end = esp_timer_get_time();
     prof_decoder_init = prof_end - prof_start;
@@ -333,7 +303,7 @@ bool timeseries_points_iterator_init(
     // Log detailed profiling breakdown
     uint64_t total_time = prof_hdr_read + prof_ts_malloc + prof_ts_read +
                           prof_val_malloc + prof_val_read + prof_decoder_init;
-    ESP_LOGI(TAG, "[ITER INIT] Total: %.3f ms (hdr: %.3f, ts_malloc: %.3f, ts_read: %.3f, val_malloc: %.3f, val_read: %.3f, decoder: %.3f) [ts_len=%u, val_len=%u]",
+    ESP_LOGD(TAG, "[ITER INIT] Total: %.3f ms (hdr: %.3f, ts_malloc: %.3f, ts_read: %.3f, val_malloc: %.3f, val_read: %.3f, decoder: %.3f) [ts_len=%u, val_len=%u]",
              total_time / 1000.0,
              prof_hdr_read / 1000.0,
              prof_ts_malloc / 1000.0,
@@ -347,45 +317,52 @@ bool timeseries_points_iterator_init(
     ESP_LOGV(TAG, "Iterator init: compressed, record_count=%u", record_count);
   } else {
     /* ----------------------------------------------------------------------
-     * 3) Not compressed => read timestamps and values from partition
+     * 3) Not compressed => single flash read for header + ts + val
      * --------------------------------------------------------------------*/
-    // A) Read timestamps into iter->ts_array
-    iter->ts_array = (uint64_t *)malloc(record_count * sizeof(uint64_t));
+    timeseries_col_data_header_t uc_hdr;
+
+    // Read entire record in one flash read into a temp buffer
+    uint8_t *record_buf = (uint8_t *)malloc(record_length);
+    if (!record_buf) {
+      ESP_LOGE(TAG, "OOM for uncompressed record buffer of size %u",
+               (unsigned)record_length);
+      iter->valid = false;
+      return false;
+    }
+    esp_err_t uc_err = esp_partition_read(db->partition, record_data_offset,
+                                          record_buf, record_length);
+    if (uc_err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed reading uncompressed record (err=0x%x)", uc_err);
+      free(record_buf);
+      iter->valid = false;
+      return false;
+    }
+    memcpy(&uc_hdr, record_buf, sizeof(uc_hdr));
+
+    uint32_t ts_size = record_count * sizeof(uint64_t);
+
+    // A) Allocate and copy timestamps
+    iter->ts_array = (uint64_t *)malloc(ts_size);
     if (!iter->ts_array) {
       ESP_LOGE(TAG, "OOM for uncompressed ts array");
+      free(record_buf);
       iter->valid = false;
       return false;
     }
-    err = esp_partition_read(db->partition, ts_offset, iter->ts_array,
-                             record_count * sizeof(uint64_t));
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed reading uncompressed ts array");
-      free(iter->ts_array);
-      iter->ts_array = NULL;
-      iter->valid = false;
-      return false;
-    }
+    memcpy(iter->ts_array, record_buf + sizeof(uc_hdr), ts_size);
 
-    // B) Read values: We'll read them into a temporary buffer,
-    //    then parse into float_array / int_array / bool_array
-    uint8_t *val_buf = (uint8_t *)malloc(col_hdr.val_len);
+    // B) Allocate and copy values
+    uint8_t *val_buf = (uint8_t *)malloc(uc_hdr.val_len);
     if (!val_buf) {
       ESP_LOGE(TAG, "OOM for uncompressed values buffer");
       free(iter->ts_array);
+      free(record_buf);
       iter->ts_array = NULL;
       iter->valid = false;
       return false;
     }
-    err =
-        esp_partition_read(db->partition, val_offset, val_buf, col_hdr.val_len);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed reading uncompressed value array");
-      free(iter->ts_array);
-      free(val_buf);
-      iter->ts_array = NULL;
-      iter->valid = false;
-      return false;
-    }
+    memcpy(val_buf, record_buf + sizeof(uc_hdr) + uc_hdr.ts_len, uc_hdr.val_len);
+    free(record_buf);
 
     // Parse val_buf according to series_type
     // We'll assume each sample has a fixed size for demonstration:
@@ -397,54 +374,31 @@ bool timeseries_points_iterator_init(
 
     switch (series_type) {
     case TIMESERIES_FIELD_TYPE_FLOAT: {
-      iter->float_array = (double *)malloc(record_count * sizeof(double));
-      if (!iter->float_array) {
-        ESP_LOGE(TAG, "OOM for float_array of size=%u", record_count);
+      if (uc_hdr.val_len < record_count * sizeof(double)) {
+        ESP_LOGE(TAG, "Value buffer too small for %u doubles", record_count);
         free(iter->ts_array);
         free(val_buf);
         iter->ts_array = NULL;
         iter->valid = false;
         return false;
       }
-
-      size_t offset = 0;
-      for (size_t i = 0; i < record_count; i++) {
-        double dval = 0.0;
-        // read 8 bytes
-        if (offset + 8 > col_hdr.val_len) {
-          ESP_LOGE(TAG, "Value buffer too small for float at i=%zu", i);
-          iter->valid = false;
-          break;
-        }
-        memcpy(&dval, val_buf + offset, 8);
-        offset += 8;
-        iter->float_array[i] = dval;
-      }
+      // val_buf is already in native double[] layout — adopt it directly
+      iter->float_array = (double *)val_buf;
+      val_buf = NULL; // deinit will free float_array
       break;
     }
     case TIMESERIES_FIELD_TYPE_INT: {
-      iter->int_array = (int64_t *)malloc(record_count * sizeof(int64_t));
-      if (!iter->int_array) {
-        ESP_LOGE(TAG, "OOM for int_array of size=%u", record_count);
+      if (uc_hdr.val_len < record_count * sizeof(int64_t)) {
+        ESP_LOGE(TAG, "Value buffer too small for %u int64s", record_count);
         free(iter->ts_array);
         free(val_buf);
         iter->ts_array = NULL;
         iter->valid = false;
         return false;
       }
-
-      size_t offset = 0;
-      for (size_t i = 0; i < record_count; i++) {
-        int64_t ival = 0;
-        if (offset + 8 > col_hdr.val_len) {
-          ESP_LOGE(TAG, "Value buffer too small for int at i=%zu", i);
-          iter->valid = false;
-          break;
-        }
-        memcpy(&ival, val_buf + offset, 8);
-        offset += 8;
-        iter->int_array[i] = ival;
-      }
+      // val_buf is already in native int64_t[] layout — adopt it directly
+      iter->int_array = (int64_t *)val_buf;
+      val_buf = NULL; // deinit will free int_array
       break;
     }
     case TIMESERIES_FIELD_TYPE_BOOL: {
@@ -460,7 +414,7 @@ bool timeseries_points_iterator_init(
 
       size_t offset = 0;
       for (size_t i = 0; i < record_count; i++) {
-        if (offset + 1 > col_hdr.val_len) {
+        if (offset + 1 > uc_hdr.val_len) {
           ESP_LOGE(TAG, "Value buffer too small for bool at i=%zu", i);
           iter->valid = false;
           break;
@@ -490,7 +444,7 @@ bool timeseries_points_iterator_init(
       for (i = 0; i < record_count; i++) {
         // Read string length (4 bytes)
         uint32_t str_len = 0;
-        if (offset + 4 > col_hdr.val_len) {
+        if (offset + 4 > uc_hdr.val_len) {
           ESP_LOGE(TAG, "Value buffer too small for string length at i=%zu", i);
           iter->valid = false;
           break;
@@ -503,7 +457,7 @@ bool timeseries_points_iterator_init(
 
         // Allocate and copy the string data
         if (str_len > 0) {
-          if (offset + str_len > col_hdr.val_len) {
+          if (offset + str_len > uc_hdr.val_len) {
             ESP_LOGE(TAG, "Value buffer too small for string data at i=%zu", i);
             iter->valid = false;
             break;
@@ -563,6 +517,89 @@ bool timeseries_points_iterator_init(
 }
 
 /* --------------------------------------------------------------------------
+ * timeseries_points_iterator_set_time_range(...)
+ * --------------------------------------------------------------------------*/
+void timeseries_points_iterator_set_time_range(
+    timeseries_points_iterator_t *iter, uint64_t start_ms, uint64_t end_ms) {
+  if (!iter || !iter->valid) return;
+
+  /* We need a random-access timestamp array. ALP path uses alp_ts,
+   * Gorilla batch path uses gorilla_batch_ts,
+   * uncompressed path uses ts_array. */
+  const int64_t *ts_i64 = NULL;   /* ALP or Gorilla batch timestamps (signed) */
+  const uint64_t *ts_u64 = NULL;  /* uncompressed timestamps */
+  uint16_t count = iter->ts_count;
+
+  if (iter->alp_ts) {
+    ts_i64 = iter->alp_ts;
+  } else if (iter->gorilla_batch_ts) {
+    ts_i64 = iter->gorilla_batch_ts;
+  } else if (!iter->is_compressed && iter->ts_array) {
+    ts_u64 = iter->ts_array;
+  } else {
+    return; /* no random-access timestamps available */
+  }
+
+  /* Binary search for lower bound (first index >= start_ms) */
+  uint16_t old_idx = iter->current_idx;
+  if (start_ms > 0) {
+    uint16_t lo = 0, hi = count;
+    while (lo < hi) {
+      uint16_t mid = lo + (hi - lo) / 2;
+      uint64_t t = ts_i64 ? (uint64_t)ts_i64[mid] : ts_u64[mid];
+      if (t < start_ms) lo = mid + 1; else hi = mid;
+    }
+    iter->current_idx = lo;
+  }
+
+  /* Binary search for upper bound (last index <= end_ms) */
+  if (end_ms > 0) {
+    uint16_t lo = iter->current_idx, hi = count;
+    while (lo < hi) {
+      uint16_t mid = lo + (hi - lo) / 2;
+      uint64_t t = ts_i64 ? (uint64_t)ts_i64[mid] : ts_u64[mid];
+      if (t <= end_ms) lo = mid + 1; else hi = mid;
+    }
+    iter->ts_count = lo;
+  }
+
+  /* Gorilla batch path: val_decoder is still streaming, so we must
+   * consume and discard the first (current_idx - old_idx) values to
+   * keep the value stream aligned with the timestamp array position. */
+  if (iter->gorilla_batch_ts && iter->current_idx > old_idx) {
+    uint16_t skip = iter->current_idx - old_idx;
+    for (uint16_t i = 0; i < skip; i++) {
+      switch (iter->series_type) {
+      case TIMESERIES_FIELD_TYPE_FLOAT: {
+        double dval;
+        gorilla_decoder_get_float(&iter->val_decoder, &dval);
+        break;
+      }
+      case TIMESERIES_FIELD_TYPE_INT: {
+        uint64_t i64;
+        gorilla_decoder_get_timestamp(&iter->val_decoder, &i64);
+        break;
+      }
+      case TIMESERIES_FIELD_TYPE_BOOL: {
+        bool bval;
+        gorilla_decoder_get_boolean(&iter->val_decoder, &bval);
+        break;
+      }
+      case TIMESERIES_FIELD_TYPE_STRING: {
+        uint8_t *str = NULL;
+        size_t slen = 0;
+        gorilla_decoder_get_string(&iter->val_decoder, &str, &slen);
+        free(str);
+        break;
+      }
+      default:
+        break;
+      }
+    }
+  }
+}
+
+/* --------------------------------------------------------------------------
  * timeseries_points_iterator_next_timestamp(...)
  * --------------------------------------------------------------------------*/
 bool timeseries_points_iterator_next_timestamp(
@@ -578,8 +615,11 @@ bool timeseries_points_iterator_next_timestamp(
     // ALP path: read from decoded array; index advances in next_value
     *out_timestamp = (uint64_t)iter->alp_ts[iter->current_idx];
     return true;
+  } else if (iter->gorilla_batch_ts) {
+    // Gorilla batch-decoded timestamps: random-access from array
+    *out_timestamp = (uint64_t)iter->gorilla_batch_ts[iter->current_idx];
   } else if (iter->is_compressed) {
-    // Gorilla-decoded approach
+    // Gorilla streaming approach (fallback, shouldn't normally reach here)
     if (!gorilla_decoder_get_timestamp(&iter->ts_decoder, out_timestamp)) {
       ESP_LOGE(TAG, "Failed to decode next timestamp at idx=%u",
                iter->current_idx);
@@ -755,8 +795,15 @@ void timeseries_points_iterator_deinit(timeseries_points_iterator_t *iter) {
     }
   } else if (iter->is_compressed) {
     // Gorilla path: deinit decoders + free buffers
-    gorilla_decoder_deinit(&iter->ts_decoder);
+    // ts_decoder is already deinited if gorilla_batch_ts was used
+    if (!iter->gorilla_batch_ts) {
+      gorilla_decoder_deinit(&iter->ts_decoder);
+    }
     gorilla_decoder_deinit(&iter->val_decoder);
+    if (iter->gorilla_batch_ts) {
+      free(iter->gorilla_batch_ts);
+      iter->gorilla_batch_ts = NULL;
+    }
     if (iter->ts_comp_buf) {
       free(iter->ts_comp_buf);
       iter->ts_comp_buf = NULL;

@@ -21,6 +21,14 @@ IntegerStreamDecoder *
 integer_stream_decoder_create(gorilla_decoder_fill_cb fill_cb, void *fill_ctx);
 
 /**
+ * @brief Create a new IntegerStreamDecoder in direct pointer mode.
+ *
+ * Zero-copy: reads directly from data already in RAM.
+ */
+IntegerStreamDecoder *
+integer_stream_decoder_create_direct(const uint8_t *data, size_t size);
+
+/**
  * @brief Destroy the IntegerStreamDecoder and free resources.
  *
  * @param decoder The decoder instance to destroy.

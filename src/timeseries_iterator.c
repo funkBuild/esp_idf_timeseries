@@ -264,7 +264,71 @@ bool timeseries_fielddata_iterator_init(timeseries_db_t* db, uint32_t page_offse
   // we do NOT set current_record_offset here; we do it in _next()
   f_iter->current_record_offset = 0;
   f_iter->valid = true;
+
+  // Bulk-read the page data (after header) into RAM for fast iteration
+  uint32_t data_size = page_size - sizeof(timeseries_page_header_t);
+  f_iter->page_buf = (uint8_t*)malloc(data_size);
+  f_iter->page_buf_size = 0;
+  f_iter->owns_page_buf = true;
+  if (f_iter->page_buf) {
+    esp_err_t err = esp_partition_read(db->partition,
+                                       page_offset + sizeof(timeseries_page_header_t),
+                                       f_iter->page_buf, data_size);
+    if (err == ESP_OK) {
+      f_iter->page_buf_size = data_size;
+    } else {
+      free(f_iter->page_buf);
+      f_iter->page_buf = NULL;
+    }
+  }
   return true;
+}
+
+bool timeseries_fielddata_iterator_init_with_buffer(timeseries_db_t* db, uint32_t page_offset,
+                                                     uint32_t page_size, uint8_t* buf,
+                                                     uint32_t buf_capacity,
+                                                     timeseries_fielddata_iterator_t* f_iter) {
+  if (!db || !f_iter) {
+    return false;
+  }
+  if (page_offset + page_size > db->partition->size) {
+    return false;
+  }
+  f_iter->db = db;
+  f_iter->page_offset = page_offset;
+  f_iter->page_size = page_size;
+  f_iter->offset = sizeof(timeseries_page_header_t);
+  f_iter->current_record_offset = 0;
+  f_iter->valid = true;
+  f_iter->owns_page_buf = false;
+
+  uint32_t data_size = page_size - sizeof(timeseries_page_header_t);
+  if (buf && buf_capacity >= data_size) {
+    esp_err_t err = esp_partition_read(db->partition,
+                                       page_offset + sizeof(timeseries_page_header_t),
+                                       buf, data_size);
+    if (err == ESP_OK) {
+      f_iter->page_buf = buf;
+      f_iter->page_buf_size = data_size;
+    } else {
+      f_iter->page_buf = NULL;
+      f_iter->page_buf_size = 0;
+    }
+  } else {
+    f_iter->page_buf = NULL;
+    f_iter->page_buf_size = 0;
+  }
+  return true;
+}
+
+void timeseries_fielddata_iterator_deinit(timeseries_fielddata_iterator_t* f_iter) {
+  if (f_iter && f_iter->page_buf && f_iter->owns_page_buf) {
+    free(f_iter->page_buf);
+  }
+  if (f_iter) {
+    f_iter->page_buf = NULL;
+    f_iter->page_buf_size = 0;
+  }
 }
 
 bool timeseries_fielddata_iterator_next(timeseries_fielddata_iterator_t* f_iter,
@@ -272,11 +336,13 @@ bool timeseries_fielddata_iterator_next(timeseries_fielddata_iterator_t* f_iter,
   if (!f_iter || !f_iter->valid) {
     return false;
   }
-  uint32_t page_end = f_iter->page_offset + f_iter->page_size;
-  uint32_t curr_offset = f_iter->page_offset + f_iter->offset;
+
+  // offset is relative to page_offset; data starts after page header
+  uint32_t hdr_size = sizeof(timeseries_page_header_t);
+  uint32_t rel_data_offset = f_iter->offset - hdr_size;  // offset into page_buf
 
   // Check we can read a field_data_header
-  if (curr_offset + sizeof(timeseries_field_data_header_t) > page_end) {
+  if (f_iter->offset + sizeof(timeseries_field_data_header_t) > f_iter->page_size) {
     f_iter->valid = false;
     return false;
   }
@@ -284,12 +350,17 @@ bool timeseries_fielddata_iterator_next(timeseries_fielddata_iterator_t* f_iter,
   // The current record is at offset
   f_iter->current_record_offset = f_iter->offset;
 
-  // read the header
+  // read the header — from buffer if available, else from flash
   timeseries_field_data_header_t local_hdr;
-  esp_err_t err = esp_partition_read(f_iter->db->partition, curr_offset, &local_hdr, sizeof(local_hdr));
-  if (err != ESP_OK) {
-    f_iter->valid = false;
-    return false;
+  if (f_iter->page_buf && rel_data_offset + sizeof(local_hdr) <= f_iter->page_buf_size) {
+    memcpy(&local_hdr, f_iter->page_buf + rel_data_offset, sizeof(local_hdr));
+  } else {
+    uint32_t curr_offset = f_iter->page_offset + f_iter->offset;
+    esp_err_t err = esp_partition_read(f_iter->db->partition, curr_offset, &local_hdr, sizeof(local_hdr));
+    if (err != ESP_OK) {
+      f_iter->valid = false;
+      return false;
+    }
   }
 
   // check blank => done
@@ -319,7 +390,7 @@ bool timeseries_fielddata_iterator_next(timeseries_fielddata_iterator_t* f_iter,
 
   // skip the entire record => header + data
   uint32_t record_size = sizeof(timeseries_field_data_header_t) + local_hdr.record_length;
-  if (curr_offset + record_size > page_end) {
+  if (f_iter->offset + record_size > f_iter->page_size) {
     // out of boundary
     f_iter->valid = false;
     return false;
@@ -335,24 +406,30 @@ bool timeseries_fielddata_iterator_read_data(timeseries_fielddata_iterator_t* f_
     return false;
   }
 
-  // The record header is at (page_offset + current_record_offset)
-  uint32_t record_start = f_iter->page_offset + f_iter->current_record_offset;
-  uint32_t data_offset = record_start + sizeof(timeseries_field_data_header_t);
-
   // boundary checks
   if (buf_len > hdr->record_length) {
     ESP_LOGW(TAG, "Requested buf_len=%zu but record_length=%u", buf_len, (unsigned int)hdr->record_length);
     return false;
   }
-  uint32_t page_end = f_iter->page_offset + f_iter->page_size;
-  if (data_offset + hdr->record_length > page_end) {
+
+  // Data starts after the header within the current record
+  uint32_t data_rel = f_iter->current_record_offset + sizeof(timeseries_field_data_header_t);
+  uint32_t page_end_rel = f_iter->page_size;
+  if (data_rel + hdr->record_length > page_end_rel) {
     return false;
   }
 
-  esp_err_t err = esp_partition_read(f_iter->db->partition, data_offset, out_buf, buf_len);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed reading field-data entry data (err=0x%x)", err);
-    return false;
+  // Read from buffer if available, else from flash
+  uint32_t buf_offset = data_rel - sizeof(timeseries_page_header_t);
+  if (f_iter->page_buf && buf_offset + buf_len <= f_iter->page_buf_size) {
+    memcpy(out_buf, f_iter->page_buf + buf_offset, buf_len);
+  } else {
+    uint32_t abs_offset = f_iter->page_offset + data_rel;
+    esp_err_t err = esp_partition_read(f_iter->db->partition, abs_offset, out_buf, buf_len);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed reading field-data entry data (err=0x%x)", err);
+      return false;
+    }
   }
   return true;
 }

@@ -40,152 +40,164 @@
  */
 
 /*-------------------------------------------------------------------------------------
- *  HELPER: Convert an incoming val => double for aggregator (only if numeric).
- *          Returns (0.0) if it's a string or unknown type.
+ *  Aggregator state — holds both int64 and double accumulators.
+ *  The int64 path avoids costly double conversions on ESP32-S3 (no hw double FPU).
  *-------------------------------------------------------------------------------------*/
-static double to_double_for_agg(const timeseries_field_value_t *val) {
-  if (!val) {
-    return 0.0;
-  }
+typedef struct {
+  int64_t  i_sum;
+  int64_t  i_min;
+  int64_t  i_max;
+  double   f_sum;
+  double   f_min;
+  double   f_max;
+  uint32_t count;
+  bool     is_int;       // true if all samples so far are INT
+  timeseries_field_value_t last_val;
+} aggregator_state_t;
 
-  switch (val->type) {
-  case TIMESERIES_FIELD_TYPE_BOOL:
-    return (val->data.bool_val) ? 1.0 : 0.0;
-
-  case TIMESERIES_FIELD_TYPE_INT:
-    return (double)val->data.int_val;
-
-  case TIMESERIES_FIELD_TYPE_FLOAT:
-    return val->data.float_val;
-
-  case TIMESERIES_FIELD_TYPE_STRING:
-    // For numeric aggregations, we skip strings by treating them as 0.0
-    // (or you could choose to skip them entirely in update_aggregator).
-    return 0.0;
-
-  default:
-    return 0.0;
-  }
+static inline void aggregator_init(aggregator_state_t *agg) {
+  agg->i_sum = 0;
+  agg->i_min = INT64_MAX;
+  agg->i_max = INT64_MIN;
+  agg->f_sum = 0.0;
+  agg->f_min = +1.0e38;
+  agg->f_max = -1.0e38;
+  agg->count = 0;
+  agg->is_int = true;    // assume int until we see a non-int value
+  memset(&agg->last_val, 0, sizeof(agg->last_val));
 }
 
 /*-------------------------------------------------------------------------------------
  *  HELPER: Update aggregator with one sample
- *          - We only aggregate numeric types (bool, int, float).
- *          - If it's a string, we skip it for min/max/sum/avg; but we
- *            still set "last_val" if aggregator = LAST.
  *-------------------------------------------------------------------------------------*/
-static void update_aggregator(timeseries_aggregation_method_e method,
-                              const timeseries_field_value_t *val,
-                              double *accumulator, double *count, double *min_v,
-                              double *max_v,
-                              timeseries_field_value_t *last_val) {
+static void update_aggregator(const timeseries_field_value_t *val,
+                              aggregator_state_t *agg) {
   if (!val) {
     return;
   }
 
-  // Always update "last_val" if aggregator is LAST (or if you'd like to keep
-  // the last for any aggregator?). For simplicity, we always store it here.
-  // Free the previous last_val string if it was a string type, since the
-  // iterator chain transfers string ownership to the caller.
-  if (last_val->type == TIMESERIES_FIELD_TYPE_STRING &&
-      last_val->data.string_val.str != NULL) {
-    // Only free if the new value is a different allocation
+  // Free previous last_val string if needed
+  if (agg->last_val.type == TIMESERIES_FIELD_TYPE_STRING &&
+      agg->last_val.data.string_val.str != NULL) {
     if (val->type != TIMESERIES_FIELD_TYPE_STRING ||
-        last_val->data.string_val.str != val->data.string_val.str) {
-      free(last_val->data.string_val.str);
+        agg->last_val.data.string_val.str != val->data.string_val.str) {
+      free(agg->last_val.data.string_val.str);
     }
   }
-  *last_val = *val;
+  agg->last_val = *val;
 
-  // If it's not numeric, skip it unless aggregator = LAST. But "last_val" is
-  // already captured above.
   if (val->type == TIMESERIES_FIELD_TYPE_STRING) {
-    // For numeric aggregator methods (min, max, sum, avg), ignore string.
-    // So do *not* update accumulator/min/max. Return now.
     return;
   }
 
-  // Convert numeric to double:
-  double numeric = to_double_for_agg(val);
+  if (val->type == TIMESERIES_FIELD_TYPE_INT) {
+    int64_t v = val->data.int_val;
+    agg->i_sum += v;
+    if (v < agg->i_min) agg->i_min = v;
+    if (v > agg->i_max) agg->i_max = v;
+    // Also maintain float accumulators in case we see mixed types later
+    if (!agg->is_int) {
+      agg->f_sum += (double)v;
+      if ((double)v < agg->f_min) agg->f_min = (double)v;
+      if ((double)v > agg->f_max) agg->f_max = (double)v;
+    }
+  } else {
+    // Float or bool — switch to double path
+    double numeric;
+    if (val->type == TIMESERIES_FIELD_TYPE_FLOAT) {
+      numeric = val->data.float_val;
+    } else { // BOOL
+      numeric = val->data.bool_val ? 1.0 : 0.0;
+    }
 
-  // Accumulate for numeric aggregations:
-  *accumulator += numeric;
-  (*count)++;
+    if (agg->is_int && agg->count > 0) {
+      // Switching from int to float: backfill float accumulators
+      agg->f_sum = (double)agg->i_sum;
+      agg->f_min = (double)agg->i_min;
+      agg->f_max = (double)agg->i_max;
+    }
+    agg->is_int = false;
 
-  if (numeric < *min_v) {
-    *min_v = numeric;
+    agg->f_sum += numeric;
+    if (numeric < agg->f_min) agg->f_min = numeric;
+    if (numeric > agg->f_max) agg->f_max = numeric;
   }
-  if (numeric > *max_v) {
-    *max_v = numeric;
-  }
+
+  agg->count++;
 }
 
 /*-------------------------------------------------------------------------------------
  *  HELPER: Finalize aggregator into one result
  *-------------------------------------------------------------------------------------*/
 static timeseries_field_value_t
-finalize_aggregator(timeseries_aggregation_method_e method, double accumulator,
-                    double count, double min_v, double max_v,
-                    const timeseries_field_value_t *last_val) {
+finalize_aggregator(timeseries_aggregation_method_e method,
+                    const aggregator_state_t *agg) {
   timeseries_field_value_t result;
   memset(&result, 0, sizeof(result));
 
-  // If we had no numeric samples in the window/bucket, count == 0.
-  // aggregator => defaults to float=0.0 unless aggregator = LAST & last_val is
-  // something. We'll handle aggregator = LAST below.
   result.type = TIMESERIES_FIELD_TYPE_FLOAT;
   result.data.float_val = 0.0;
 
-  // If aggregator = LAST, we always return the last_val as-is, even if
-  // it's a string or a bool, int, etc.
   if (method == TSDB_AGGREGATION_LAST) {
-    // If we never saw any point at all, last_val might be empty.
-    // But typically, you only call finalize if something was processed.
-    return *last_val;
+    return agg->last_val;
   }
 
-  // If aggregator is MIN, MAX, AVG, or NONE/SUM, but no numeric samples =>
-  // just return 0.0 float. (Or you can leave as an "invalid" marker.)
-  if (count <= 0) {
+  if (agg->count == 0) {
     return result;
   }
 
+  // Integer fast path: avoid all double conversions
+  if (agg->is_int && agg->last_val.type == TIMESERIES_FIELD_TYPE_INT) {
+    result.type = TIMESERIES_FIELD_TYPE_INT;
+    switch (method) {
+    case TSDB_AGGREGATION_MIN:
+      result.data.int_val = agg->i_min;
+      return result;
+    case TSDB_AGGREGATION_MAX:
+      result.data.int_val = agg->i_max;
+      return result;
+    case TSDB_AGGREGATION_AVG:
+      // Match double-path rounding: (int64_t)(avg + 0.5), i.e. truncation toward zero
+      result.data.int_val = (2 * agg->i_sum + (int64_t)agg->count) / (2 * (int64_t)agg->count);
+      return result;
+    case TSDB_AGGREGATION_COUNT:
+      result.data.int_val = (int64_t)agg->count;
+      return result;
+    case TSDB_AGGREGATION_SUM:
+    case TSDB_AGGREGATION_NONE:
+      result.data.int_val = agg->i_sum;
+      return result;
+    default:
+      result.data.int_val = agg->i_sum;
+      return result;
+    }
+  }
+
+  // Float / mixed / bool path
   switch (method) {
   case TSDB_AGGREGATION_MIN:
-    // If last_val was originally int or bool, produce an int/bool min
-    if (last_val->type == TIMESERIES_FIELD_TYPE_INT) {
-      result.type = TIMESERIES_FIELD_TYPE_INT;
-      result.data.int_val = (int64_t)min_v;
-    } else if (last_val->type == TIMESERIES_FIELD_TYPE_BOOL) {
+    if (agg->last_val.type == TIMESERIES_FIELD_TYPE_BOOL) {
       result.type = TIMESERIES_FIELD_TYPE_BOOL;
-      result.data.bool_val = (min_v > 0.5);
+      result.data.bool_val = (agg->f_min > 0.5);
     } else {
-      // float
       result.type = TIMESERIES_FIELD_TYPE_FLOAT;
-      result.data.float_val = min_v;
+      result.data.float_val = agg->f_min;
     }
     break;
 
   case TSDB_AGGREGATION_MAX:
-    if (last_val->type == TIMESERIES_FIELD_TYPE_INT) {
-      result.type = TIMESERIES_FIELD_TYPE_INT;
-      result.data.int_val = (int64_t)max_v;
-    } else if (last_val->type == TIMESERIES_FIELD_TYPE_BOOL) {
+    if (agg->last_val.type == TIMESERIES_FIELD_TYPE_BOOL) {
       result.type = TIMESERIES_FIELD_TYPE_BOOL;
-      result.data.bool_val = (max_v > 0.5);
+      result.data.bool_val = (agg->f_max > 0.5);
     } else {
       result.type = TIMESERIES_FIELD_TYPE_FLOAT;
-      result.data.float_val = max_v;
+      result.data.float_val = agg->f_max;
     }
     break;
 
   case TSDB_AGGREGATION_AVG: {
-    double avg = accumulator / count;
-    // Preserve original type to match column type in query results
-    if (last_val->type == TIMESERIES_FIELD_TYPE_INT) {
-      result.type = TIMESERIES_FIELD_TYPE_INT;
-      result.data.int_val = (int64_t)(avg + 0.5); // round to nearest
-    } else if (last_val->type == TIMESERIES_FIELD_TYPE_BOOL) {
+    double avg = agg->f_sum / (double)agg->count;
+    if (agg->last_val.type == TIMESERIES_FIELD_TYPE_BOOL) {
       result.type = TIMESERIES_FIELD_TYPE_BOOL;
       result.data.bool_val = (avg > 0.5);
     } else {
@@ -197,26 +209,23 @@ finalize_aggregator(timeseries_aggregation_method_e method, double accumulator,
 
   case TSDB_AGGREGATION_COUNT:
     result.type = TIMESERIES_FIELD_TYPE_INT;
-    result.data.int_val = (int64_t)count;
+    result.data.int_val = (int64_t)agg->count;
     break;
 
   case TSDB_AGGREGATION_SUM:
   case TSDB_AGGREGATION_NONE:
-    // Summation — preserve original type for int/bool
-    if (last_val->type == TIMESERIES_FIELD_TYPE_INT ||
-        last_val->type == TIMESERIES_FIELD_TYPE_BOOL) {
-      int64_t sum_as_int = (int64_t)accumulator; // watch for overflow
+    if (agg->last_val.type == TIMESERIES_FIELD_TYPE_BOOL) {
       result.type = TIMESERIES_FIELD_TYPE_INT;
-      result.data.int_val = sum_as_int;
+      result.data.int_val = (int64_t)agg->f_sum;
     } else {
       result.type = TIMESERIES_FIELD_TYPE_FLOAT;
-      result.data.float_val = accumulator;
+      result.data.float_val = agg->f_sum;
     }
     break;
 
   default:
     result.type = TIMESERIES_FIELD_TYPE_FLOAT;
-    result.data.float_val = accumulator;
+    result.data.float_val = agg->f_sum;
     break;
   }
 
@@ -283,7 +292,30 @@ bool timeseries_multi_series_iterator_next(
    *unmodified.
    *-----------------------------------------------------------------------------*/
   if (iter->rollup_interval == 0) {
-    // 1. Find the sub-iterator whose next point is earliest
+    // Single-series fast path: skip scan loops entirely
+    if (iter->sub_count == 1) {
+      uint64_t ts;
+      timeseries_field_value_t val;
+      if (!timeseries_multi_points_iterator_next(iter->sub_iters[0], &ts, &val)) {
+        iter->valid = false;
+        return false;
+      }
+      if (out_ts) *out_ts = ts;
+      if (out_val) {
+        *out_val = val;
+      } else if (val.type == TIMESERIES_FIELD_TYPE_STRING && val.data.string_val.str) {
+        free(val.data.string_val.str);
+      }
+      // Check if more data remains
+      uint64_t peek_ts;
+      timeseries_field_value_t peek_val;
+      if (!timeseries_multi_points_iterator_peek(iter->sub_iters[0], &peek_ts, &peek_val)) {
+        iter->valid = false;
+      }
+      return true;
+    }
+
+    // Multi-series pass-through: find earliest across all sub-iterators
     uint64_t earliest_ts = UINT64_MAX;
     int earliest_idx = -1;
 
@@ -305,45 +337,29 @@ bool timeseries_multi_series_iterator_next(
       return false;
     }
 
-    // 2. Pop that earliest data point
+    // Pop that earliest data point
     uint64_t actual_ts;
     timeseries_field_value_t actual_val;
     if (!timeseries_multi_points_iterator_next(iter->sub_iters[earliest_idx],
                                                &actual_ts, &actual_val)) {
-      // Should not fail if peek said it was valid
       iter->valid = false;
       return false;
     }
 
-    // 3. Return as-is
     if (out_ts) {
       *out_ts = actual_ts;
     }
     if (out_val) {
       *out_val = actual_val;
     } else {
-      // No caller to receive ownership — free string to avoid leak
       if (actual_val.type == TIMESERIES_FIELD_TYPE_STRING &&
           actual_val.data.string_val.str) {
         free(actual_val.data.string_val.str);
       }
     }
 
-    // 4. Check if we have more data left
-    bool has_more_data = false;
-    for (size_t s = 0; s < iter->sub_count; s++) {
-      uint64_t check_ts;
-      timeseries_field_value_t dummy;
-      if (timeseries_multi_points_iterator_peek(iter->sub_iters[s], &check_ts,
-                                                &dummy)) {
-        has_more_data = true;
-        break;
-      }
-    }
-    if (!has_more_data) {
-      iter->valid = false;
-    }
-
+    // has_more check is deferred: next call's "find earliest" scan will
+    // set iter->valid = false when no sub-iterators have data.
     return true;
   }
 
@@ -356,12 +372,8 @@ bool timeseries_multi_series_iterator_next(
     uint64_t window_start = iter->current_window_start;
     uint64_t window_end = iter->current_window_end;
 
-    double accumulator = 0.0;
-    double sample_count = 0.0;
-    double min_v = +1.0e38;
-    double max_v = -1.0e38;
-    timeseries_field_value_t last_val;
-    memset(&last_val, 0, sizeof(last_val));
+    aggregator_state_t agg;
+    aggregator_init(&agg);
 
     // Gather points from each sub-iterator in [window_start, window_end)
     for (size_t s = 0; s < iter->sub_count; s++) {
@@ -392,8 +404,7 @@ bool timeseries_multi_series_iterator_next(
         (void)timeseries_multi_points_iterator_next(iter->sub_iters[s], &ts_cur,
                                                     &val_cur);
 
-        update_aggregator(iter->aggregator, &val_cur, &accumulator,
-                          &sample_count, &min_v, &max_v, &last_val);
+        update_aggregator(&val_cur, &agg);
       }
     }
 
@@ -414,7 +425,7 @@ bool timeseries_multi_series_iterator_next(
     }
 
     // If this window had no samples, skip it
-    if (sample_count <= 0 &&
+    if (agg.count == 0 &&
         iter->aggregator != TSDB_AGGREGATION_LAST) {
       if (!has_more_data) {
         iter->valid = false;
@@ -425,17 +436,16 @@ bool timeseries_multi_series_iterator_next(
     }
 
     // Finalize aggregator
-    timeseries_field_value_t aggregated = finalize_aggregator(
-        iter->aggregator, accumulator, sample_count, min_v, max_v, &last_val);
+    timeseries_field_value_t aggregated =
+        finalize_aggregator(iter->aggregator, &agg);
 
     // If the aggregator did not transfer last_val's string into the result
     // (i.e. non-LAST aggregation on string data), free it to avoid a leak.
-    if (last_val.type == TIMESERIES_FIELD_TYPE_STRING &&
-        last_val.data.string_val.str != NULL) {
-      // Check if finalize_aggregator returned a different value (non-LAST path)
+    if (agg.last_val.type == TIMESERIES_FIELD_TYPE_STRING &&
+        agg.last_val.data.string_val.str != NULL) {
       if (aggregated.type != TIMESERIES_FIELD_TYPE_STRING ||
-          aggregated.data.string_val.str != last_val.data.string_val.str) {
-        free(last_val.data.string_val.str);
+          aggregated.data.string_val.str != agg.last_val.data.string_val.str) {
+        free(agg.last_val.data.string_val.str);
       }
     }
 

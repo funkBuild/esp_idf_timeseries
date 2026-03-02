@@ -27,6 +27,14 @@ FloatStreamDecoder *float_stream_decoder_create(FillCallback fill_cb,
                                                 void *fill_ctx);
 
 /**
+ * @brief Create a new floating-point stream decoder in direct pointer mode.
+ *
+ * Zero-copy: reads directly from data already in RAM.
+ */
+FloatStreamDecoder *float_stream_decoder_create_direct(const uint8_t *data,
+                                                       size_t size);
+
+/**
  * @brief Decode the next double value from the stream.
  *
  * @param dec    Pointer to the FloatStreamDecoder.

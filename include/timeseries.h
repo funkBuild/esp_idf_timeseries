@@ -214,6 +214,14 @@ bool timeseries_compact(void);
  */
 bool timeseries_compact_sync(void);
 
+/**
+ * @brief Force compaction of all levels, ignoring page-count thresholds.
+ *
+ * Compacts every level that has any pages, ensuring no L0 pages remain.
+ * Useful for benchmarking to get consistent, fully-compacted state.
+ */
+bool timeseries_compact_force_sync(void);
+
 bool timeseries_expire(void);
 
 bool timeseries_query(const timeseries_query_t* query, timeseries_query_result_t* result);

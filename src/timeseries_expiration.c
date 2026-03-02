@@ -358,6 +358,7 @@ static bool gather_25_oldest_fielddata(timeseries_db_t *db,
         // Insert into the max-heap
         heap_insert_max25(heap_25, out_count, &candidate);
       }
+      timeseries_fielddata_iterator_deinit(&f_iter);
     }
   }
   timeseries_page_cache_iterator_deinit(&page_iter);

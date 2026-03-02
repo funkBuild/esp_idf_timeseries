@@ -57,6 +57,10 @@ typedef struct {
     int64_t *alp_int;
   };
 
+  // Gorilla batch-decoded timestamps (non-NULL when Gorilla ts are pre-decoded)
+  // Values are still streamed via Gorilla decoders.
+  int64_t *gorilla_batch_ts;
+
   // Gorilla decoder context (stores state across incremental decode calls)
   DecoderContext ts_decoder_context;
   DecoderContext val_decoder_context;
@@ -91,6 +95,20 @@ bool timeseries_points_iterator_next_timestamp(
  */
 bool timeseries_points_iterator_next_value(timeseries_points_iterator_t *iter,
                                            timeseries_field_value_t *out_value);
+
+/**
+ * @brief Trim the iterator to only yield points within [start_ms, end_ms].
+ *
+ * Must be called after init, before any next_timestamp/next_value calls.
+ * Uses binary search on the decoded timestamp array (ALP and uncompressed
+ * paths only; Gorilla streaming path is unaffected).
+ *
+ * @param iter      Initialized iterator
+ * @param start_ms  Lower bound (0 = no lower bound)
+ * @param end_ms    Upper bound (0 = no upper bound)
+ */
+void timeseries_points_iterator_set_time_range(
+    timeseries_points_iterator_t *iter, uint64_t start_ms, uint64_t end_ms);
 
 /**
  * @brief Deinitialize the points iterator and free allocated memory.

@@ -56,6 +56,7 @@ static bool tsdb_mark_series_deleted_in_page(timeseries_db_t* db, uint32_t page_
     (*deleted_count)++;
   }
 
+  timeseries_fielddata_iterator_deinit(&fdata_iter);
   return true;
 }
 

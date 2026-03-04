@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "timeseries.h"
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -233,6 +234,13 @@ typedef struct {
   TaskHandle_t compaction_task_handle;
   _Atomic bool compaction_in_progress;
   _Atomic uint32_t compaction_generation;  // Incremented after each compaction run
+
+  // Optional hooks called before/after background compaction
+  timeseries_compaction_hook_t pre_compact_hook;
+  timeseries_compaction_hook_t post_compact_hook;
+
+  // Optional hook for forwarding internal log messages to the application
+  timeseries_log_hook_t log_hook;
 
   // Last used L0 page/offset
   bool last_l0_cache_valid;

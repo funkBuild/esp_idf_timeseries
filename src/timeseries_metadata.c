@@ -343,7 +343,8 @@ bool tsdb_insert_single_field(timeseries_db_t* db, uint32_t measurement_id, cons
   mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_MD5), (const unsigned char*)buffer, strlen(buffer), series_id);
 
   // 3) Ensure field type in metadata
-  if (!tsdb_ensure_series_type_in_metadata(db, series_id, field_val->type)) {
+  timeseries_field_type_e actual_type;
+  if (!tsdb_ensure_series_type_in_metadata(db, series_id, field_val->type, field_name, &actual_type)) {
     return false;
   }
 
@@ -352,8 +353,19 @@ bool tsdb_insert_single_field(timeseries_db_t* db, uint32_t measurement_id, cons
     return false;
   }
 
-  // 5) Append data to field data page
-  if (!tsdb_append_field_data(db, series_id, timestamp_ms, field_val)) {
+  // 5) Append data to field data page — convert value if needed
+  if (actual_type != field_val->type) {
+    timeseries_field_value_t converted = *field_val;
+    converted.type = actual_type;
+    if (actual_type == TIMESERIES_FIELD_TYPE_FLOAT) {
+      converted.data.float_val = (double)field_val->data.int_val;
+    } else {
+      converted.data.int_val = (int64_t)field_val->data.float_val;
+    }
+    if (!tsdb_append_field_data(db, series_id, timestamp_ms, &converted)) {
+      return false;
+    }
+  } else if (!tsdb_append_field_data(db, series_id, timestamp_ms, field_val)) {
     return false;
   }
 
@@ -427,9 +439,15 @@ bool tsdb_lookup_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
  *        or create a new entry if it doesn't exist. Returns false on conflict.
  */
 bool tsdb_ensure_series_type_in_metadata(timeseries_db_t* db, const unsigned char series_id[16],
-                                         timeseries_field_type_e field_type) {
+                                         timeseries_field_type_e field_type, const char* field_name,
+                                         timeseries_field_type_e *actual_type) {
   if (!db || !series_id) {
     return false;
+  }
+
+  // Default: caller should use the type they passed in
+  if (actual_type) {
+    *actual_type = field_type;
   }
 
   // 1) Check if there's already a stored type for this series ID
@@ -437,7 +455,37 @@ bool tsdb_ensure_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
   if (tsdb_lookup_series_type_in_metadata(db, series_id, &existing_type)) {
     // found existing
     if (existing_type != field_type) {
-      ESP_LOGE(TAG, "SeriesID conflict: existing type=%d, new=%d", (int)existing_type, (int)field_type);
+      static const char *type_names[] = {"float", "int", "bool", "string"};
+      const char *existing_name = (unsigned)existing_type < 4 ? type_names[existing_type] : "unknown";
+      const char *new_name = (unsigned)field_type < 4 ? type_names[field_type] : "unknown";
+
+      // Float <-> int is convertible
+      bool convertible = (existing_type == TIMESERIES_FIELD_TYPE_FLOAT && field_type == TIMESERIES_FIELD_TYPE_INT) ||
+                          (existing_type == TIMESERIES_FIELD_TYPE_INT && field_type == TIMESERIES_FIELD_TYPE_FLOAT);
+
+      if (convertible) {
+        ESP_LOGW(TAG, "Converting field '%s' from %s to %s",
+                 field_name ? field_name : "?", new_name, existing_name);
+        if (db->log_hook) {
+          char msg[128];
+          snprintf(msg, sizeof(msg), "Timeseries: converting field '%s' from %s to %s",
+                   field_name ? field_name : "?", new_name, existing_name);
+          db->log_hook(ESP_LOG_WARN, msg);
+        }
+        if (actual_type) {
+          *actual_type = existing_type;
+        }
+        return true;
+      }
+
+      ESP_LOGE(TAG, "SeriesID conflict for field '%s': existing type=%s, new=%s",
+               field_name ? field_name : "?", existing_name, new_name);
+      if (db->log_hook) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Timeseries type conflict for field '%s': existing=%s, new=%s",
+                 field_name ? field_name : "?", existing_name, new_name);
+        db->log_hook(ESP_LOG_ERROR, msg);
+      }
       return false;
     }
     // else it matches => done

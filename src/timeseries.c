@@ -36,9 +36,24 @@ static timeseries_db_t s_tsdb = {
 };
 static _Atomic bool s_init_in_progress = false;
 
+void timeseries_set_compaction_hooks(timeseries_compaction_hook_t pre_compact,
+                                     timeseries_compaction_hook_t post_compact) {
+    s_tsdb.pre_compact_hook = pre_compact;
+    s_tsdb.post_compact_hook = post_compact;
+}
+
+void timeseries_set_log_hook(timeseries_log_hook_t hook) {
+    s_tsdb.log_hook = hook;
+}
+
 // One-shot compaction task: runs compaction once, then exits
 static void tsdb_compaction_oneshot_task(void *param) {
     timeseries_db_t *db = (timeseries_db_t *)param;
+
+    if (db->pre_compact_hook) {
+        db->pre_compact_hook();
+    }
+
     ESP_LOGI(TAG, "Compaction task started");
     timeseries_compact_all_levels(db);
     atomic_fetch_add(&db->compaction_generation, 1);
@@ -50,7 +65,10 @@ static void tsdb_compaction_oneshot_task(void *param) {
     size_t l0_count = tsdb_count_l0_pages(db);
     if (l0_count >= MIN_PAGES_FOR_COMPACTION) {
         ESP_LOGI(TAG, "Re-triggering compaction: %zu L0 pages accumulated", l0_count);
+        // post hook deferred until the re-triggered compaction finishes
         tsdb_launch_compaction(db);
+    } else if (db->post_compact_hook) {
+        db->post_compact_hook();
     }
 
     vTaskDelete(NULL);
@@ -281,6 +299,7 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
 
     unsigned char series_id[16];
     bool found_in_cache = false;
+    timeseries_field_type_e actual_type = data->field_values[i * data->num_points].type;
 
     // Try to get series_id from cache first
     if (tsdb_cache_lookup_series_id(&s_tsdb, cache_key, series_id)) {
@@ -292,7 +311,8 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
       ESP_LOGD(TAG, "Cache MISS for field '%s' - performing metadata operations", data->field_names[i]);
     }
 
-    // Only do metadata operations if not found in cache
+    const timeseries_field_value_t* first_val = &data->field_values[i * data->num_points + 0];
+
     if (!found_in_cache) {
       // Protect metadata flash writes from concurrent compaction
       if (s_tsdb.flash_write_mutex) {
@@ -309,12 +329,12 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
       }
 
       // Ensure field type in metadata
-      const timeseries_field_value_t* first_val = &data->field_values[i * data->num_points + 0];
-      if (!tsdb_ensure_series_type_in_metadata(&s_tsdb, series_id, first_val->type)) {
+      if (!tsdb_ensure_series_type_in_metadata(&s_tsdb, series_id, first_val->type, data->field_names[i], &actual_type)) {
         if (s_tsdb.flash_write_mutex) {
           xSemaphoreGive(s_tsdb.flash_write_mutex);
         }
-        return false;
+        any_field_failed = true;
+        continue;
       }
 
       // Index tags
@@ -332,19 +352,47 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
 
       // Successfully indexed - add to cache for next time
       tsdb_cache_insert_series_id(&s_tsdb, cache_key, series_id);
+    } else {
+      // Cache hit — still need type check for float<->int conversion and conflict detection
+      if (!tsdb_ensure_series_type_in_metadata(&s_tsdb, series_id, first_val->type, data->field_names[i], &actual_type)) {
+        any_field_failed = true;
+        continue;
+      }
     }
 
     // Gather the array of values for this field
     const timeseries_field_value_t* field_array = &data->field_values[i * data->num_points];
+
+    // Convert values if stored type differs from incoming type (float <-> int)
+    timeseries_field_value_t* converted_array = NULL;
+    if (actual_type != field_array[0].type) {
+      converted_array = malloc(data->num_points * sizeof(timeseries_field_value_t));
+      if (!converted_array) {
+        ESP_LOGE(TAG, "Failed to allocate conversion buffer for field '%s'", data->field_names[i]);
+        any_field_failed = true;
+        continue;
+      }
+      for (size_t p = 0; p < data->num_points; p++) {
+        converted_array[p].type = actual_type;
+        if (actual_type == TIMESERIES_FIELD_TYPE_FLOAT) {
+          converted_array[p].data.float_val = (double)field_array[p].data.int_val;
+        } else {
+          converted_array[p].data.int_val = (int64_t)field_array[p].data.float_val;
+        }
+      }
+      field_array = converted_array;
+    }
 
     // 2) Insert multi data points in one entry
     ESP_LOGD(TAG, "Inserting field %zu/%zu: '%s' (%zu points)",
              i + 1, data->num_fields, data->field_names[i], data->num_points);
     if (!tsdb_append_multiple_points(&s_tsdb, series_id, data->timestamps_ms, field_array, data->num_points)) {
       ESP_LOGE(TAG, "Failed to insert multi points for field '%s'", data->field_names[i]);
+      free(converted_array);
       any_field_failed = true;
       continue;  // best-effort: try remaining fields to minimize inconsistency
     }
+    free(converted_array);
     ESP_LOGV(TAG, "Successfully inserted field='%s' with %zu points for measurement=%s",
              data->field_names[i], data->num_points, data->measurement_name);
   }

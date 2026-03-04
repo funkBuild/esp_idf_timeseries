@@ -196,6 +196,42 @@ typedef struct {
   uint32_t total_space_bytes;
 } tsdb_usage_summary_t;
 
+/**
+ * @brief Callback invoked before/after background compaction.
+ *
+ * Use timeseries_set_compaction_hooks() to register. The pre-compact hook is
+ * called before the compaction task begins work; the post-compact hook is
+ * called after it finishes (or on re-trigger). This allows the caller to
+ * e.g. hold a deep-sleep lock for the duration of compaction without
+ * coupling the timeseries component to the sleep subsystem.
+ */
+typedef void (*timeseries_compaction_hook_t)(void);
+
+/**
+ * @brief Callback for forwarding internal log messages to the application layer.
+ *
+ * @param level  ESP_LOG_* severity (e.g. ESP_LOG_ERROR)
+ * @param message  Human-readable log message
+ */
+typedef void (*timeseries_log_hook_t)(int level, const char *message);
+
+/**
+ * @brief Register pre/post compaction callbacks.
+ *
+ * Either or both may be NULL to disable that hook.
+ */
+void timeseries_set_compaction_hooks(timeseries_compaction_hook_t pre_compact,
+                                     timeseries_compaction_hook_t post_compact);
+
+/**
+ * @brief Register a log hook for forwarding internal errors to the application.
+ *
+ * The hook is called for significant internal errors (e.g. series ID type
+ * conflicts) that would otherwise only appear in ESP_LOGx output.
+ * Pass NULL to disable.
+ */
+void timeseries_set_log_hook(timeseries_log_hook_t hook);
+
 bool timeseries_init(void);
 
 /**

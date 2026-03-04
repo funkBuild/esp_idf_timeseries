@@ -42,8 +42,16 @@ error() { echo -e "\033[0;31m[ERROR]\033[0m $1"; }
 
 # --- Build ---
 if [ "$SKIP_BUILD" = false ]; then
+  rm -rf build
   info "Building test_app..."
-  idf.py build || { error "Build failed"; exit 1; }
+  BUILD_LOG=$(mktemp)
+  if ! idf.py build > "$BUILD_LOG" 2>&1; then
+    cat "$BUILD_LOG"
+    rm -f "$BUILD_LOG"
+    error "Build failed"
+    exit 1
+  fi
+  rm -f "$BUILD_LOG"
 fi
 
 if [ ! -f build/unit_test_test.bin ]; then
@@ -133,10 +141,35 @@ fi
 QEMU_PID=""
 
 # --- Parse results ---
-echo ""
-echo "======== QEMU Test Output ========"
-cat "$OUTPUT_FILE"
-echo "=================================="
+display_test_results() {
+  local buffer="" test_name=""
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    case "$line" in
+      "Running "*"...")
+        test_name="${line#Running }"
+        test_name="${test_name%...}"
+        buffer=""
+        ;;
+      "./"*":PASS")
+        echo -e "\033[0;32m  PASS\033[0m ${test_name}"
+        buffer="" test_name=""
+        ;;
+      "./"*":FAIL"*)
+        echo ""
+        error "FAIL: ${test_name}"
+        [ -n "$buffer" ] && printf '%s' "$buffer"
+        echo "$line"
+        echo ""
+        buffer="" test_name=""
+        ;;
+      *)
+        if [ -n "$test_name" ]; then buffer+="${line}"$'\n'; fi
+        ;;
+    esac
+  done < "$1"
+}
+display_test_results "$OUTPUT_FILE"
 echo ""
 
 if [ "$TESTS_DONE" = false ]; then
@@ -145,8 +178,8 @@ if [ "$TESTS_DONE" = false ]; then
 fi
 
 # Extract the summary line: "N Tests M Failures K Ignored"
-SUMMARY=$(grep "Tests [0-9]* Failures [0-9]* Ignored" "$OUTPUT_FILE" | tail -1)
-FAILURES=$(echo "$SUMMARY" | grep -oP '\d+(?= Failures)')
+SUMMARY=$(grep "Tests [0-9]* Failures [0-9]* Ignored" "$OUTPUT_FILE" | tail -1 || true)
+FAILURES=$(echo "$SUMMARY" | grep -oP '\d+(?= Failures)' || true)
 
 if [ -z "$FAILURES" ]; then
   error "Could not parse test results"

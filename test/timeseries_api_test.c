@@ -458,3 +458,336 @@ TEST_CASE("api: delete_measurement_and_field NULL params",
   TEST_ASSERT_FALSE(timeseries_delete_measurement_and_field("x", NULL));
   TEST_ASSERT_FALSE(timeseries_delete_measurement_and_field(NULL, "y"));
 }
+
+// ============================================================================
+// Type conversion (float <-> int) and incompatible conflict tests
+// ============================================================================
+
+static void insert_typed(const char *measurement, const char *field_name,
+                         timeseries_field_type_e type, size_t num_points) {
+  uint64_t *timestamps = malloc(num_points * sizeof(uint64_t));
+  TEST_ASSERT_NOT_NULL(timestamps);
+  timeseries_field_value_t *values =
+      malloc(num_points * sizeof(timeseries_field_value_t));
+  TEST_ASSERT_NOT_NULL(values);
+
+  for (size_t i = 0; i < num_points; i++) {
+    timestamps[i] = 1000 * i;
+    values[i].type = type;
+    switch (type) {
+    case TIMESERIES_FIELD_TYPE_FLOAT:
+      values[i].data.float_val = 1.5 + (double)i;
+      break;
+    case TIMESERIES_FIELD_TYPE_INT:
+      values[i].data.int_val = 100 + (int64_t)i;
+      break;
+    case TIMESERIES_FIELD_TYPE_BOOL:
+      values[i].data.bool_val = (i % 2 == 0);
+      break;
+    case TIMESERIES_FIELD_TYPE_STRING:
+      values[i].data.string_val.str = "test";
+      values[i].data.string_val.length = 4;
+      break;
+    }
+  }
+
+  const char *field_names[] = {field_name};
+  timeseries_insert_data_t data = {
+      .measurement_name = measurement,
+      .tag_keys = NULL,
+      .tag_values = NULL,
+      .num_tags = 0,
+      .field_names = field_names,
+      .field_values = values,
+      .num_fields = 1,
+      .timestamps_ms = timestamps,
+      .num_points = num_points,
+  };
+
+  TEST_ASSERT_TRUE(timeseries_insert(&data));
+  free(timestamps);
+  free(values);
+}
+
+static bool try_insert_typed(const char *measurement, const char *field_name,
+                             timeseries_field_type_e type, size_t num_points) {
+  uint64_t *timestamps = malloc(num_points * sizeof(uint64_t));
+  TEST_ASSERT_NOT_NULL(timestamps);
+  timeseries_field_value_t *values =
+      malloc(num_points * sizeof(timeseries_field_value_t));
+  TEST_ASSERT_NOT_NULL(values);
+
+  for (size_t i = 0; i < num_points; i++) {
+    timestamps[i] = 100000 + 1000 * i;  // Offset to avoid overlapping with insert_typed
+    values[i].type = type;
+    switch (type) {
+    case TIMESERIES_FIELD_TYPE_FLOAT:
+      values[i].data.float_val = 2.5 + (double)i;
+      break;
+    case TIMESERIES_FIELD_TYPE_INT:
+      values[i].data.int_val = 200 + (int64_t)i;
+      break;
+    case TIMESERIES_FIELD_TYPE_BOOL:
+      values[i].data.bool_val = (i % 2 != 0);
+      break;
+    case TIMESERIES_FIELD_TYPE_STRING:
+      values[i].data.string_val.str = "test2";
+      values[i].data.string_val.length = 5;
+      break;
+    }
+  }
+
+  const char *field_names[] = {field_name};
+  timeseries_insert_data_t data = {
+      .measurement_name = measurement,
+      .tag_keys = NULL,
+      .tag_values = NULL,
+      .num_tags = 0,
+      .field_names = field_names,
+      .field_values = values,
+      .num_fields = 1,
+      .timestamps_ms = timestamps,
+      .num_points = num_points,
+  };
+
+  bool ok = timeseries_insert(&data);
+  free(timestamps);
+  free(values);
+  return ok;
+}
+
+TEST_CASE("api: int-to-float conversion succeeds and stores as float",
+          "[api][type_conversion]") {
+  clear_db();
+
+  // Insert as float first — establishes the metadata type
+  insert_typed("conv_test", "value", TIMESERIES_FIELD_TYPE_FLOAT, 5);
+
+  // Insert as int — should auto-convert to float
+  bool ok = try_insert_typed("conv_test", "value", TIMESERIES_FIELD_TYPE_INT, 5);
+  TEST_ASSERT_TRUE(ok);
+
+  // Query back and verify type is float and values are correct
+  timeseries_query_t query = {
+      .measurement_name = "conv_test",
+      .start_ms = 0,
+      .end_ms = INT64_MAX,
+      .limit = 0,
+  };
+  timeseries_query_result_t result = {0};
+  TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+  TEST_ASSERT_EQUAL(10, result.num_points);
+  TEST_ASSERT_EQUAL(1, result.num_columns);
+  TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_FLOAT, result.columns[0].type);
+
+  // The second batch (int 200..204) should have been converted to float
+  // Values are stored as doubles: 200.0, 201.0, etc.
+  for (size_t i = 5; i < 10; i++) {
+    double val = result.columns[0].values[i].data.float_val;
+    double expected = 200.0 + (double)(i - 5);
+    TEST_ASSERT_DOUBLE_WITHIN(0.001, expected, val);
+  }
+
+  timeseries_query_free_result(&result);
+}
+
+TEST_CASE("api: float-to-int conversion succeeds and stores as int",
+          "[api][type_conversion]") {
+  clear_db();
+
+  // Insert as int first — establishes the metadata type
+  insert_typed("conv_test2", "count", TIMESERIES_FIELD_TYPE_INT, 5);
+
+  // Insert as float — should auto-convert to int (truncated)
+  bool ok = try_insert_typed("conv_test2", "count", TIMESERIES_FIELD_TYPE_FLOAT, 5);
+  TEST_ASSERT_TRUE(ok);
+
+  // Query back and verify type is int
+  timeseries_query_t query = {
+      .measurement_name = "conv_test2",
+      .start_ms = 0,
+      .end_ms = INT64_MAX,
+      .limit = 0,
+  };
+  timeseries_query_result_t result = {0};
+  TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+  TEST_ASSERT_EQUAL(10, result.num_points);
+  TEST_ASSERT_EQUAL(1, result.num_columns);
+  TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, result.columns[0].type);
+
+  // The second batch (float 2.5, 3.5, ...) should have been truncated to int
+  for (size_t i = 5; i < 10; i++) {
+    int64_t val = result.columns[0].values[i].data.int_val;
+    int64_t expected = (int64_t)(2.5 + (double)(i - 5));
+    TEST_ASSERT_EQUAL_INT64(expected, val);
+  }
+
+  timeseries_query_free_result(&result);
+}
+
+TEST_CASE("api: incompatible type conflict fails (float vs string)",
+          "[api][type_conversion]") {
+  clear_db();
+
+  // Insert as float first
+  insert_typed("conflict_test", "val", TIMESERIES_FIELD_TYPE_FLOAT, 5);
+
+  // Insert as string — should fail (incompatible)
+  bool ok = try_insert_typed("conflict_test", "val", TIMESERIES_FIELD_TYPE_STRING, 3);
+  TEST_ASSERT_FALSE(ok);
+}
+
+TEST_CASE("api: incompatible type conflict fails (int vs bool)",
+          "[api][type_conversion]") {
+  clear_db();
+
+  insert_typed("conflict_test2", "flag", TIMESERIES_FIELD_TYPE_INT, 5);
+
+  bool ok = try_insert_typed("conflict_test2", "flag", TIMESERIES_FIELD_TYPE_BOOL, 3);
+  TEST_ASSERT_FALSE(ok);
+}
+
+// ============================================================================
+// Delete + recreate with different type
+// ============================================================================
+
+TEST_CASE("api: delete measurement then recreate with different type",
+          "[api][delete][type_conversion]") {
+  clear_db();
+
+  // Insert as float
+  insert_typed("recreate_m", "val", TIMESERIES_FIELD_TYPE_FLOAT, 5);
+
+  // Verify float type
+  timeseries_query_t query = {
+      .measurement_name = "recreate_m",
+      .start_ms = 0,
+      .end_ms = INT64_MAX,
+      .limit = 0,
+  };
+  timeseries_query_result_t result = {0};
+  TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+  TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_FLOAT, result.columns[0].type);
+  timeseries_query_free_result(&result);
+
+  // Delete the measurement
+  TEST_ASSERT_TRUE(timeseries_delete_measurement("recreate_m"));
+
+  // Recreate with int — should succeed (old type metadata was cleaned up)
+  insert_typed("recreate_m", "val", TIMESERIES_FIELD_TYPE_INT, 5);
+
+  // Verify int type
+  memset(&result, 0, sizeof(result));
+  TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+  TEST_ASSERT_EQUAL(5, result.num_points);
+  TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, result.columns[0].type);
+  timeseries_query_free_result(&result);
+}
+
+TEST_CASE("api: delete field then recreate with different type",
+          "[api][delete_field][type_conversion]") {
+  clear_db();
+
+  // Insert two fields, one float and one int
+  insert_typed("recreate_f", "temp", TIMESERIES_FIELD_TYPE_FLOAT, 5);
+  insert_typed("recreate_f", "count", TIMESERIES_FIELD_TYPE_INT, 5);
+
+  // Delete just "temp"
+  TEST_ASSERT_TRUE(
+      timeseries_delete_measurement_and_field("recreate_f", "temp"));
+
+  // Recreate "temp" as int — should succeed
+  insert_typed("recreate_f", "temp", TIMESERIES_FIELD_TYPE_INT, 5);
+
+  // Verify "temp" is now int
+  const char *field_names[] = {"temp"};
+  timeseries_query_t query = {
+      .measurement_name = "recreate_f",
+      .field_names = field_names,
+      .num_fields = 1,
+      .start_ms = 0,
+      .end_ms = INT64_MAX,
+      .limit = 0,
+  };
+  timeseries_query_result_t result = {0};
+  TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+  TEST_ASSERT_EQUAL(5, result.num_points);
+  TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, result.columns[0].type);
+  timeseries_query_free_result(&result);
+
+  // Verify "count" is still intact and still int
+  const char *count_field[] = {"count"};
+  timeseries_query_t query2 = {
+      .measurement_name = "recreate_f",
+      .field_names = count_field,
+      .num_fields = 1,
+      .start_ms = 0,
+      .end_ms = INT64_MAX,
+      .limit = 0,
+  };
+  memset(&result, 0, sizeof(result));
+  TEST_ASSERT_TRUE(timeseries_query(&query2, &result));
+  TEST_ASSERT_EQUAL(5, result.num_points);
+  TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_INT, result.columns[0].type);
+  timeseries_query_free_result(&result);
+}
+
+// ============================================================================
+// Log hook
+// ============================================================================
+
+static int s_log_hook_call_count;
+static int s_log_hook_last_level;
+static char s_log_hook_last_message[256];
+
+static void test_log_hook(int level, const char *message) {
+  s_log_hook_call_count++;
+  s_log_hook_last_level = level;
+  strncpy(s_log_hook_last_message, message, sizeof(s_log_hook_last_message) - 1);
+  s_log_hook_last_message[sizeof(s_log_hook_last_message) - 1] = '\0';
+}
+
+TEST_CASE("api: log hook fires warning on type conversion",
+          "[api][log_hook]") {
+  clear_db();
+
+  timeseries_set_log_hook(test_log_hook);
+  s_log_hook_call_count = 0;
+  s_log_hook_last_level = 0;
+  s_log_hook_last_message[0] = '\0';
+
+  // Insert as float first
+  insert_typed("hook_test", "val", TIMESERIES_FIELD_TYPE_FLOAT, 3);
+
+  // Insert as int — triggers conversion warning
+  bool ok = try_insert_typed("hook_test", "val", TIMESERIES_FIELD_TYPE_INT, 3);
+  TEST_ASSERT_TRUE(ok);
+  TEST_ASSERT_GREATER_THAN(0, s_log_hook_call_count);
+  TEST_ASSERT_EQUAL(ESP_LOG_WARN, s_log_hook_last_level);
+  TEST_ASSERT_NOT_NULL(strstr(s_log_hook_last_message, "val"));
+  TEST_ASSERT_NOT_NULL(strstr(s_log_hook_last_message, "converting"));
+
+  timeseries_set_log_hook(NULL);
+}
+
+TEST_CASE("api: log hook fires error on incompatible conflict",
+          "[api][log_hook]") {
+  clear_db();
+
+  timeseries_set_log_hook(test_log_hook);
+  s_log_hook_call_count = 0;
+  s_log_hook_last_level = 0;
+  s_log_hook_last_message[0] = '\0';
+
+  // Insert as float first
+  insert_typed("hook_err_test", "val", TIMESERIES_FIELD_TYPE_FLOAT, 3);
+
+  // Insert as bool — triggers error
+  bool ok = try_insert_typed("hook_err_test", "val", TIMESERIES_FIELD_TYPE_BOOL, 3);
+  TEST_ASSERT_FALSE(ok);
+  TEST_ASSERT_GREATER_THAN(0, s_log_hook_call_count);
+  TEST_ASSERT_EQUAL(ESP_LOG_ERROR, s_log_hook_last_level);
+  TEST_ASSERT_NOT_NULL(strstr(s_log_hook_last_message, "conflict"));
+
+  timeseries_set_log_hook(NULL);
+}

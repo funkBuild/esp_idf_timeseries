@@ -1,4 +1,5 @@
 #include "esp_timer.h"
+#include "timeseries_cache.h"
 #include "timeseries_id_list.h"
 #include "timeseries_internal.h"
 #include "timeseries_iterator.h"
@@ -61,7 +62,37 @@ static bool tsdb_mark_series_deleted_in_page(timeseries_db_t* db, uint32_t page_
 
 static bool tsdb_mark_metadata_deleted_in_page(timeseries_db_t* db, uint32_t page_offset, uint32_t page_size,
                                                timeseries_series_id_list_t* series_to_delete) {
-  // Implementation for marking metadata as deleted in the specified page
+  timeseries_entity_iterator_t ent_iter;
+  if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+    return false;
+  }
+
+  timeseries_entry_header_t e_hdr;
+  while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
+    if (e_hdr.key_type != TIMESERIES_KEYTYPE_FIELDINDEX ||
+        e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
+      continue;
+    }
+    // FIELDINDEX key is the 16-byte series_id
+    if (e_hdr.key_len != 16) {
+      continue;
+    }
+
+    unsigned char key_series_id[16];
+    uint8_t dummy_val;
+    if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key_series_id, &dummy_val)) {
+      continue;
+    }
+
+    for (size_t i = 0; i < series_to_delete->count; i++) {
+      if (memcmp(key_series_id, series_to_delete->ids[i].bytes, 16) == 0) {
+        tsdb_soft_delete_entry(db, page_offset, ent_iter.current_entry_offset);
+        break;
+      }
+    }
+  }
+
+  timeseries_entity_iterator_deinit(&ent_iter);
   return true;
 }
 
@@ -172,6 +203,10 @@ bool timeseries_delete_by_measurement(timeseries_db_t* db, const char* measureme
     goto cleanup;
   }
 
+  // Invalidate caches so recreated fields can use new types
+  tsdb_cache_clear(db);
+  tsdb_clear_type_cache(db);
+
 cleanup:
   tsdb_series_id_list_free(&series_to_delete);
 
@@ -236,6 +271,10 @@ bool timeseries_delete_by_measurement_and_field(timeseries_db_t* db, const char*
     ESP_LOGW(TAG, "Failed to remove FIELDLISTINDEX entry for field '%s' in measurement '%s' "
              "(will be rebuilt on demand)", field_name, measurement_name);
   }
+
+  // Invalidate caches so recreated fields can use new types
+  tsdb_cache_clear(db);
+  tsdb_clear_type_cache(db);
 
 cleanup:
   tsdb_series_id_list_free(&series_to_delete);

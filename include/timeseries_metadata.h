@@ -98,16 +98,23 @@ void tsdb_clear_type_cache(timeseries_db_t *db);
 /**
  * @brief Ensure the metadata has an entry for this series_id and field type.
  *        If it does not exist, creates it. If it exists with a conflicting
- *        type, returns false.
+ *        type, returns false for incompatible types.  For convertible types
+ *        (float <-> int), returns true and sets *actual_type to the existing
+ *        stored type so the caller can convert values before writing.
  *
- * @param db        Pointer to the database context
- * @param series_id 16-byte series identifier
- * @param field_type Type of the field (e.g., float, int)
- * @return true on success or if it already matches, false on error/conflict
+ * @param db          Pointer to the database context
+ * @param series_id   16-byte series identifier
+ * @param field_type  Type of the field (e.g., float, int)
+ * @param field_name  Field name (for diagnostics)
+ * @param actual_type Out: the type that should be used for storage (may differ
+ *                    from field_type on float<->int conversion). May be NULL.
+ * @return true on success or convertible match, false on incompatible conflict
  */
 bool tsdb_ensure_series_type_in_metadata(timeseries_db_t *db,
                                          const unsigned char series_id[16],
-                                         timeseries_field_type_e field_type);
+                                         timeseries_field_type_e field_type,
+                                         const char *field_name,
+                                         timeseries_field_type_e *actual_type);
 
 /**
  * @brief Insert or update tag indexing for a given series ID. Each tag

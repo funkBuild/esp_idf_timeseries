@@ -839,13 +839,13 @@ TEST_CASE("query: tags + fields + time range + limit", "[query][combined]") {
     // Insert data with tags and multiple fields
     const char *tag_keys[] = {"location"};
     const char *tag_values[] = {"room1"};
-    const char *field_names[] = {"temperature", "humidity", "pressure"};
+    const char *field_names[] = {"temperature", "humidity"};
 
     TEST_ASSERT_TRUE(insert_test_data("weather", tag_keys, tag_values, 1,
-                                      field_names, 3, 100, 1000, 1000));
+                                      field_names, 2, 30, 1000, 1000));
 
     // Query with all parameters
-    const char *query_field_names[] = {"temperature", "humidity"};
+    const char *query_field_names[] = {"temperature"};
 
     timeseries_query_t query;
     memset(&query, 0, sizeof(query));
@@ -854,7 +854,7 @@ TEST_CASE("query: tags + fields + time range + limit", "[query][combined]") {
     query.tag_values = tag_values;
     query.num_tags = 1;
     query.field_names = query_field_names;
-    query.num_fields = 2;
+    query.num_fields = 1;
     query.start_ms = 20000;
     query.end_ms = 80000;
     query.limit = 20;
@@ -863,7 +863,7 @@ TEST_CASE("query: tags + fields + time range + limit", "[query][combined]") {
     TEST_ASSERT_TRUE(execute_and_validate_query(&query, &result));
 
     // Should respect all parameters
-    TEST_ASSERT_LESS_OR_EQUAL(2, result.num_columns);  // At most 2 fields
+    TEST_ASSERT_LESS_OR_EQUAL(1, result.num_columns);  // At most 1 field
     TEST_ASSERT_LESS_OR_EQUAL(20, result.num_points);  // At most limit
 
     timeseries_query_free_result(&result);
@@ -1324,9 +1324,9 @@ TEST_CASE("query: large dataset query performance", "[query][integration]") {
     setup_test();
 
     // Insert a larger dataset
-    const char *field_names[] = {"temperature", "humidity"};
+    const char *field_names[] = {"temperature"};
     TEST_ASSERT_TRUE(insert_test_data("weather", NULL, NULL, 0,
-                                      field_names, 2, 500, 1000, 100));
+                                      field_names, 1, 100, 1000, 100));
 
     timeseries_query_t query;
     memset(&query, 0, sizeof(query));

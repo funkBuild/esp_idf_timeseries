@@ -111,10 +111,15 @@ while [ $SECONDS_WAITED -lt $TIMEOUT_SEC ]; do
   if ! kill -0 "$QEMU_PID" 2>/dev/null; then
     break
   fi
-  # Check if Unity has printed the final summary line
+  # Check if Unity has printed the final summary line or the menu prompt
+  # (unity_run_all_tests prints "Press ENTER" after all tests complete)
   if grep -q "Tests [0-9]* Failures [0-9]* Ignored" "$OUTPUT_FILE" 2>/dev/null; then
     TESTS_DONE=true
-    # Give a moment for any trailing output
+    sleep 1
+    break
+  fi
+  if grep -q "Press ENTER to see the list of tests" "$OUTPUT_FILE" 2>/dev/null; then
+    TESTS_DONE=true
     sleep 1
     break
   fi
@@ -144,19 +149,34 @@ if [ "$TESTS_DONE" = false ]; then
   exit 1
 fi
 
-# Extract the summary line: "N Tests M Failures K Ignored"
-SUMMARY=$(grep "Tests [0-9]* Failures [0-9]* Ignored" "$OUTPUT_FILE" | tail -1)
-FAILURES=$(echo "$SUMMARY" | grep -oP '\d+(?= Failures)')
+# Try the summary line first: "N Tests M Failures K Ignored"
+SUMMARY=$(grep "Tests [0-9]* Failures [0-9]* Ignored" "$OUTPUT_FILE" | tail -1 || true)
+if [ -n "$SUMMARY" ]; then
+  FAILURES=$(echo "$SUMMARY" | grep -oP '\d+(?= Failures)')
+  if [ "$FAILURES" -eq 0 ]; then
+    info "All tests passed: $SUMMARY"
+    exit 0
+  else
+    error "Test failures: $SUMMARY"
+    exit 1
+  fi
+fi
 
-if [ -z "$FAILURES" ]; then
+# Fallback: count individual PASS/FAIL lines (handle \r from serial output)
+PASS_COUNT=$(grep -cP ":PASS\r?$" "$OUTPUT_FILE" || true)
+FAIL_COUNT=$(grep -cP ":FAIL\r?$" "$OUTPUT_FILE" || true)
+TOTAL=$((PASS_COUNT + FAIL_COUNT))
+
+if [ "$TOTAL" -eq 0 ]; then
   error "Could not parse test results"
   exit 1
 fi
 
-if [ "$FAILURES" -eq 0 ]; then
-  info "All tests passed: $SUMMARY"
+if [ "$FAIL_COUNT" -eq 0 ]; then
+  info "All tests passed: $PASS_COUNT passed, 0 failures (counted from test output)"
   exit 0
 else
-  error "Test failures: $SUMMARY"
+  error "Test failures: $PASS_COUNT passed, $FAIL_COUNT failed"
+  grep -P ":FAIL\r?$" "$OUTPUT_FILE" || true
   exit 1
 fi

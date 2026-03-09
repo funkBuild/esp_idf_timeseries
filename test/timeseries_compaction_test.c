@@ -180,6 +180,7 @@ static void count_l1_encoding_flags(int *out_alp_count, int *out_gorilla_count) 
                 (*out_gorilla_count)++;
             }
         }
+        timeseries_fielddata_iterator_deinit(&fd_iter);
     }
 }
 

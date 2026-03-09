@@ -2,6 +2,7 @@
 #define TIMESERIES_INTERNAL_H
 
 #include "esp_partition.h"
+#include "timeseries.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -245,6 +246,13 @@ typedef struct {
   _Atomic bool compaction_in_progress;
   _Atomic uint32_t compaction_generation;  // Incremented after each compaction run
   _Atomic uint32_t l0_page_count;          // Tracked atomically to avoid per-insert scan
+
+  // Optional hooks called before/after background compaction
+  timeseries_compaction_hook_t pre_compact_hook;
+  timeseries_compaction_hook_t post_compact_hook;
+
+  // Optional hook for forwarding internal log messages to the application
+  timeseries_log_hook_t log_hook;
 
   // Last used L0 page/offset
   bool last_l0_cache_valid;

@@ -36,9 +36,24 @@ static timeseries_db_t s_tsdb = {
 };
 static _Atomic bool s_init_in_progress = false;
 
+void timeseries_set_compaction_hooks(timeseries_compaction_hook_t pre_compact,
+                                     timeseries_compaction_hook_t post_compact) {
+    s_tsdb.pre_compact_hook = pre_compact;
+    s_tsdb.post_compact_hook = post_compact;
+}
+
+void timeseries_set_log_hook(timeseries_log_hook_t hook) {
+    s_tsdb.log_hook = hook;
+}
+
 // One-shot compaction task: runs compaction once, then exits
 static void tsdb_compaction_oneshot_task(void *param) {
     timeseries_db_t *db = (timeseries_db_t *)param;
+
+    if (db->pre_compact_hook) {
+        db->pre_compact_hook();
+    }
+
     ESP_LOGI(TAG, "Compaction task started");
     timeseries_compact_all_levels(db);
     atomic_fetch_add(&db->compaction_generation, 1);
@@ -50,7 +65,10 @@ static void tsdb_compaction_oneshot_task(void *param) {
     uint32_t l0_count = atomic_load(&db->l0_page_count);
     if (l0_count >= MIN_PAGES_FOR_COMPACTION) {
         ESP_LOGI(TAG, "Re-triggering compaction: %" PRIu32 " L0 pages accumulated", l0_count);
+        // post hook deferred until the re-triggered compaction finishes
         tsdb_launch_compaction(db);
+    } else if (db->post_compact_hook) {
+        db->post_compact_hook();
     }
 
     vTaskDelete(NULL);

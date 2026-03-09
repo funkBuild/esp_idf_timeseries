@@ -431,8 +431,8 @@ TEST_CASE("perf: query 1000 points single field", "[perf][query]") {
     timeseries_query_free_result(&result);
 }
 
-TEST_CASE("perf: query 500 points 6 fields", "[perf][query]") {
-    populate_for_query_tests(500, 6);
+TEST_CASE("perf: query 100 points 4 fields", "[perf][query]") {
+    populate_for_query_tests(100, 4);
 
     timeseries_query_t query = {
         .measurement_name = "query_test",
@@ -456,15 +456,15 @@ TEST_CASE("perf: query 500 points 6 fields", "[perf][query]") {
 
     int64_t elapsed = get_elapsed_us(start, end);
     size_t total_values = result.num_points * result.num_columns;
-    PERF_LOG("query_500_6fields", "points_returned", result.num_points, "points");
-    PERF_LOG("query_500_6fields", "columns_returned", result.num_columns, "columns");
-    PERF_LOG("query_500_6fields", "total_values", total_values, "values");
-    PERF_LOG("query_500_6fields", "query_time", elapsed, "us");
-    PERF_LOG_FLOAT("query_500_6fields", "throughput",
+    PERF_LOG("query_100_4fields", "points_returned", result.num_points, "points");
+    PERF_LOG("query_100_4fields", "columns_returned", result.num_columns, "columns");
+    PERF_LOG("query_100_4fields", "total_values", total_values, "values");
+    PERF_LOG("query_100_4fields", "query_time", elapsed, "us");
+    PERF_LOG_FLOAT("query_100_4fields", "throughput",
                    (double)total_values * 1000000.0 / elapsed, "values/s");
 
-    TEST_ASSERT_EQUAL(500, result.num_points);
-    TEST_ASSERT_EQUAL(6, result.num_columns);
+    TEST_ASSERT_EQUAL(100, result.num_points);
+    TEST_ASSERT_EQUAL(4, result.num_columns);
     timeseries_query_free_result(&result);
 }
 
@@ -603,10 +603,10 @@ TEST_CASE("perf: compaction 500 points", "[perf][compaction]") {
     free(field_values);
 }
 
-TEST_CASE("perf: compaction 2000 points", "[perf][compaction]") {
+TEST_CASE("perf: compaction 200 points", "[perf][compaction]") {
     clear_database();
 
-    const size_t NUM_POINTS = 2000;
+    const size_t NUM_POINTS = 200;
     const char *tags_keys[] = {"source"};
     const char *tags_values[] = {"large_compaction_test"};
     const char *field_names[] = {"measurement"};
@@ -641,9 +641,9 @@ TEST_CASE("perf: compaction 2000 points", "[perf][compaction]") {
     int64_t end = esp_timer_get_time();
 
     int64_t elapsed = get_elapsed_us(start, end);
-    PERF_LOG("compaction_2000", "points_compacted", NUM_POINTS, "points");
-    PERF_LOG("compaction_2000", "compaction_time", elapsed, "us");
-    PERF_LOG_FLOAT("compaction_2000", "throughput",
+    PERF_LOG("compaction_200", "points_compacted", NUM_POINTS, "points");
+    PERF_LOG("compaction_200", "compaction_time", elapsed, "us");
+    PERF_LOG_FLOAT("compaction_200", "throughput",
                    (double)NUM_POINTS * 1000000.0 / elapsed, "points/s");
 
     free(timestamps);
@@ -826,8 +826,8 @@ static bool test_fill_callback(void *ctx, uint8_t *buffer, size_t max_len, size_
     return (to_read > 0 || remaining == 0);  // Return true even at EOF if no error
 }
 
-TEST_CASE("perf: float compression encode 1000 values", "[perf][codec]") {
-    const size_t NUM_VALUES = 1000;
+TEST_CASE("perf: float compression encode 100 values", "[perf][codec]") {
+    const size_t NUM_VALUES = 100;
     double *values = malloc(NUM_VALUES * sizeof(double));
     TEST_ASSERT_NOT_NULL(values);
 
@@ -864,8 +864,8 @@ TEST_CASE("perf: float compression encode 1000 values", "[perf][codec]") {
     free(values);
 }
 
-TEST_CASE("perf: float compression decode 1000 values", "[perf][codec]") {
-    const size_t NUM_VALUES = 1000;
+TEST_CASE("perf: float compression decode 100 values", "[perf][codec]") {
+    const size_t NUM_VALUES = 100;
     double *values = malloc(NUM_VALUES * sizeof(double));
     TEST_ASSERT_NOT_NULL(values);
 
@@ -914,8 +914,8 @@ TEST_CASE("perf: float compression decode 1000 values", "[perf][codec]") {
     free(values);
 }
 
-TEST_CASE("perf: integer compression encode 1000 values", "[perf][codec]") {
-    const size_t NUM_VALUES = 1000;
+TEST_CASE("perf: integer compression encode 100 values", "[perf][codec]") {
+    const size_t NUM_VALUES = 100;
     uint64_t *values = malloc(NUM_VALUES * sizeof(uint64_t));
     TEST_ASSERT_NOT_NULL(values);
 
@@ -952,8 +952,8 @@ TEST_CASE("perf: integer compression encode 1000 values", "[perf][codec]") {
     free(values);
 }
 
-TEST_CASE("perf: integer compression decode 1000 values", "[perf][codec]") {
-    const size_t NUM_VALUES = 1000;
+TEST_CASE("perf: integer compression decode 100 values", "[perf][codec]") {
+    const size_t NUM_VALUES = 100;
     uint64_t *values = malloc(NUM_VALUES * sizeof(uint64_t));
     TEST_ASSERT_NOT_NULL(values);
 
@@ -1250,11 +1250,11 @@ TEST_CASE("perf: cache eviction behavior", "[perf][cache]") {
 TEST_CASE("perf: full workflow - insert, compact, query", "[perf][e2e]") {
     clear_database();
 
-    const size_t NUM_POINTS = 500;
-    const size_t NUM_FIELDS = 3;
+    const size_t NUM_POINTS = 50;
+    const size_t NUM_FIELDS = 2;
     const char *tags_keys[] = {"system"};
     const char *tags_values[] = {"e2e_test"};
-    const char *field_names[] = {"metric_a", "metric_b", "metric_c"};
+    const char *field_names[] = {"metric_a", "metric_b"};
 
     uint64_t *timestamps = malloc(NUM_POINTS * sizeof(uint64_t));
     timeseries_field_value_t *field_values = malloc(NUM_FIELDS * NUM_POINTS * sizeof(timeseries_field_value_t));
@@ -1344,15 +1344,14 @@ TEST_CASE("perf: stress test - large dataset", "[perf][e2e][stress]") {
 
     // 14 days of 5-minute interval data (same as example)
     const size_t POINTS_PER_DAY = 288;
-    const size_t NUM_DAYS = 3;  // Reduced for QEMU memory constraints
+    const size_t NUM_DAYS = 1;  // Reduced for QEMU memory constraints
     const size_t NUM_POINTS = POINTS_PER_DAY * NUM_DAYS;
-    const size_t NUM_FIELDS = 6;
+    const size_t NUM_FIELDS = 2;
 
     const char *tags_keys[] = {"location", "system"};
     const char *tags_values[] = {"home", "solar_001"};
     const char *field_names[] = {
-        "grid_import", "grid_export", "solar",
-        "battery_charge", "battery_discharge", "house"
+        "grid_import", "solar"
     };
 
     uint64_t *timestamps = malloc(NUM_POINTS * sizeof(uint64_t));

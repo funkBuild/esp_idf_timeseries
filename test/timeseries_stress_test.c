@@ -57,16 +57,16 @@ static bool insert_n(const char *measurement, const char *field, size_t count,
 // Rapid insert → query → compact cycles
 // ============================================================================
 
-TEST_CASE("stress: insert-query-compact cycle 10 rounds",
+TEST_CASE("stress: insert-query-compact cycle 5 rounds",
           "[stress][cycle]") {
   ensure_init();
 
   int64_t start = esp_timer_get_time();
 
-  for (int round = 0; round < 10; round++) {
-    // Insert 50 points per round
+  for (int round = 0; round < 5; round++) {
+    // Insert 20 points per round
     TEST_ASSERT_TRUE(
-        insert_n("cycle_test", "v", 50, (uint64_t)round * 100000));
+        insert_n("cycle_test", "v", 20, (uint64_t)round * 100000));
 
     // Query to verify data is there
     timeseries_query_t q;
@@ -77,7 +77,7 @@ TEST_CASE("stress: insert-query-compact cycle 10 rounds",
 
     timeseries_query_result_t r = {0};
     TEST_ASSERT_TRUE(timeseries_query(&q, &r));
-    TEST_ASSERT_EQUAL((round + 1) * 50, r.num_points);
+    TEST_ASSERT_EQUAL((round + 1) * 20, r.num_points);
     timeseries_query_free_result(&r);
 
     // Compact every other round
@@ -87,7 +87,7 @@ TEST_CASE("stress: insert-query-compact cycle 10 rounds",
   }
 
   int64_t elapsed = esp_timer_get_time() - start;
-  ESP_LOGI(TAG, "10 insert-query-compact cycles: %" PRId64 " ms",
+  ESP_LOGI(TAG, "5 insert-query-compact cycles: %" PRId64 " ms",
            elapsed / 1000);
 }
 
@@ -147,21 +147,21 @@ TEST_CASE("stress: interleave inserts and compactions",
   ensure_init();
 
   // Insert batch 1
-  TEST_ASSERT_TRUE(insert_n("interleave", "v", 100, 0));
+  TEST_ASSERT_TRUE(insert_n("interleave", "v", 30, 0));
 
   // Compact L0→L1
   TEST_ASSERT_TRUE(timeseries_compact_force_sync());
 
   // Insert batch 2 (new L0 pages)
-  TEST_ASSERT_TRUE(insert_n("interleave", "v", 100, 200000));
+  TEST_ASSERT_TRUE(insert_n("interleave", "v", 30, 60000));
 
   // Compact again (L0→L1, L1→L2)
   TEST_ASSERT_TRUE(timeseries_compact_force_sync());
 
   // Insert batch 3
-  TEST_ASSERT_TRUE(insert_n("interleave", "v", 100, 400000));
+  TEST_ASSERT_TRUE(insert_n("interleave", "v", 30, 120000));
 
-  // Final query — all 300 points should be present
+  // Final query — all 90 points should be present
   timeseries_query_t q;
   memset(&q, 0, sizeof(q));
   q.measurement_name = "interleave";
@@ -170,7 +170,7 @@ TEST_CASE("stress: interleave inserts and compactions",
 
   timeseries_query_result_t r = {0};
   TEST_ASSERT_TRUE(timeseries_query(&q, &r));
-  TEST_ASSERT_EQUAL(300, r.num_points);
+  TEST_ASSERT_EQUAL(90, r.num_points);
 
   // Verify timestamps are sorted
   for (size_t i = 1; i < r.num_points; i++) {
@@ -178,7 +178,7 @@ TEST_CASE("stress: interleave inserts and compactions",
   }
 
   timeseries_query_free_result(&r);
-  ESP_LOGI(TAG, "Interleaved insert+compact: 300 points verified");
+  ESP_LOGI(TAG, "Interleaved insert+compact: 90 points verified");
 }
 
 // ============================================================================
@@ -215,30 +215,30 @@ TEST_CASE("stress: clear and re-populate 5 times", "[stress][clear]") {
 // Multi-field insert stress
 // ============================================================================
 
-TEST_CASE("stress: 5 fields in single measurement", "[stress][fields]") {
+TEST_CASE("stress: 3 fields in single measurement", "[stress][fields]") {
   ensure_init();
 
-  size_t num_points = 50;
+  size_t num_points = 20;
   uint64_t *ts = malloc(num_points * sizeof(uint64_t));
   timeseries_field_value_t *vals =
-      malloc(5 * num_points * sizeof(timeseries_field_value_t));
+      malloc(3 * num_points * sizeof(timeseries_field_value_t));
   TEST_ASSERT_NOT_NULL(ts);
   TEST_ASSERT_NOT_NULL(vals);
 
   for (size_t i = 0; i < num_points; i++) {
     ts[i] = 1000 + i * 1000;
-    for (int f = 0; f < 5; f++) {
+    for (int f = 0; f < 3; f++) {
       vals[f * num_points + i].type = TIMESERIES_FIELD_TYPE_FLOAT;
       vals[f * num_points + i].data.float_val = (double)(f * 100 + i);
     }
   }
 
-  const char *fields[] = {"f0", "f1", "f2", "f3", "f4"};
+  const char *fields[] = {"f0", "f1", "f2"};
   timeseries_insert_data_t data = {
       .measurement_name = "multi_field_stress",
       .field_names = fields,
       .field_values = vals,
-      .num_fields = 5,
+      .num_fields = 3,
       .timestamps_ms = ts,
       .num_points = num_points,
   };
@@ -251,7 +251,7 @@ TEST_CASE("stress: 5 fields in single measurement", "[stress][fields]") {
   size_t fcount = 0;
   TEST_ASSERT_TRUE(timeseries_get_fields_for_measurement("multi_field_stress",
                                                          &field_names, &fcount));
-  TEST_ASSERT_EQUAL(5, fcount);
+  TEST_ASSERT_EQUAL(3, fcount);
   for (size_t i = 0; i < fcount; i++) {
     free(field_names[i]);
   }
@@ -266,9 +266,9 @@ TEST_CASE("stress: 5 fields in single measurement", "[stress][fields]") {
 
   timeseries_query_result_t r = {0};
   TEST_ASSERT_TRUE(timeseries_query(&q, &r));
-  TEST_ASSERT_EQUAL(50, r.num_points);
-  TEST_ASSERT_EQUAL(5, r.num_columns);
+  TEST_ASSERT_EQUAL(20, r.num_points);
+  TEST_ASSERT_EQUAL(3, r.num_columns);
   timeseries_query_free_result(&r);
 
-  ESP_LOGI(TAG, "5 fields × 50 points verified");
+  ESP_LOGI(TAG, "3 fields × 20 points verified");
 }

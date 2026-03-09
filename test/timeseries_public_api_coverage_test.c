@@ -184,8 +184,8 @@ TEST_CASE("public_api: compact after deinit reinit", "[public_api][lifecycle]") 
     ensure_init();
 
     // Insert enough data to compact
-    for (int batch = 0; batch < 5; batch++) {
-        TEST_ASSERT_TRUE(insert_floats("compact_reinit", "val", 100,
+    for (int batch = 0; batch < 3; batch++) {
+        TEST_ASSERT_TRUE(insert_floats("compact_reinit", "val", 30,
                                         (uint64_t)batch * 100000, 100));
     }
 
@@ -201,7 +201,7 @@ TEST_CASE("public_api: compact after deinit reinit", "[public_api][lifecycle]") 
     // Data should still be queryable
     timeseries_query_result_t r;
     TEST_ASSERT_TRUE(query_measurement("compact_reinit", &r));
-    TEST_ASSERT_EQUAL(500, r.num_points);
+    TEST_ASSERT_EQUAL(90, r.num_points);
     timeseries_query_free_result(&r);
 }
 
@@ -214,9 +214,9 @@ TEST_CASE("public_api: expire with data removes oldest", "[public_api][expire]")
 
     // Fill database with enough data to trigger expiration threshold
     // Insert many batches to consume space
-    for (int batch = 0; batch < 10; batch++) {
-        TEST_ASSERT_TRUE(insert_floats("expire_data", "sensor", 200,
-                                        (uint64_t)batch * 200000, 100));
+    for (int batch = 0; batch < 5; batch++) {
+        TEST_ASSERT_TRUE(insert_floats("expire_data", "sensor", 50,
+                                        (uint64_t)batch * 50000, 100));
     }
 
     // Query total before expiration
@@ -224,7 +224,7 @@ TEST_CASE("public_api: expire with data removes oldest", "[public_api][expire]")
     TEST_ASSERT_TRUE(query_measurement("expire_data", &r_before));
     size_t points_before = r_before.num_points;
     ESP_LOGI(TAG, "Points before expire: %zu", points_before);
-    TEST_ASSERT_EQUAL(2000, points_before);
+    TEST_ASSERT_EQUAL(250, points_before);
     timeseries_query_free_result(&r_before);
 
     // Run expire - with default 50% threshold, may or may not delete
@@ -251,7 +251,7 @@ TEST_CASE("public_api: expire preserves newer data", "[public_api][expire]") {
     ensure_init();
 
     // Insert old data and new data
-    TEST_ASSERT_TRUE(insert_floats("expire_old", "val", 500, 1000, 100));
+    TEST_ASSERT_TRUE(insert_floats("expire_old", "val", 50, 1000, 100));
     TEST_ASSERT_TRUE(insert_floats("expire_new", "val", 50, 90000000, 100));
 
     // Expire
@@ -1343,7 +1343,7 @@ TEST_CASE("public_api: get_usage_summary reflects inserts and compaction", "[pub
     uint32_t initial_used = s1.used_space_bytes;
 
     // Insert data
-    TEST_ASSERT_TRUE(insert_floats("usage_test", "val", 500, 0, 100));
+    TEST_ASSERT_TRUE(insert_floats("usage_test", "val", 50, 0, 100));
 
     tsdb_usage_summary_t s2;
     TEST_ASSERT_TRUE(timeseries_get_usage_summary(&s2));

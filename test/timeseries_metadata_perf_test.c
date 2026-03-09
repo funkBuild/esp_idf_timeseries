@@ -493,6 +493,7 @@ TEST_CASE("metadata_perf: entity_iterator_full_scan", "[metadata_perf][iterator]
             meta_offsets[meta_count++] = page_offset;
         }
     }
+    timeseries_page_cache_iterator_deinit(&page_iter);
 
     TEST_ASSERT_GREATER_THAN(0, meta_count);
 

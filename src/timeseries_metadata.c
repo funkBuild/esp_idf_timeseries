@@ -27,6 +27,9 @@
 
 static const char* TAG = "TimeseriesMetadata";
 
+// Max linear probe distance for type cache collision resolution
+#define TYPE_CACHE_MAX_PROBE 4
+
 // -----------------------------------------------------------------------------
 // Forward-declared static helpers
 // -----------------------------------------------------------------------------
@@ -47,6 +50,8 @@ static bool tsdb_create_new_index_entry(timeseries_db_t* db, uint32_t page_offse
 static bool tsdb_upsert_seriesid_list_entry(timeseries_db_t* db, timeseries_keytype_t target_key_type,
                                             const uint32_t* meta_offsets, size_t meta_count, const char* key_str,
                                             const unsigned char series_id[16]);
+
+static inline size_t hash_series_id(const unsigned char series_id[16], size_t cache_size);
 
 static bool tsdb_upsert_tagindex_entry(timeseries_db_t* db, const uint32_t* meta_offsets, size_t meta_count,
                                        const char* key_str, const unsigned char series_id[16]);
@@ -432,9 +437,9 @@ bool tsdb_ensure_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
     return false;
   }
 
-  // 1) Check if there's already a stored type for this series ID
+  // 1) Check RAM cache first, then fall back to flash scan
   timeseries_field_type_e existing_type;
-  if (tsdb_lookup_series_type_in_metadata(db, series_id, &existing_type)) {
+  if (tsdb_lookup_series_type_cached(db, series_id, &existing_type)) {
     // found existing
     if (existing_type != field_type) {
       ESP_LOGE(TAG, "SeriesID conflict: existing type=%d, new=%d", (int)existing_type, (int)field_type);
@@ -517,6 +522,21 @@ bool tsdb_ensure_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
         return false;
       }
 
+      // Populate type cache so subsequent inserts skip flash lookup
+      if (db->type_cache && db->type_cache_size > 0) {
+        size_t idx = hash_series_id(series_id, db->type_cache_size);
+        for (size_t p = 0; p < TYPE_CACHE_MAX_PROBE; p++) {
+          size_t slot = (idx + p) % db->type_cache_size;
+          series_type_cache_entry_t* tc = &db->type_cache[slot];
+          if (!tc->valid || memcmp(tc->series_id, series_id, 16) == 0) {
+            memcpy(tc->series_id, series_id, 16);
+            tc->field_type = (uint8_t)field_type;
+            tc->valid = true;
+            break;
+          }
+        }
+      }
+
       ESP_LOGV(TAG, "Created new fieldindex for series=%.2X%.2X%.2X%.2X..., type=%d", series_id[0], series_id[1],
                series_id[2], series_id[3], (int)field_type);
       return true;
@@ -541,7 +561,6 @@ bool tsdb_ensure_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
 
 bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, const char** tag_keys,
                                 const char** tag_values, size_t num_tags, const unsigned char series_id[16]) {
-  // If you call tsdb_upsert_tagindex_entry() here, it must be declared first!
   if (!db || !series_id) {
     return false;
   }
@@ -549,7 +568,37 @@ bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, co
     return true;
   }
 
-  // find metadata pages
+  // Limit batch size to keep stack usage bounded
+  if (num_tags > 16) {
+    // Fall back to per-tag upsert for unusually large tag sets
+    uint32_t meta_offsets[4];
+    size_t meta_count = 0;
+    if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
+      return false;
+    }
+    for (size_t i = 0; i < num_tags; i++) {
+      char key_buf[128];
+      int n = snprintf(key_buf, sizeof(key_buf), "%" PRIu32 ":%s:%s", measurement_id, tag_keys[i], tag_values[i]);
+      if (n < 0 || (size_t)n >= sizeof(key_buf)) return false;
+      if (!tsdb_upsert_tagindex_entry(db, meta_offsets, meta_count, key_buf, series_id)) return false;
+    }
+    return true;
+  }
+
+  // Build all tag key strings upfront
+  char tag_key_bufs[16][128];
+  size_t tag_key_lens[16];
+  bool tag_done[16];  // true once found/updated
+  for (size_t i = 0; i < num_tags; i++) {
+    int n = snprintf(tag_key_bufs[i], sizeof(tag_key_bufs[i]), "%" PRIu32 ":%s:%s",
+                     measurement_id, tag_keys[i], tag_values[i]);
+    if (n < 0 || (size_t)n >= sizeof(tag_key_bufs[i])) {
+      return false;
+    }
+    tag_key_lens[i] = (size_t)n;
+    tag_done[i] = false;
+  }
+
   uint32_t meta_offsets[4];
   size_t meta_count = 0;
   if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
@@ -557,16 +606,138 @@ bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, co
     return false;
   }
 
-  // For each tag, build the key and upsert
-  for (size_t i = 0; i < num_tags; i++) {
-    char key_buf[128];
-    int n = snprintf(key_buf, sizeof(key_buf), "%" PRIu32 ":%s:%s", measurement_id, tag_keys[i], tag_values[i]);
-    if (n < 0 || (size_t)n >= sizeof(key_buf)) {
-      return false;
+  // Single scan: iterate each metadata page once, checking all pending tags
+  for (size_t p = 0; p < meta_count; p++) {
+    // Check if all tags are done
+    bool all_done = true;
+    for (size_t t = 0; t < num_tags; t++) {
+      if (!tag_done[t]) { all_done = false; break; }
+    }
+    if (all_done) break;
+
+    timeseries_entity_iterator_t ent_iter;
+    if (!timeseries_entity_iterator_init(db, meta_offsets[p], TIMESERIES_METADATA_PAGE_SIZE, &ent_iter)) {
+      continue;
     }
 
-    if (!tsdb_upsert_tagindex_entry(db, meta_offsets, meta_count, key_buf, series_id)) {
-      ESP_LOGE(TAG, "Failed to upsert tag '%s' => series ID", key_buf);
+    timeseries_entry_header_t e_hdr;
+    while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
+      if (e_hdr.key_type != TIMESERIES_KEYTYPE_TAGINDEX ||
+          e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID ||
+          (e_hdr.value_len % 16 != 0)) {
+        continue;
+      }
+
+      // Check this entry against all pending tags
+      for (size_t t = 0; t < num_tags; t++) {
+        if (tag_done[t] || e_hdr.key_len != tag_key_lens[t]) continue;
+
+        char stored_key[128];
+        size_t series_count = e_hdr.value_len / 16;
+        unsigned char* all_series_ids = malloc(e_hdr.value_len);
+        if (!all_series_ids) {
+          timeseries_entity_iterator_deinit(&ent_iter);
+          return false;
+        }
+
+        if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, stored_key, all_series_ids)) {
+          free(all_series_ids);
+          continue;
+        }
+        stored_key[tag_key_lens[t]] = '\0';
+
+        if (strcmp(stored_key, tag_key_bufs[t]) != 0) {
+          free(all_series_ids);
+          continue;
+        }
+
+        // Found matching entry for tag t
+        tag_done[t] = true;
+
+        bool already_present = false;
+        for (size_t s = 0; s < series_count; s++) {
+          if (memcmp(all_series_ids + s * 16, series_id, 16) == 0) {
+            already_present = true;
+            break;
+          }
+        }
+
+        if (!already_present) {
+          size_t new_size = (series_count + 1) * 16;
+          unsigned char* new_ids = malloc(new_size);
+          if (!new_ids) {
+            free(all_series_ids);
+            timeseries_entity_iterator_deinit(&ent_iter);
+            return false;
+          }
+          memcpy(new_ids, all_series_ids, series_count * 16);
+          memcpy(new_ids + series_count * 16, series_id, 16);
+
+          bool entry_created = tsdb_create_new_index_entry(
+              db, meta_offsets[p], TIMESERIES_KEYTYPE_TAGINDEX,
+              tag_key_bufs[t], new_ids, new_size);
+          if (!entry_created) {
+            for (size_t q = 0; q < meta_count && !entry_created; q++) {
+              if (meta_offsets[q] != meta_offsets[p]) {
+                entry_created = tsdb_create_new_index_entry(
+                    db, meta_offsets[q], TIMESERIES_KEYTYPE_TAGINDEX,
+                    tag_key_bufs[t], new_ids, new_size);
+              }
+            }
+          }
+          if (!entry_created && timeseries_metadata_create_page(db)) {
+            uint32_t new_offsets[4];
+            size_t new_count = 0;
+            if (tsdb_find_metadata_pages(db, new_offsets, 4, &new_count)) {
+              for (size_t q = 0; q < new_count && !entry_created; q++) {
+                entry_created = tsdb_create_new_index_entry(
+                    db, new_offsets[q], TIMESERIES_KEYTYPE_TAGINDEX,
+                    tag_key_bufs[t], new_ids, new_size);
+              }
+            }
+          }
+          free(new_ids);
+
+          if (!entry_created) {
+            free(all_series_ids);
+            timeseries_entity_iterator_deinit(&ent_iter);
+            return false;
+          }
+
+          tsdb_soft_delete_entry(db, meta_offsets[p], ent_iter.current_entry_offset);
+        }
+
+        free(all_series_ids);
+        break;  // This entry matched one tag; move to next entry
+      }  // for each pending tag
+    }  // while next entity
+
+    timeseries_entity_iterator_deinit(&ent_iter);
+  }  // for each metadata page
+
+  // Create new entries for tags not found in any page
+  for (size_t t = 0; t < num_tags; t++) {
+    if (tag_done[t]) continue;
+
+    bool created = false;
+    for (size_t p = 0; p < meta_count && !created; p++) {
+      created = tsdb_create_new_index_entry(
+          db, meta_offsets[p], TIMESERIES_KEYTYPE_TAGINDEX,
+          tag_key_bufs[t], series_id, 16);
+    }
+    if (!created && timeseries_metadata_create_page(db)) {
+      uint32_t new_offsets[4];
+      size_t new_count = 0;
+      if (tsdb_find_metadata_pages(db, new_offsets, 4, &new_count)) {
+        for (size_t p = 0; p < new_count && !created; p++) {
+          created = tsdb_create_new_index_entry(
+              db, new_offsets[p], TIMESERIES_KEYTYPE_TAGINDEX,
+              tag_key_bufs[t], series_id, 16);
+        }
+      }
+    }
+    if (!created) {
+      ESP_LOGE(TAG, "Failed to create tag index entry for '%s'", tag_key_bufs[t]);
       return false;
     }
   }
@@ -1153,7 +1324,9 @@ static bool tsdb_upsert_seriesid_list_entry(timeseries_db_t* db, timeseries_keyt
         memset(stored_key, 0, sizeof(stored_key));
 
         size_t series_count = e_hdr.value_len / 16;
-        unsigned char* all_series_ids = malloc(e_hdr.value_len);
+        // Allocate for existing IDs + 1 extra slot so we can append in-place
+        size_t new_size = (series_count + 1) * 16;
+        unsigned char* all_series_ids = malloc(new_size);
         if (!all_series_ids) {
           return false;
         }
@@ -1176,25 +1349,17 @@ static bool tsdb_upsert_seriesid_list_entry(timeseries_db_t* db, timeseries_keyt
             }
           }
 
-          // If not present, append
+          // If not present, append in-place (buffer already has room)
           if (!already_present) {
-            size_t new_size = (series_count + 1) * 16;
-            unsigned char* new_ids = malloc(new_size);
-            if (!new_ids) {
-              free(all_series_ids);
-              timeseries_entity_iterator_deinit(&ent_iter);
-              return false;
-            }
-            memcpy(new_ids, all_series_ids, series_count * 16);
-            memcpy(new_ids + series_count * 16, series_id, 16);
+            memcpy(all_series_ids + series_count * 16, series_id, 16);
 
             // Create new entry with new_size - try same page first, then others
-            bool entry_created = tsdb_create_new_index_entry(db, page_offset, target_key_type, key_str, new_ids, new_size);
+            bool entry_created = tsdb_create_new_index_entry(db, page_offset, target_key_type, key_str, all_series_ids, new_size);
             if (!entry_created) {
               // Same page is full - try other pages
               for (size_t q = 0; q < meta_count && !entry_created; q++) {
                 if (meta_offsets[q] != page_offset) {
-                  entry_created = tsdb_create_new_index_entry(db, meta_offsets[q], target_key_type, key_str, new_ids, new_size);
+                  entry_created = tsdb_create_new_index_entry(db, meta_offsets[q], target_key_type, key_str, all_series_ids, new_size);
                 }
               }
               if (!entry_created) {
@@ -1204,19 +1369,17 @@ static bool tsdb_upsert_seriesid_list_entry(timeseries_db_t* db, timeseries_keyt
                   size_t new_count = 0;
                   if (tsdb_find_metadata_pages(db, new_offsets, 4, &new_count)) {
                     for (size_t q = 0; q < new_count && !entry_created; q++) {
-                      entry_created = tsdb_create_new_index_entry(db, new_offsets[q], target_key_type, key_str, new_ids, new_size);
+                      entry_created = tsdb_create_new_index_entry(db, new_offsets[q], target_key_type, key_str, all_series_ids, new_size);
                     }
                   }
                 }
               }
               if (!entry_created) {
-                free(new_ids);
                 free(all_series_ids);
                 timeseries_entity_iterator_deinit(&ent_iter);
                 return false;
               }
             }
-            free(new_ids);
 
             // Soft-delete the old entry
             if (!tsdb_soft_delete_entry(db, page_offset, ent_iter.current_entry_offset)) {
@@ -1705,28 +1868,36 @@ bool tsdb_lookup_series_type_cached(timeseries_db_t* db, const unsigned char ser
     return false;
   }
 
-  // Check cache first if available
+  // Check cache first if available (linear probing)
   if (db->type_cache && db->type_cache_size > 0) {
     size_t idx = hash_series_id(series_id, db->type_cache_size);
-    series_type_cache_entry_t* entry = &db->type_cache[idx];
-
-    if (entry->valid && memcmp(entry->series_id, series_id, 16) == 0) {
-      // Cache hit!
-      *out_type = (timeseries_field_type_e)entry->field_type;
-      return true;
+    for (size_t p = 0; p < TYPE_CACHE_MAX_PROBE; p++) {
+      size_t slot = (idx + p) % db->type_cache_size;
+      series_type_cache_entry_t* entry = &db->type_cache[slot];
+      if (!entry->valid) break;  // empty slot = not cached
+      if (memcmp(entry->series_id, series_id, 16) == 0) {
+        *out_type = (timeseries_field_type_e)entry->field_type;
+        return true;
+      }
     }
   }
 
   // Cache miss - do the metadata scan
   bool found = tsdb_lookup_series_type_in_metadata(db, series_id, out_type);
 
-  // If found, cache the result
+  // If found, cache the result (linear probing for insertion)
   if (found && db->type_cache && db->type_cache_size > 0) {
     size_t idx = hash_series_id(series_id, db->type_cache_size);
-    series_type_cache_entry_t* entry = &db->type_cache[idx];
-    memcpy(entry->series_id, series_id, 16);
-    entry->field_type = (uint8_t)*out_type;
-    entry->valid = true;
+    for (size_t p = 0; p < TYPE_CACHE_MAX_PROBE; p++) {
+      size_t slot = (idx + p) % db->type_cache_size;
+      series_type_cache_entry_t* entry = &db->type_cache[slot];
+      if (!entry->valid || memcmp(entry->series_id, series_id, 16) == 0) {
+        memcpy(entry->series_id, series_id, 16);
+        entry->field_type = (uint8_t)*out_type;
+        entry->valid = true;
+        break;
+      }
+    }
   }
 
   return found;

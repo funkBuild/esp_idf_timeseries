@@ -511,6 +511,7 @@ TEST_CASE("iterator: fielddata iterator on field data page", "[iterator]") {
         TEST_ASSERT_TRUE(fd_header.record_length > 0);
       }
 
+      timeseries_fielddata_iterator_deinit(&fd_iter);
       ESP_LOGI(TAG, "Total field data records: %d", record_count);
       TEST_ASSERT_TRUE(record_count > 0);
       break;
@@ -685,6 +686,7 @@ TEST_CASE("iterator: page cache iterator on empty cache", "[iterator]") {
     TEST_ASSERT_EQUAL(TIMESERIES_PAGE_STATE_ACTIVE, header.page_state);
   }
 
+  timeseries_page_cache_iterator_deinit(&iter);
   ESP_LOGI(TAG, "Page cache entries (empty DB): %d", cache_count);
 }
 
@@ -713,6 +715,7 @@ TEST_CASE("iterator: page cache iterator with data", "[iterator]") {
              active_pages, offset, size, header.page_type);
   }
 
+  timeseries_page_cache_iterator_deinit(&iter);
   ESP_LOGI(TAG, "Total active pages in cache: %d", active_pages);
   TEST_ASSERT_TRUE(active_pages > 0);
 }

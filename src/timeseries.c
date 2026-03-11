@@ -36,23 +36,42 @@ static timeseries_db_t s_tsdb = {
 };
 static _Atomic bool s_init_in_progress = false;
 
-// One-shot compaction task: runs compaction once, then exits
+// Compaction task: loops while work remains, then self-deletes.
+// Using a loop instead of re-triggering via tsdb_launch_compaction avoids
+// creating a new task (12 KiB stack) before the current task's stack is freed
+// by the IDLE task, which caused progressive heap exhaustion.
+static _Atomic uint32_t s_compaction_consecutive_failures = 0;
+#define COMPACTION_MAX_CONSECUTIVE_FAILURES 3
+
 static void tsdb_compaction_oneshot_task(void *param) {
     timeseries_db_t *db = (timeseries_db_t *)param;
-    ESP_LOGI(TAG, "Compaction task started");
-    timeseries_compact_all_levels(db);
-    atomic_fetch_add(&db->compaction_generation, 1);
-    db->compaction_task_handle = NULL;
-    atomic_store(&db->compaction_in_progress, false);
-    ESP_LOGI(TAG, "Compaction task finished");
 
-    // Re-check L0 count - inserts during compaction may have accumulated new pages
-    uint32_t l0_count = atomic_load(&db->l0_page_count);
-    if (l0_count >= MIN_PAGES_FOR_COMPACTION) {
-        ESP_LOGI(TAG, "Re-triggering compaction: %" PRIu32 " L0 pages accumulated", l0_count);
-        tsdb_launch_compaction(db);
+    for (;;) {
+        ESP_LOGI(TAG, "Compaction task started");
+        bool success = timeseries_compact_all_levels(db);
+        atomic_fetch_add(&db->compaction_generation, 1);
+        ESP_LOGI(TAG, "Compaction task finished");
+
+        if (!success) {
+            uint32_t failures = atomic_fetch_add(&s_compaction_consecutive_failures, 1) + 1;
+            if (failures >= COMPACTION_MAX_CONSECUTIVE_FAILURES) {
+                ESP_LOGW(TAG, "Compaction failed %" PRIu32 " consecutive times, backing off", failures);
+                break;
+            }
+        } else {
+            atomic_store(&s_compaction_consecutive_failures, 0);
+        }
+
+        // Re-check L0 count — inserts during compaction may have accumulated new pages
+        uint32_t l0_count = atomic_load(&db->l0_page_count);
+        if (l0_count < MIN_PAGES_FOR_COMPACTION) {
+            break;
+        }
+        ESP_LOGI(TAG, "Re-running compaction: %" PRIu32 " L0 pages accumulated", l0_count);
     }
 
+    db->compaction_task_handle = NULL;
+    atomic_store(&db->compaction_in_progress, false);
     vTaskDelete(NULL);
 }
 
@@ -818,4 +837,16 @@ bool timeseries_delete_measurement_and_field(const char* measurement_name, const
     return false;
   }
   return timeseries_delete_by_measurement_and_field(&s_tsdb, measurement_name, field_name);
+}
+
+bool timeseries_get_timestamp_range(const char *measurement_name,
+                                    uint64_t *out_min_ms,
+                                    uint64_t *out_max_ms,
+                                    uint32_t *out_point_count) {
+  if (!s_tsdb.initialized) {
+    return false;
+  }
+  return timeseries_query_get_timestamp_range(&s_tsdb, measurement_name,
+                                              out_min_ms, out_max_ms,
+                                              out_point_count);
 }

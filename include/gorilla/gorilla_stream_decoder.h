@@ -93,6 +93,14 @@ bool gorilla_decoder_get_string(gorilla_decoder_stream_t *decoder,
                                 uint8_t **out_data, size_t *out_length);
 
 /**
+ * @brief Skip one value without materializing it.
+ *
+ * For float/int/bool, this decodes and discards (bit-reading cost is inherent).
+ * For strings, this avoids the malloc by inflating into a stack buffer.
+ */
+bool gorilla_decoder_skip_value(gorilla_decoder_stream_t *decoder);
+
+/**
  * @brief Finalize the decoding process.
  *
  * If an underlying decoder was created, this function finalizes it.

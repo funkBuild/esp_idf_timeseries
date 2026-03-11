@@ -633,14 +633,6 @@ static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
   if (db->write_buffer && db->write_buffer_capacity >= total_write) {
     write_buf = db->write_buffer;
     using_preallocated = true;
-  } else if (db->write_buffer && total_write <= 64 * 1024) {
-    uint8_t *new_buffer = (uint8_t *)realloc(db->write_buffer, total_write);
-    if (new_buffer) {
-      db->write_buffer = new_buffer;
-      db->write_buffer_capacity = total_write;
-      write_buf = db->write_buffer;
-      using_preallocated = true;
-    }
   }
 
   if (!write_buf) {

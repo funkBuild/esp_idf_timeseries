@@ -25,18 +25,17 @@ static const double FRAC_ARR[19] = {
 /*
  * Scratch buffer layout (single allocation):
  *
- *   [ decoded_ints  | packed_data   | exc_positions | _pad_ | exc_values   ]
- *   [ 128 × int64  | 128 × uint64  | 128 × uint16  |  8B   | 128 × uint64 ]
- *   [ 1024 B        | 1024 B        | 256 B          |  8B   | 1024 B       ]
+ *   [ decoded_ints  | packed_data   | exc_positions ]
+ *   [ 128 × int64  | 128 × uint64  | 128 × uint16  ]
+ *   [ 1024 B        | 1024 B        | 256 B          ]
  *
- * exc_positions is 256 bytes (128 × 2), already 8-byte aligned.
- * No padding needed between sections.
+ * exc_values reuses packed_data's memory — FFOR unpack is complete before
+ * exception data is read, so the two never overlap in time. Saves 1024 bytes.
  */
 #define SCRATCH_INT_SZ   (ALP_BLOCK_SIZE * sizeof(int64_t))   /* 1024 */
 #define SCRATCH_PACK_SZ  (ALP_BLOCK_SIZE * sizeof(uint64_t))  /* 1024 */
 #define SCRATCH_POS_SZ   (ALP_BLOCK_SIZE * sizeof(uint16_t))  /*  256 */
-#define SCRATCH_VAL_SZ   (ALP_BLOCK_SIZE * sizeof(uint64_t))  /* 1024 */
-#define SCRATCH_TOTAL    (SCRATCH_INT_SZ + SCRATCH_PACK_SZ + SCRATCH_POS_SZ + SCRATCH_VAL_SZ)
+#define SCRATCH_TOTAL    (SCRATCH_INT_SZ + SCRATCH_PACK_SZ + SCRATCH_POS_SZ)
 
 __attribute__((optimize("O3")))
 bool alp_decode(const uint8_t * restrict data, size_t data_len,
@@ -80,7 +79,9 @@ bool alp_decode(const uint8_t * restrict data, size_t data_len,
     int64_t  *decoded_ints  = (int64_t  *)(scratch);
     uint64_t *packed_data   = (uint64_t *)(scratch + SCRATCH_INT_SZ);
     uint16_t *exc_positions = (uint16_t *)(scratch + SCRATCH_INT_SZ + SCRATCH_PACK_SZ);
-    uint64_t *exc_values    = (uint64_t *)(scratch + SCRATCH_INT_SZ + SCRATCH_PACK_SZ + SCRATCH_POS_SZ);
+    /* exc_values reuses packed_data — safe because FFOR unpack is finished
+       before exception data is read from the stream. */
+    uint64_t *exc_values    = packed_data;
 
     size_t out_idx = 0;
     int64_t running = anchor;

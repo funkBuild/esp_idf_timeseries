@@ -114,9 +114,11 @@ static bool verify_l0_data_exists(timeseries_db_t *db,
           total_points += f_hdr.record_count;
         }
       }
+      timeseries_fielddata_iterator_deinit(&f_iter);
     }
   }
 
+  timeseries_page_cache_iterator_deinit(&page_iter);
   return (total_points == expected_count);
 }
 
@@ -701,6 +703,8 @@ TEST_CASE("data: insert fills first L0 page then creates new one", "[data][pages
     }
   }
 
+  timeseries_page_cache_iterator_deinit(&page_iter);
+
   ESP_LOGI(TAG, "Created %zu L0 pages", l0_page_count);
   TEST_ASSERT_GREATER_THAN(1, l0_page_count);
 
@@ -1076,10 +1080,12 @@ TEST_CASE("data: verify record length calculation for float", "[data][record]") 
             break;
           }
         }
+        timeseries_fielddata_iterator_deinit(&f_iter);
       }
     }
   }
 
+  timeseries_page_cache_iterator_deinit(&page_iter);
   TEST_ASSERT_TRUE_MESSAGE(found, "Record not found in L0 pages");
 
   free(timestamps);
@@ -1132,10 +1138,12 @@ TEST_CASE("data: verify record length for varying string sizes", "[data][record]
             break;
           }
         }
+        timeseries_fielddata_iterator_deinit(&f_iter);
       }
     }
   }
 
+  timeseries_page_cache_iterator_deinit(&page_iter);
   TEST_ASSERT_TRUE_MESSAGE(found, "Record not found in L0 pages");
 }
 
@@ -1191,10 +1199,12 @@ TEST_CASE("data: verify start_time and end_time in header", "[data][bug]") {
             break;
           }
         }
+        timeseries_fielddata_iterator_deinit(&f_iter);
       }
     }
   }
 
+  timeseries_page_cache_iterator_deinit(&page_iter);
   TEST_ASSERT_TRUE_MESSAGE(found, "Record not found in L0 pages");
 }
 
@@ -1295,9 +1305,11 @@ TEST_CASE("data: verify flags field initialization", "[data][bug]") {
             break;
           }
         }
+        timeseries_fielddata_iterator_deinit(&f_iter);
       }
     }
   }
 
+  timeseries_page_cache_iterator_deinit(&page_iter);
   TEST_ASSERT_TRUE_MESSAGE(found, "Record not found in L0 pages");
 }

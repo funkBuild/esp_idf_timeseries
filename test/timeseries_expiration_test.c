@@ -123,6 +123,7 @@ static size_t count_active_field_data_records(timeseries_db_t *db) {
           count++;
         }
       }
+      timeseries_fielddata_iterator_deinit(&f_iter);
     }
   }
 
@@ -167,6 +168,7 @@ static bool find_oldest_active_record(timeseries_db_t *db,
           }
         }
       }
+      timeseries_fielddata_iterator_deinit(&f_iter);
     }
   }
 
@@ -220,6 +222,7 @@ static size_t __attribute__((unused)) count_deleted_records(timeseries_db_t *db)
           count++;
         }
       }
+      timeseries_fielddata_iterator_deinit(&f_iter);
     }
   }
 

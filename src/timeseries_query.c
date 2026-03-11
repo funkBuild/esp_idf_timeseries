@@ -1,12 +1,13 @@
 #include "timeseries_query.h"
 #include "esp_timer.h"
-#include "timeseries_data.h"    // hypothetical data-fetch stubs
-#include "timeseries_id_list.h" // for timeseries_series_id_list_t
+#include "timeseries_data.h"
+#include "timeseries_id_list.h"
 #include "timeseries_iterator.h"
-#include "timeseries_metadata.h" // for tsdb_find_measurement_id, etc.
+#include "timeseries_metadata.h"
 #include "timeseries_multi_series_iterator.h"
 #include "timeseries_page_cache_snapshot.h"
 #include "timeseries_points_iterator.h"
+#include "timeseries_string_list.h"
 
 #include "esp_log.h"
 
@@ -416,7 +417,9 @@ static size_t find_or_create_column(timeseries_query_result_t *result,
 
   // Allocate values array at the current result capacity (which may have been
   // pre-allocated during estimation). This avoids the need for NULL checks on
-  // every ensure_result_capacity call.
+  // every ensure_result_capacity call. When alloc_size is 0 (empty result set),
+  // skip allocation — values stays NULL and ensure_result_capacity will allocate
+  // on demand if rows are added later.
   size_t alloc_size = result_capacity > result->num_points
                           ? result_capacity : result->num_points;
   if (alloc_size > 0) {
@@ -425,7 +428,9 @@ static size_t find_or_create_column(timeseries_query_result_t *result,
     if (!result->columns[new_col_index].values) {
       free((void *)result->columns[new_col_index].name);
       result->columns[new_col_index].name = NULL;
-      ESP_LOGE(TAG, "OOM allocating initial cells for column '%s'", field_name);
+      ESP_LOGE(TAG, "OOM allocating %" PRIu32 " cells (%" PRIu32 " bytes) for column '%s'",
+               (uint32_t)alloc_size, (uint32_t)(alloc_size * sizeof(timeseries_field_value_t)),
+               field_name);
       return SIZE_MAX;
     }
   }
@@ -470,53 +475,191 @@ static bool ensure_result_capacity(timeseries_query_result_t *result,
 /**
  * @brief Find a row index with the given timestamp; if none, add a new row.
  *
- * Timestamps are always produced in ascending order. For the first field,
- * this is always an append. For subsequent fields, we use binary search
- * on the existing sorted timestamps array.
+ * Uses a forward cursor hint for O(1) amortized lookup when timestamps
+ * arrive in sorted order (the common case for aggregation rollup).
  *
  * @param[in,out] result   The query result
  * @param[in]     ts       The timestamp to match
+ * @param[in,out] capacity Current capacity of result arrays
+ * @param[in,out] hint     Forward cursor — start search here, updated on return
  * @return The row index corresponding to this timestamp
  */
 static size_t find_or_create_row(timeseries_query_result_t *result,
-                                 uint64_t ts, size_t *capacity) {
-  // Fast path: check if it matches the last row (common for multi-field)
-  if (result->num_points > 0 &&
-      result->timestamps[result->num_points - 1] == ts) {
-    return result->num_points - 1;
+                                 uint64_t ts, size_t *capacity,
+                                 size_t *hint) {
+  // Forward scan from hint (both input and existing data are sorted)
+  size_t h = *hint;
+  if (h > result->num_points) h = 0;
+
+  while (h < result->num_points && result->timestamps[h] < ts) {
+    h++;
+  }
+  if (h < result->num_points && result->timestamps[h] == ts) {
+    *hint = h + 1;
+    return h;
   }
 
-  // Binary search on sorted timestamps
-  if (result->num_points > 0) {
-    size_t lo = 0, hi = result->num_points;
-    while (lo < hi) {
-      size_t mid = lo + (hi - lo) / 2;
-      if (result->timestamps[mid] < ts) {
-        lo = mid + 1;
-      } else if (result->timestamps[mid] > ts) {
-        hi = mid;
-      } else {
-        return mid;
-      }
-    }
-  }
-
-  // Not found — append new row
+  // Not found — insert at position h
+  size_t insert_pos = h;
   if (!ensure_result_capacity(result, capacity)) {
     return SIZE_MAX;
   }
 
-  size_t new_row_index = result->num_points;
-  result->timestamps[new_row_index] = ts;
+  if (insert_pos < result->num_points) {
+    size_t shift = result->num_points - insert_pos;
+    memmove(&result->timestamps[insert_pos + 1],
+            &result->timestamps[insert_pos],
+            shift * sizeof(uint64_t));
+    for (size_t c = 0; c < result->num_columns; c++) {
+      memmove(&result->columns[c].values[insert_pos + 1],
+              &result->columns[c].values[insert_pos],
+              shift * sizeof(timeseries_field_value_t));
+    }
+  }
 
-  // Zero-initialize the new cell in each column
+  result->timestamps[insert_pos] = ts;
   for (size_t c = 0; c < result->num_columns; c++) {
-    memset(&result->columns[c].values[new_row_index], 0,
+    memset(&result->columns[c].values[insert_pos], 0,
            sizeof(timeseries_field_value_t));
   }
 
-  result->num_points = new_row_index + 1;
-  return new_row_index;
+  result->num_points++;
+  *hint = insert_pos + 1;
+  return insert_pos;
+}
+
+/**
+ * @brief Merge sorted field data into the result in O(n + m) time.
+ *
+ * Both the existing result timestamps and the new timestamps must be sorted.
+ * Instead of per-point memmove (O(n²)), this counts new insertions, expands
+ * the arrays once, and fills from right-to-left in a single pass.
+ */
+static bool merge_sorted_field_data(timeseries_query_result_t *result,
+                                    size_t col_index,
+                                    const uint64_t *new_ts,
+                                    const timeseries_field_value_t *new_vals,
+                                    size_t new_count,
+                                    size_t *capacity) {
+  if (new_count == 0) return true;
+
+  size_t old_count = result->num_points;
+
+  // Fast path: no existing data — bulk copy
+  if (old_count == 0) {
+    while (*capacity < new_count) {
+      if (!ensure_result_capacity(result, capacity)) return false;
+    }
+    memcpy(result->timestamps, new_ts, new_count * sizeof(uint64_t));
+    memcpy(result->columns[col_index].values, new_vals,
+           new_count * sizeof(timeseries_field_value_t));
+    for (size_t c = 0; c < result->num_columns; c++) {
+      if (c != col_index) {
+        memset(result->columns[c].values, 0,
+               new_count * sizeof(timeseries_field_value_t));
+      }
+    }
+    result->num_points = new_count;
+    return true;
+  }
+
+  // Single-pass: try placing values assuming all timestamps exist.
+  // If we encounter a missing timestamp, count remaining inserts and fall through to merge.
+  size_t insert_count = 0;
+  {
+    size_t oi = 0;
+    size_t ni = 0;
+    for (; ni < new_count; ni++) {
+      while (oi < old_count && result->timestamps[oi] < new_ts[ni]) {
+        oi++;
+      }
+      if (oi >= old_count || result->timestamps[oi] != new_ts[ni]) {
+        // Found a new timestamp — count it and finish counting the rest
+        insert_count = 1;
+        oi = oi; // keep oi position for continued counting
+        for (size_t ni2 = ni + 1; ni2 < new_count; ni2++) {
+          while (oi < old_count && result->timestamps[oi] < new_ts[ni2]) {
+            oi++;
+          }
+          if (oi >= old_count || result->timestamps[oi] != new_ts[ni2]) {
+            insert_count++;
+          } else {
+            oi++;
+          }
+        }
+        break;
+      }
+      // Timestamp exists — place value immediately (combines count + placement)
+      result->columns[col_index].values[oi] = new_vals[ni];
+      oi++;
+    }
+    if (insert_count == 0) {
+      return true;  // All timestamps existed, values already placed
+    }
+  }
+
+  // Ensure capacity for merged result
+  size_t merged_count = old_count + insert_count;
+  while (*capacity < merged_count) {
+    if (!ensure_result_capacity(result, capacity)) return false;
+  }
+
+  // Reverse merge: fill from right to left so we never overwrite unread data
+  ssize_t oi = (ssize_t)old_count - 1;
+  ssize_t ni = (ssize_t)new_count - 1;
+  ssize_t ki = (ssize_t)merged_count - 1;
+
+  while (ki >= 0) {
+    bool take_old;
+    if (oi < 0) {
+      take_old = false;
+    } else if (ni < 0) {
+      take_old = true;
+    } else if (result->timestamps[oi] > new_ts[ni]) {
+      take_old = true;
+    } else if (result->timestamps[oi] < new_ts[ni]) {
+      take_old = false;
+    } else {
+      // Equal timestamps — keep old row, set value for current column
+      if ((size_t)ki != (size_t)oi) {
+        result->timestamps[ki] = result->timestamps[oi];
+        for (size_t c = 0; c < result->num_columns; c++) {
+          if (c != col_index) {
+            result->columns[c].values[ki] = result->columns[c].values[oi];
+          }
+        }
+      }
+      result->columns[col_index].values[ki] = new_vals[ni];
+      oi--; ni--; ki--;
+      continue;
+    }
+
+    if (take_old) {
+      if ((size_t)ki != (size_t)oi) {
+        result->timestamps[ki] = result->timestamps[oi];
+        for (size_t c = 0; c < result->num_columns; c++) {
+          result->columns[c].values[ki] = result->columns[c].values[oi];
+        }
+      }
+      oi--;
+    } else {
+      // New timestamp — insert with zero-initialized values for other columns
+      result->timestamps[ki] = new_ts[ni];
+      for (size_t c = 0; c < result->num_columns; c++) {
+        if (c == col_index) {
+          result->columns[c].values[ki] = new_vals[ni];
+        } else {
+          memset(&result->columns[c].values[ki], 0,
+                 sizeof(timeseries_field_value_t));
+        }
+      }
+      ni--;
+    }
+    ki--;
+  }
+
+  result->num_points = merged_count;
+  return true;
 }
 
 static int cmp_series_id_asc(const void *a, const void *b) {
@@ -787,26 +930,53 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
   prof_end = esp_timer_get_time();
   ESP_LOGD(TAG, "[PROFILE] Prune lists: %.3f ms", (prof_end - prof_start) / 1000.0);
 
-  // Pre-estimate result capacity from collected record counts
+  // Pre-estimate result capacity from collected record counts.
+  // Take the max across fields (not the sum), because each field stores the
+  // same timestamps independently — summing would over-count by num_fields×.
   {
     size_t estimated_points = 0;
     for (size_t f = 0; f < num_fields; f++) {
+      size_t field_points = 0;
       for (size_t s = 0; s < fields_array[f].num_series; s++) {
         for (size_t i = 0; i < fields_array[f].series_lists[s].count; i++) {
-          estimated_points += fields_array[f].series_lists[s].records[i].record_count;
+          field_points += fields_array[f].series_lists[s].records[i].record_count;
         }
+      }
+      if (field_points > estimated_points)
+        estimated_points = field_points;
+    }
+    // Bound by rollup interval: aggregation reduces point count
+    if (query->rollup_interval > 0 && query->start_ms > 0 && query->end_ms > query->start_ms) {
+      size_t rollup_estimate = (size_t)((query->end_ms - query->start_ms) / query->rollup_interval) + 1;
+      if (rollup_estimate < estimated_points) {
+        estimated_points = rollup_estimate;
       }
     }
     if (query->limit > 0 && estimated_points > (size_t)query->limit) {
       estimated_points = (size_t)query->limit;
     }
+    ESP_LOGD(TAG, "Estimated %" PRIu32 " points from record headers", (uint32_t)estimated_points);
     if (estimated_points > 0) {
       result_capacity = estimated_points;
       result->timestamps = malloc(result_capacity * sizeof(uint64_t));
       if (!result->timestamps) {
-        ESP_LOGE(TAG, "OOM pre-allocating %zu timestamps", result_capacity);
+        ESP_LOGE(TAG, "OOM pre-allocating %" PRIu32 " timestamps", (uint32_t)result_capacity);
         result_capacity = 0;
       }
+    }
+  }
+
+  // Early exit: no records found — return empty result without creating columns
+  if (result_capacity == 0 && result->num_points == 0) {
+    bool any_records = false;
+    for (size_t f = 0; f < num_fields && !any_records; f++) {
+      for (size_t s = 0; s < fields_array[f].num_series && !any_records; s++) {
+        if (fields_array[f].series_lists[s].count > 0) any_records = true;
+      }
+    }
+    if (!any_records) {
+      series_lookup_free(&srl_tbl);
+      return 0;
     }
   }
 
@@ -896,202 +1066,281 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     // Keep track of how many data points we've inserted for this field
     // so we can respect the `query->limit` per-field (as requested).
     size_t inserted_for_this_field = 0;
+    bool field_limit_reached = false;
 
-    // Build a multi_points_iterator for each series.
-    // Batch-allocate iterators to reduce malloc count and heap fragmentation.
-    timeseries_multi_points_iterator_t **series_multi_iters =
-        calloc(fld->num_series, sizeof(*series_multi_iters));
-    // Batch allocation for all multi_points_iterators (one per series)
-    timeseries_multi_points_iterator_t *mpit_batch =
-        calloc(fld->num_series, sizeof(timeseries_multi_points_iterator_t));
-    // Per-series batch pointers for points_iterators
-    timeseries_points_iterator_t **pit_batches =
-        calloc(fld->num_series, sizeof(timeseries_points_iterator_t *));
-    if (!series_multi_iters || !mpit_batch || !pit_batches) {
-      free(series_multi_iters);
-      free(mpit_batch);
-      free(pit_batches);
-      ESP_LOGE(TAG, "OOM: cannot allocate iterator arrays for field='%s'",
-               fld->field_name);
-      continue;
-    }
+    if (query->rollup_interval == 0) {
+      // ====================================================================
+      // PASS-THROUGH MODE: process each series independently.
+      // Only one series' iterators are alive at a time, reducing peak memory
+      // from O(num_series × data_per_series) to O(data_per_series).
+      // find_or_create_row maintains sorted timestamp order via insertion.
+      // ====================================================================
+      prof_iter_create += (esp_timer_get_time() - prof_temp);
+      prof_temp = esp_timer_get_time();
 
-    for (size_t s = 0; s < fld->num_series; s++) {
-      series_record_list_t *srl = &fld->series_lists[s];
+      for (size_t s = 0; s < fld->num_series && !field_limit_reached; s++) {
+        series_record_list_t *srl = &fld->series_lists[s];
+        if (srl->count == 0) continue;
 
-      size_t record_count = srl->count;
-      if (record_count == 0) {
-        continue;
-      }
-
-      // Batch-allocate all points_iterators for this series in one calloc
-      timeseries_points_iterator_t *pit_batch =
-          calloc(record_count, sizeof(timeseries_points_iterator_t));
-      // Temporary pointer/seq arrays for multi_points_iterator_init
-      timeseries_points_iterator_t **sub_iters =
-          calloc(record_count, sizeof(*sub_iters));
-      uint32_t *page_seqs = calloc(record_count, sizeof(uint32_t));
-      if (!pit_batch || !sub_iters || !page_seqs) {
-        free(pit_batch);
-        free(sub_iters);
-        free(page_seqs);
-        ESP_LOGE(TAG, "OOM building sub-iter structures for field='%s'",
-                 fld->field_name);
-        continue;
-      }
-      pit_batches[s] = pit_batch;
-
-      // Initialize each record's points_iterator from the batch
-      size_t idx = 0;
-      for (size_t ri = 0; ri < record_count; ri++) {
-        field_record_info_t *rec = &srl->records[ri];
-        timeseries_points_iterator_t *pit = &pit_batch[ri];
-        ESP_LOGV(TAG, "Initializing points_iter: absolute_offset=0x%08" PRIX32 ", length=%" PRIu16 ", count=%" PRIu16,
-                 rec->record_offset, rec->record_length, rec->record_count);
-        bool ok = timeseries_points_iterator_init(
-            db, rec->record_offset, rec->record_length,
-            rec->record_count, field_type, rec->data_flags, pit);
-        if (!ok) {
-          ESP_LOGW(TAG, "Failed init of points_iter offset=0x%08X, length=%u, count=%u, type=%d",
-                   (unsigned)(rec->record_offset),
-                   rec->record_length, rec->record_count, field_type);
+        // Allocate iterators for this series only
+        timeseries_points_iterator_t *pit_batch =
+            calloc(srl->count, sizeof(timeseries_points_iterator_t));
+        timeseries_points_iterator_t **sub_iters =
+            calloc(srl->count, sizeof(*sub_iters));
+        uint32_t *page_seqs = calloc(srl->count, sizeof(uint32_t));
+        if (!pit_batch || !sub_iters || !page_seqs) {
+          free(pit_batch); free(sub_iters); free(page_seqs);
+          ESP_LOGE(TAG, "OOM: series iter alloc for field='%s'", fld->field_name);
           continue;
         }
-        // Trim decoded arrays to query time range (ALP & uncompressed only)
-        timeseries_points_iterator_set_time_range(pit, query->start_ms, query->end_ms);
-        sub_iters[idx] = pit;
-        page_seqs[idx] = 0;
-        idx++;
-      }
 
-      // Merge them into one multi_points_iterator (from the batch)
-      if (idx > 0) {
-        timeseries_multi_points_iterator_t *mpit = &mpit_batch[s];
-        if (timeseries_multi_points_iterator_init(sub_iters, page_seqs,
-                                                   idx, mpit)) {
-          series_multi_iters[s] = mpit;
-        } else {
-          // Cleanup partial — deinit initialized iterators (don't free individually)
-          for (size_t i2 = 0; i2 < idx; i2++) {
-            if (sub_iters[i2]) {
-              timeseries_points_iterator_deinit(sub_iters[i2]);
+        size_t idx = 0;
+        for (size_t ri = 0; ri < srl->count; ri++) {
+          field_record_info_t *rec = &srl->records[ri];
+          timeseries_points_iterator_t *pit = &pit_batch[ri];
+          bool ok = timeseries_points_iterator_init(
+              db, rec->record_offset, rec->record_length,
+              rec->record_count, field_type, rec->data_flags, pit);
+          if (!ok) continue;
+          timeseries_points_iterator_set_time_range(pit, query->start_ms, query->end_ms);
+          sub_iters[idx] = pit;
+          page_seqs[idx] = 0;
+          idx++;
+        }
+
+        if (idx > 0) {
+          timeseries_multi_points_iterator_t mpit;
+          if (timeseries_multi_points_iterator_init(sub_iters, page_seqs, idx, &mpit)) {
+            // Buffer points from iterator, then merge into result in O(n+m)
+            size_t buf_cap = 64, buf_count = 0;
+            uint64_t *buf_ts = malloc(buf_cap * sizeof(uint64_t));
+            timeseries_field_value_t *buf_vals = malloc(buf_cap * sizeof(timeseries_field_value_t));
+            bool buf_ok = (buf_ts && buf_vals);
+
+            if (buf_ok) {
+              uint64_t ts;
+              timeseries_field_value_t val;
+              while (timeseries_multi_points_iterator_next(&mpit, &ts, &val)) {
+                if (query->start_ms != 0 && ts < query->start_ms) {
+                  if (val.type == TIMESERIES_FIELD_TYPE_STRING && val.data.string_val.str)
+                    free(val.data.string_val.str);
+                  continue;
+                }
+                if (query->end_ms != 0 && ts > query->end_ms) {
+                  if (val.type == TIMESERIES_FIELD_TYPE_STRING && val.data.string_val.str)
+                    free(val.data.string_val.str);
+                  break;
+                }
+                if (query->limit != 0 && inserted_for_this_field >= query->limit) {
+                  if (val.type == TIMESERIES_FIELD_TYPE_STRING && val.data.string_val.str)
+                    free(val.data.string_val.str);
+                  field_limit_reached = true;
+                  break;
+                }
+
+                // Grow buffer if needed
+                if (buf_count == buf_cap) {
+                  size_t new_cap = buf_cap * 2;
+                  uint64_t *nt = realloc(buf_ts, new_cap * sizeof(uint64_t));
+                  timeseries_field_value_t *nv = realloc(buf_vals, new_cap * sizeof(timeseries_field_value_t));
+                  if (!nt || !nv) {
+                    if (nt) buf_ts = nt;
+                    if (nv) buf_vals = nv;
+                    ESP_LOGE(TAG, "OOM growing point buffer for field '%s'", fld->field_name);
+                    if (val.type == TIMESERIES_FIELD_TYPE_STRING && val.data.string_val.str)
+                      free(val.data.string_val.str);
+                    field_limit_reached = true;
+                    break;
+                  }
+                  buf_ts = nt;
+                  buf_vals = nv;
+                  buf_cap = new_cap;
+                }
+
+                buf_ts[buf_count] = ts;
+                buf_vals[buf_count] = val;
+                buf_count++;
+                inserted_for_this_field++;
+                total_points_aggregated++;
+              }
+
+              // Merge buffered points into result — O(n + m) instead of O(n²)
+              if (buf_count > 0) {
+                if (!merge_sorted_field_data(result, col_index, buf_ts, buf_vals,
+                                             buf_count, &result_capacity)) {
+                  ESP_LOGE(TAG, "OOM merging result for field '%s'", fld->field_name);
+                  // Free any string values in buffer on failure
+                  for (size_t bi = 0; bi < buf_count; bi++) {
+                    if (buf_vals[bi].type == TIMESERIES_FIELD_TYPE_STRING &&
+                        buf_vals[bi].data.string_val.str)
+                      free(buf_vals[bi].data.string_val.str);
+                  }
+                }
+              }
+            } else {
+              ESP_LOGE(TAG, "OOM allocating point buffer for field '%s'", fld->field_name);
+            }
+
+            free(buf_ts);
+            free(buf_vals);
+
+            // Cleanup immediately: deinit sub-iterators through the multi_points_iterator
+            for (size_t i_sub = 0; i_sub < mpit.sub_count; i_sub++) {
+              if (mpit.subs[i_sub].sub_iter)
+                timeseries_points_iterator_deinit(mpit.subs[i_sub].sub_iter);
+            }
+            timeseries_multi_points_iterator_deinit(&mpit);
+          } else {
+            for (size_t i2 = 0; i2 < idx; i2++) {
+              if (sub_iters[i2])
+                timeseries_points_iterator_deinit(sub_iters[i2]);
             }
           }
         }
+
+        free(sub_iters);
+        free(page_seqs);
+        free(pit_batch);
+      } // end sequential series processing
+
+      prof_decompress += (esp_timer_get_time() - prof_temp);
+    } else {
+      // ====================================================================
+      // AGGREGATION MODE: all iterators alive, use multi_series_iterator
+      // ====================================================================
+
+      // Build a multi_points_iterator for each series.
+      timeseries_multi_points_iterator_t **series_multi_iters =
+          calloc(fld->num_series, sizeof(*series_multi_iters));
+      timeseries_multi_points_iterator_t *mpit_batch =
+          calloc(fld->num_series, sizeof(timeseries_multi_points_iterator_t));
+      timeseries_points_iterator_t **pit_batches =
+          calloc(fld->num_series, sizeof(timeseries_points_iterator_t *));
+      if (!series_multi_iters || !mpit_batch || !pit_batches) {
+        free(series_multi_iters);
+        free(mpit_batch);
+        free(pit_batches);
+        ESP_LOGE(TAG, "OOM: cannot allocate iterator arrays for field='%s'",
+                 fld->field_name);
+        continue;
       }
 
-      free(sub_iters);
-      free(page_seqs);
-    } // end for each series in field
+      for (size_t s = 0; s < fld->num_series; s++) {
+        series_record_list_t *srl = &fld->series_lists[s];
+        if (srl->count == 0) continue;
 
-    // Use multi_series_iterator to aggregate across all series in the field
-    prof_iter_create += (esp_timer_get_time() - prof_temp);
-
-    timeseries_multi_series_iterator_t ms_iter;
-    if (!timeseries_multi_series_iterator_init(
-            series_multi_iters, fld->num_series, query->rollup_interval,
-            agg_method, &ms_iter)) {
-      ESP_LOGW(TAG, "Failed multi-series aggregator for '%s'", fld->field_name);
-    } else {
-      // We'll pull aggregated points until exhausted, or until limit/time-range
-      // reached
-      prof_temp = esp_timer_get_time();
-      while (true) {
-        uint64_t rollup_ts = 0;
-        timeseries_field_value_t val_agg;
-        bool got_data = timeseries_multi_series_iterator_next(
-            &ms_iter, &rollup_ts, &val_agg);
-
-        if (!got_data) {
-          break; // no more data
-        }
-
-        // Optional time-range filtering (if requested)
-        if (query->start_ms != 0 && rollup_ts < query->start_ms) {
-          if (val_agg.type == TIMESERIES_FIELD_TYPE_STRING &&
-              val_agg.data.string_val.str) {
-            free(val_agg.data.string_val.str);
-          }
+        timeseries_points_iterator_t *pit_batch =
+            calloc(srl->count, sizeof(timeseries_points_iterator_t));
+        timeseries_points_iterator_t **sub_iters =
+            calloc(srl->count, sizeof(*sub_iters));
+        uint32_t *page_seqs = calloc(srl->count, sizeof(uint32_t));
+        if (!pit_batch || !sub_iters || !page_seqs) {
+          free(pit_batch); free(sub_iters); free(page_seqs);
+          ESP_LOGE(TAG, "OOM building sub-iter structures for field='%s'",
+                   fld->field_name);
           continue;
         }
-        if (query->end_ms != 0 && rollup_ts > query->end_ms) {
-          if (val_agg.type == TIMESERIES_FIELD_TYPE_STRING &&
-              val_agg.data.string_val.str) {
-            free(val_agg.data.string_val.str);
-          }
-          break; // aggregator times are in ascending order, so we can break
+        pit_batches[s] = pit_batch;
+
+        size_t idx = 0;
+        for (size_t ri = 0; ri < srl->count; ri++) {
+          field_record_info_t *rec = &srl->records[ri];
+          timeseries_points_iterator_t *pit = &pit_batch[ri];
+          bool ok = timeseries_points_iterator_init(
+              db, rec->record_offset, rec->record_length,
+              rec->record_count, field_type, rec->data_flags, pit);
+          if (!ok) continue;
+          timeseries_points_iterator_set_time_range(pit, query->start_ms, query->end_ms);
+          sub_iters[idx] = pit;
+          page_seqs[idx] = 0;
+          idx++;
         }
 
-        // Check limit for this field
-        if (query->limit != 0 && inserted_for_this_field >= query->limit) {
-          // We've reached the maximum number of points we allow for this field
-          if (val_agg.type == TIMESERIES_FIELD_TYPE_STRING &&
-              val_agg.data.string_val.str) {
-            free(val_agg.data.string_val.str);
-          }
-          break;
-        }
-
-        // Actually store this aggregator result into the result struct
-        size_t row_index = find_or_create_row(result, rollup_ts,
-                                                    &result_capacity);
-
-        if (row_index == SIZE_MAX) {
-          ESP_LOGE(TAG, "OOM inserting new result row – aborting field '%s'",
-                   fld->field_name);
-          if (val_agg.type == TIMESERIES_FIELD_TYPE_STRING &&
-              val_agg.data.string_val.str) {
-            free(val_agg.data.string_val.str);
-          }
-          break;
-        }
-
-        // Free any existing string in this cell before overwriting (can happen
-        // when find_or_create_row returns an existing row with a duplicate ts).
-        if (result->columns[col_index].values[row_index].type == TIMESERIES_FIELD_TYPE_STRING &&
-            result->columns[col_index].values[row_index].data.string_val.str) {
-          free(result->columns[col_index].values[row_index].data.string_val.str);
-        }
-
-        // Use the type from the aggregated value as it may be different from
-        // the original field type
-        result->columns[col_index].values[row_index].type = val_agg.type;
-
-        // Copy the aggregated value into the result.
-        // For strings, ownership has been transferred through the iterator
-        // chain -- the result now owns the string pointer and free_result
-        // will free it.
-        result->columns[col_index].values[row_index].data = val_agg.data;
-
-        inserted_for_this_field++;
-        total_points_aggregated++;
-
-      } // end while aggregator
-      prof_decompress += (esp_timer_get_time() - prof_temp);
-      timeseries_multi_series_iterator_deinit(&ms_iter);
-    }
-
-    // Cleanup: deinit iterators, then free batch allocations
-    for (size_t s = 0; s < fld->num_series; s++) {
-      if (series_multi_iters[s]) {
-        /* Deinit each sub-iterator (don't free — they're from pit_batches) */
-        for (size_t i_sub = 0; i_sub < series_multi_iters[s]->sub_count;
-             ++i_sub) {
-          timeseries_points_iterator_t *pit =
-              series_multi_iters[s]->subs[i_sub].sub_iter;
-          if (pit) {
-            timeseries_points_iterator_deinit(pit);
+        if (idx > 0) {
+          timeseries_multi_points_iterator_t *mpit = &mpit_batch[s];
+          if (timeseries_multi_points_iterator_init(sub_iters, page_seqs, idx, mpit)) {
+            series_multi_iters[s] = mpit;
+          } else {
+            for (size_t i2 = 0; i2 < idx; i2++) {
+              if (sub_iters[i2])
+                timeseries_points_iterator_deinit(sub_iters[i2]);
+            }
           }
         }
-        /* Free multi-iterator internals (don't free struct — it's from mpit_batch) */
-        timeseries_multi_points_iterator_deinit(series_multi_iters[s]);
+
+        free(sub_iters);
+        free(page_seqs);
+      } // end for each series in field
+
+      prof_iter_create += (esp_timer_get_time() - prof_temp);
+
+      timeseries_multi_series_iterator_t ms_iter;
+      if (!timeseries_multi_series_iterator_init(
+              series_multi_iters, fld->num_series, query->rollup_interval,
+              agg_method, &ms_iter)) {
+        ESP_LOGW(TAG, "Failed multi-series aggregator for '%s'", fld->field_name);
+      } else {
+        prof_temp = esp_timer_get_time();
+        size_t agg_hint = 0;
+        while (true) {
+          uint64_t rollup_ts = 0;
+          timeseries_field_value_t val_agg;
+          if (!timeseries_multi_series_iterator_next(&ms_iter, &rollup_ts, &val_agg))
+            break;
+
+          if (query->start_ms != 0 && rollup_ts < query->start_ms) {
+            if (val_agg.type == TIMESERIES_FIELD_TYPE_STRING && val_agg.data.string_val.str)
+              free(val_agg.data.string_val.str);
+            continue;
+          }
+          if (query->end_ms != 0 && rollup_ts > query->end_ms) {
+            if (val_agg.type == TIMESERIES_FIELD_TYPE_STRING && val_agg.data.string_val.str)
+              free(val_agg.data.string_val.str);
+            break;
+          }
+          if (query->limit != 0 && inserted_for_this_field >= query->limit) {
+            if (val_agg.type == TIMESERIES_FIELD_TYPE_STRING && val_agg.data.string_val.str)
+              free(val_agg.data.string_val.str);
+            break;
+          }
+
+          size_t row_index = find_or_create_row(result, rollup_ts, &result_capacity, &agg_hint);
+          if (row_index == SIZE_MAX) {
+            ESP_LOGE(TAG, "OOM inserting new result row – aborting field '%s'", fld->field_name);
+            if (val_agg.type == TIMESERIES_FIELD_TYPE_STRING && val_agg.data.string_val.str)
+              free(val_agg.data.string_val.str);
+            break;
+          }
+
+          if (result->columns[col_index].values[row_index].type == TIMESERIES_FIELD_TYPE_STRING &&
+              result->columns[col_index].values[row_index].data.string_val.str) {
+            free(result->columns[col_index].values[row_index].data.string_val.str);
+          }
+          result->columns[col_index].values[row_index].type = val_agg.type;
+          result->columns[col_index].values[row_index].data = val_agg.data;
+
+          inserted_for_this_field++;
+          total_points_aggregated++;
+        } // end while aggregator
+        prof_decompress += (esp_timer_get_time() - prof_temp);
+        timeseries_multi_series_iterator_deinit(&ms_iter);
       }
-      /* Free the per-series points_iterator batch */
-      free(pit_batches[s]);
-    }
-    free(series_multi_iters);
-    free(mpit_batch);
-    free(pit_batches);
+
+      // Cleanup: deinit iterators, then free batch allocations
+      for (size_t s = 0; s < fld->num_series; s++) {
+        if (series_multi_iters[s]) {
+          for (size_t i_sub = 0; i_sub < series_multi_iters[s]->sub_count; ++i_sub) {
+            timeseries_points_iterator_t *pit = series_multi_iters[s]->subs[i_sub].sub_iter;
+            if (pit) timeseries_points_iterator_deinit(pit);
+          }
+          timeseries_multi_points_iterator_deinit(series_multi_iters[s]);
+        }
+        free(pit_batches[s]);
+      }
+      free(series_multi_iters);
+      free(mpit_batch);
+      free(pit_batches);
+    } // end aggregation mode
   } // end for each field
 
   prof_end = esp_timer_get_time();
@@ -1104,4 +1353,126 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
   series_lookup_free(&srl_tbl);
 
   return total_points_aggregated;
+}
+
+// =============================================================================
+// Timestamp Range (header-only scan, no decompression)
+// =============================================================================
+
+bool timeseries_query_get_timestamp_range(timeseries_db_t *db,
+                                          const char *measurement_name,
+                                          uint64_t *out_min_ms,
+                                          uint64_t *out_max_ms,
+                                          uint32_t *out_point_count) {
+  if (!db || !measurement_name || !out_min_ms || !out_max_ms) {
+    return false;
+  }
+
+  *out_min_ms = 0;
+  *out_max_ms = 0;
+  if (out_point_count) *out_point_count = 0;
+
+  // 1. Resolve measurement
+  uint32_t measurement_id = 0;
+  if (!tsdb_find_measurement_id(db, measurement_name, &measurement_id)) {
+    return false;
+  }
+
+  // 2. Get all series IDs for this measurement
+  timeseries_series_id_list_t all_series;
+  tsdb_series_id_list_init(&all_series);
+  if (!tsdb_find_all_series_ids_for_measurement(db, measurement_id, &all_series) ||
+      all_series.count == 0) {
+    tsdb_series_id_list_free(&all_series);
+    return false;
+  }
+
+  // 3. Build a hash set of series IDs for fast lookup
+  size_t cap = 2;
+  while (cap < all_series.count * 2) cap *= 2;
+
+  typedef struct { unsigned char id[16]; bool used; } id_entry_t;
+  id_entry_t *set = calloc(cap, sizeof(id_entry_t));
+  if (!set) {
+    tsdb_series_id_list_free(&all_series);
+    return false;
+  }
+
+  for (size_t i = 0; i < all_series.count; i++) {
+    uint32_t h = hash_series_id16(all_series.ids[i].bytes);
+    size_t idx = h & (cap - 1);
+    while (set[idx].used) idx = (idx + 1) & (cap - 1);
+    memcpy(set[idx].id, all_series.ids[i].bytes, 16);
+    set[idx].used = true;
+  }
+  tsdb_series_id_list_free(&all_series);
+
+  // 4. Scan all field data pages, reading only headers
+  uint64_t global_min = UINT64_MAX;
+  uint64_t global_max = 0;
+  uint32_t total_points = 0;
+  bool found_any = false;
+
+  timeseries_page_cache_iterator_t page_iter;
+  if (!timeseries_page_cache_iterator_init(db, &page_iter)) {
+    free(set);
+    return false;
+  }
+
+  uint8_t *shared_buf = NULL;
+  uint32_t shared_buf_cap = 0;
+  timeseries_page_header_t hdr;
+  uint32_t page_offset = 0, page_size = 0;
+
+  while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &page_offset, &page_size)) {
+    if (hdr.page_type != TIMESERIES_PAGE_TYPE_FIELD_DATA) continue;
+
+    uint32_t data_size = page_size - sizeof(timeseries_page_header_t);
+    if (data_size > shared_buf_cap) {
+      uint8_t *new_buf = realloc(shared_buf, data_size);
+      if (new_buf) {
+        shared_buf = new_buf;
+        shared_buf_cap = data_size;
+      }
+    }
+
+    timeseries_fielddata_iterator_t fdata_iter;
+    if (!timeseries_fielddata_iterator_init_with_buffer(
+            db, page_offset, page_size, shared_buf, shared_buf_cap, &fdata_iter)) {
+      continue;
+    }
+
+    timeseries_field_data_header_t fdh;
+    while (timeseries_fielddata_iterator_next(&fdata_iter, &fdh)) {
+      if ((fdh.flags & TSDB_FIELDDATA_FLAG_DELETED) == 0) continue;
+
+      // Check if this series belongs to our measurement
+      uint32_t h = hash_series_id16(fdh.series_id);
+      size_t idx = h & (cap - 1);
+      bool match = false;
+      while (set[idx].used) {
+        if (memcmp(set[idx].id, fdh.series_id, 16) == 0) { match = true; break; }
+        idx = (idx + 1) & (cap - 1);
+      }
+      if (!match) continue;
+
+      found_any = true;
+      if (fdh.start_time < global_min) global_min = fdh.start_time;
+      if (fdh.end_time > global_max) global_max = fdh.end_time;
+      total_points += fdh.record_count;
+    }
+    timeseries_fielddata_iterator_deinit(&fdata_iter);
+  }
+  timeseries_page_cache_iterator_deinit(&page_iter);
+  free(shared_buf);
+  free(set);
+
+  if (!found_any) {
+    return false;  // no data found
+  }
+
+  *out_min_ms = global_min;
+  *out_max_ms = global_max;
+  if (out_point_count) *out_point_count = total_points;
+  return true;
 }

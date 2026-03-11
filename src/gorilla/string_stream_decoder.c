@@ -52,19 +52,17 @@ StringStreamDecoder *string_stream_decoder_create(FillCallback fill_cb,
   dec->fill_cb = fill_cb;
   dec->fill_ctx = fill_ctx;
 
-  /* Initialize zlib for raw zlib or standard zlib stream (choose windowBits).
+  /* Initialize zlib for inflate. windowBits must be >= the encoder's
+   * windowBits. The encoder uses windowBits=9 (512-byte window) to
+   * minimize RAM. We use 9 here to match, saving ~31KB vs windowBits=15.
+   * Note: data compressed with a larger window (e.g. old data from when
+   * the encoder used windowBits=15) cannot be decoded with windowBits=9.
    */
   dec->zstrm.zalloc = Z_NULL;
   dec->zstrm.zfree = Z_NULL;
   dec->zstrm.opaque = Z_NULL;
 
-  /*
-   * Typically, to match a zlib-based encoder, use `windowBits = 15` if
-   * the encoder used 15 as well. If the encoder used raw deflate with
-   * `windowBits = -15`, do so here as well. Also ensure memoryLevel
-   * matches your usage constraints.
-   */
-  int ret = inflateInit2(&dec->zstrm, 15);
+  int ret = inflateInit2(&dec->zstrm, 9);
   if (ret != Z_OK) {
     free(dec);
     return NULL;
@@ -258,6 +256,35 @@ bool string_stream_decoder_get_value(StringStreamDecoder *dec,
   /* Success! Return them to the caller. */
   *out_data = buf;
   *out_length = length;
+  return true;
+}
+
+bool string_stream_decoder_skip_value(StringStreamDecoder *dec) {
+  if (!dec || dec->finished) {
+    return false;
+  }
+
+  /* Read the 4-byte length prefix */
+  uint8_t prefix[4];
+  if (!read_uncompressed_bytes(dec, prefix, 4)) {
+    return false;
+  }
+
+  uint32_t length = from_little_endian_u32(prefix);
+  if (length == 0) {
+    return true;
+  }
+
+  /* Inflate into a stack buffer and discard — no malloc needed */
+  uint8_t discard[64];
+  size_t remaining = length;
+  while (remaining > 0) {
+    size_t chunk = remaining < sizeof(discard) ? remaining : sizeof(discard);
+    if (!read_uncompressed_bytes(dec, discard, chunk)) {
+      return false;
+    }
+    remaining -= chunk;
+  }
   return true;
 }
 

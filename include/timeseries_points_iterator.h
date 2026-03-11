@@ -3,6 +3,7 @@
 
 #include "esp_err.h"
 #include "gorilla/gorilla_stream_decoder.h"
+#include "alp/alp_stream_decoder.h"
 #include "timeseries_data.h"
 
 #include <stdbool.h>
@@ -56,6 +57,11 @@ typedef struct {
     double  *alp_float;
     int64_t *alp_int;
   };
+
+  // ALP streaming decoder (for records with > 128 values, decodes on demand)
+  // When non-NULL, alp_float/alp_int are NOT used; values come from this decoder.
+  uint8_t *alp_comp_buf;              // retained compressed buffer
+  alp_stream_decoder_t *alp_val_dec;  // streaming value decoder
 
   // Gorilla batch-decoded timestamps (non-NULL when Gorilla ts are pre-decoded)
   // Values are still streamed via Gorilla decoders.

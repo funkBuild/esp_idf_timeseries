@@ -8,6 +8,7 @@
 #include "timeseries_internal.h"
 #include "alp/alp_decoder.h"
 #include "alp/alp_int_codec.h"
+#include "alp/alp_stream_decoder.h"
 
 #include <inttypes.h>
 #include <math.h>
@@ -141,7 +142,9 @@ bool timeseries_points_iterator_init(
     bool use_alp = (data_flags & TSDB_FIELDDATA_FLAG_ENCODING_ALP) == 0;
 
     if (use_alp) {
-      /* --- ALP decode path: decode directly from record_buf, then free it --- */
+      /* --- ALP decode path --- */
+
+      /* Always decode all timestamps (needed for time-range binary search) */
       iter->alp_ts = (int64_t *)malloc(record_count * sizeof(int64_t));
       if (!iter->alp_ts) {
         ESP_LOGE(TAG, "OOM for ALP timestamp array of size %u", record_count);
@@ -159,6 +162,43 @@ bool timeseries_points_iterator_init(
         return false;
       }
 
+      /*
+       * For values: use streaming decoder when record has multiple ALP blocks
+       * (> 128 values). This avoids allocating the full decoded array,
+       * reducing peak memory from O(N) to O(128) per iterator.
+       * For small records (<= 128), full decode is simpler and equally fast.
+       */
+      if (record_count > ALP_STREAM_BLOCK_SIZE) {
+        /* Streaming ALP path: keep record_buf, init streaming decoder */
+        bool is_float = (series_type == TIMESERIES_FIELD_TYPE_FLOAT);
+        iter->alp_val_dec = (alp_stream_decoder_t *)malloc(sizeof(alp_stream_decoder_t));
+        if (!iter->alp_val_dec) {
+          ESP_LOGE(TAG, "OOM for ALP stream decoder");
+          free(iter->alp_ts);
+          free(record_buf);
+          iter->alp_ts = NULL;
+          iter->valid = false;
+          return false;
+        }
+        if (!alp_stream_decoder_init(iter->alp_val_dec, val_data,
+                                      col_hdr.val_len, is_float)) {
+          ESP_LOGE(TAG, "ALP stream decoder init failed");
+          free(iter->alp_val_dec);
+          free(iter->alp_ts);
+          free(record_buf);
+          iter->alp_val_dec = NULL;
+          iter->alp_ts = NULL;
+          iter->valid = false;
+          return false;
+        }
+        /* Keep record_buf alive — decoder reads from it */
+        iter->alp_comp_buf = record_buf;
+
+        ESP_LOGD(TAG, "Iterator init: ALP streaming, record_count=%u", record_count);
+        return iter->valid;
+      }
+
+      /* Eager ALP path: decode all values now, free record_buf */
       if (series_type == TIMESERIES_FIELD_TYPE_FLOAT) {
         iter->alp_float = (double *)malloc(record_count * sizeof(double));
         if (!iter->alp_float) {
@@ -206,7 +246,7 @@ bool timeseries_points_iterator_init(
       // Single record buffer consumed; free it now
       free(record_buf);
 
-      ESP_LOGD(TAG, "Iterator init: ALP, record_count=%u", record_count);
+      ESP_LOGD(TAG, "Iterator init: ALP eager, record_count=%u", record_count);
       return iter->valid;
     }
 
@@ -317,52 +357,63 @@ bool timeseries_points_iterator_init(
     ESP_LOGV(TAG, "Iterator init: compressed, record_count=%u", record_count);
   } else {
     /* ----------------------------------------------------------------------
-     * 3) Not compressed => single flash read for header + ts + val
+     * 3) Not compressed => targeted flash reads (no intermediate buffer)
+     *
+     * Read header, timestamps, and values separately to avoid allocating
+     * one large record_buf that holds everything simultaneously.
      * --------------------------------------------------------------------*/
     timeseries_col_data_header_t uc_hdr;
 
-    // Read entire record in one flash read into a temp buffer
-    uint8_t *record_buf = (uint8_t *)malloc(record_length);
-    if (!record_buf) {
-      ESP_LOGE(TAG, "OOM for uncompressed record buffer of size %u",
-               (unsigned)record_length);
-      iter->valid = false;
-      return false;
-    }
+    // Read header (8 bytes)
     esp_err_t uc_err = esp_partition_read(db->partition, record_data_offset,
-                                          record_buf, record_length);
+                                          &uc_hdr, sizeof(uc_hdr));
     if (uc_err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed reading uncompressed record (err=0x%x)", uc_err);
-      free(record_buf);
+      ESP_LOGE(TAG, "Failed reading uncompressed header (err=0x%x)", uc_err);
       iter->valid = false;
       return false;
     }
-    memcpy(&uc_hdr, record_buf, sizeof(uc_hdr));
 
     uint32_t ts_size = record_count * sizeof(uint64_t);
+    uint32_t ts_offset = record_data_offset + sizeof(uc_hdr);
+    uint32_t val_offset = ts_offset + uc_hdr.ts_len;
 
-    // A) Allocate and copy timestamps
+    // A) Allocate and read timestamps directly from flash
     iter->ts_array = (uint64_t *)malloc(ts_size);
     if (!iter->ts_array) {
       ESP_LOGE(TAG, "OOM for uncompressed ts array");
-      free(record_buf);
       iter->valid = false;
       return false;
     }
-    memcpy(iter->ts_array, record_buf + sizeof(uc_hdr), ts_size);
-
-    // B) Allocate and copy values
-    uint8_t *val_buf = (uint8_t *)malloc(uc_hdr.val_len);
-    if (!val_buf) {
-      ESP_LOGE(TAG, "OOM for uncompressed values buffer");
+    uc_err = esp_partition_read(db->partition, ts_offset,
+                                iter->ts_array, ts_size);
+    if (uc_err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed reading uncompressed timestamps (err=0x%x)", uc_err);
       free(iter->ts_array);
-      free(record_buf);
       iter->ts_array = NULL;
       iter->valid = false;
       return false;
     }
-    memcpy(val_buf, record_buf + sizeof(uc_hdr) + uc_hdr.ts_len, uc_hdr.val_len);
-    free(record_buf);
+
+    // B) Allocate and read values directly from flash
+    uint8_t *val_buf = (uint8_t *)malloc(uc_hdr.val_len);
+    if (!val_buf) {
+      ESP_LOGE(TAG, "OOM for uncompressed values buffer of size %u",
+               (unsigned)uc_hdr.val_len);
+      free(iter->ts_array);
+      iter->ts_array = NULL;
+      iter->valid = false;
+      return false;
+    }
+    uc_err = esp_partition_read(db->partition, val_offset,
+                                val_buf, uc_hdr.val_len);
+    if (uc_err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed reading uncompressed values (err=0x%x)", uc_err);
+      free(val_buf);
+      free(iter->ts_array);
+      iter->ts_array = NULL;
+      iter->valid = false;
+      return false;
+    }
 
     // Parse val_buf according to series_type
     // We'll assume each sample has a fixed size for demonstration:
@@ -563,38 +614,20 @@ void timeseries_points_iterator_set_time_range(
     iter->ts_count = lo;
   }
 
+  /* ALP streaming path: skip values to align with the new start index. */
+  if (iter->alp_val_dec && iter->current_idx > old_idx) {
+    uint16_t skip = iter->current_idx - old_idx;
+    alp_stream_decoder_skip(iter->alp_val_dec, skip);
+  }
+
   /* Gorilla batch path: val_decoder is still streaming, so we must
-   * consume and discard the first (current_idx - old_idx) values to
-   * keep the value stream aligned with the timestamp array position. */
+   * advance past the first (current_idx - old_idx) values to keep the
+   * value stream aligned with the timestamp array position.
+   * gorilla_decoder_skip_value avoids malloc for strings. */
   if (iter->gorilla_batch_ts && iter->current_idx > old_idx) {
     uint16_t skip = iter->current_idx - old_idx;
     for (uint16_t i = 0; i < skip; i++) {
-      switch (iter->series_type) {
-      case TIMESERIES_FIELD_TYPE_FLOAT: {
-        double dval;
-        gorilla_decoder_get_float(&iter->val_decoder, &dval);
-        break;
-      }
-      case TIMESERIES_FIELD_TYPE_INT: {
-        uint64_t i64;
-        gorilla_decoder_get_timestamp(&iter->val_decoder, &i64);
-        break;
-      }
-      case TIMESERIES_FIELD_TYPE_BOOL: {
-        bool bval;
-        gorilla_decoder_get_boolean(&iter->val_decoder, &bval);
-        break;
-      }
-      case TIMESERIES_FIELD_TYPE_STRING: {
-        uint8_t *str = NULL;
-        size_t slen = 0;
-        gorilla_decoder_get_string(&iter->val_decoder, &str, &slen);
-        free(str);
-        break;
-      }
-      default:
-        break;
-      }
+      gorilla_decoder_skip_value(&iter->val_decoder);
     }
   }
 }
@@ -657,10 +690,31 @@ bool timeseries_points_iterator_next_value(
       return false;
     }
     size_t i = iter->current_idx++;
-    if (iter->series_type == TIMESERIES_FIELD_TYPE_FLOAT) {
-      out_value->data.float_val = iter->alp_float[i];
+
+    if (iter->alp_val_dec) {
+      /* Streaming ALP: decode from the block-based stream decoder */
+      if (iter->series_type == TIMESERIES_FIELD_TYPE_FLOAT) {
+        double v;
+        if (!alp_stream_decoder_next_float(iter->alp_val_dec, &v)) {
+          iter->valid = false;
+          return false;
+        }
+        out_value->data.float_val = v;
+      } else {
+        int64_t v;
+        if (!alp_stream_decoder_next_int(iter->alp_val_dec, &v)) {
+          iter->valid = false;
+          return false;
+        }
+        out_value->data.int_val = v;
+      }
     } else {
-      out_value->data.int_val = iter->alp_int[i];
+      /* Eager ALP: read from pre-decoded arrays */
+      if (iter->series_type == TIMESERIES_FIELD_TYPE_FLOAT) {
+        out_value->data.float_val = iter->alp_float[i];
+      } else {
+        out_value->data.int_val = iter->alp_int[i];
+      }
     }
     return true;
   }
@@ -692,20 +746,11 @@ bool timeseries_points_iterator_next_value(
     }
     case TIMESERIES_FIELD_TYPE_STRING: {
       size_t slen = iter->string_array[idx].length;
-      const char *src = iter->string_array[idx].str;
-      if (src && slen > 0) {
-        char *copy = malloc(slen + 1);
-        if (!copy) {
-          iter->valid = false;
-          return false;
-        }
-        memcpy(copy, src, slen);
-        copy[slen] = '\0';
-        out_value->data.string_val.str = copy;
-      } else {
-        out_value->data.string_val.str = NULL;
-      }
+      // Transfer ownership to caller — each index is read exactly once
+      // during forward iteration, so no copy is needed
+      out_value->data.string_val.str = iter->string_array[idx].str;
       out_value->data.string_val.length = slen;
+      iter->string_array[idx].str = NULL; // prevent double-free in deinit
       return true;
     }
     default:
@@ -785,11 +830,19 @@ void timeseries_points_iterator_deinit(timeseries_points_iterator_t *iter) {
   }
 
   if (iter->alp_ts) {
-    // ALP path: free decoded arrays (comp bufs were freed in init)
+    // ALP path: free decoded arrays
     free(iter->alp_ts);
     iter->alp_ts = NULL;
-    if (iter->alp_float) {
-      // Union covers alp_int too; only one free needed
+    if (iter->alp_val_dec) {
+      // Streaming ALP: free decoder and retained compressed buffer
+      free(iter->alp_val_dec);
+      iter->alp_val_dec = NULL;
+      if (iter->alp_comp_buf) {
+        free(iter->alp_comp_buf);
+        iter->alp_comp_buf = NULL;
+      }
+    } else if (iter->alp_float) {
+      // Eager ALP: free decoded value array (union covers alp_int too)
       free(iter->alp_float);
       iter->alp_float = NULL;
     }

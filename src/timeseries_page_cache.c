@@ -63,8 +63,31 @@ bool tsdb_build_page_cache(timeseries_db_t *db) {
 }
 
 /**
+ * @brief Refresh a private clone from the current live snapshot.
+ * Reuses the existing allocation when possible to avoid malloc/free churn.
+ */
+static bool snapshot_refresh_clone(tsdb_page_cache_snapshot_t *clone,
+                                   const tsdb_page_cache_snapshot_t *src) {
+  if (src->count > clone->capacity) {
+    size_t newcap = src->count + 4; // small headroom for the add
+    timeseries_cached_page_t *newarr =
+        realloc(clone->entries, newcap * sizeof(*newarr));
+    if (!newarr) return false;
+    clone->entries = newarr;
+    clone->capacity = newcap;
+  }
+  if (src->count > 0) {
+    memcpy(clone->entries, src->entries,
+           src->count * sizeof(timeseries_cached_page_t));
+  }
+  clone->count = src->count;
+  return true;
+}
+
+/**
  * @brief Add a new entry to the page cache using CAS retry.
  * Thread-safe for concurrent readers and writers.
+ * Reuses clone buffer on retry to reduce allocation overhead.
  */
 void tsdb_pagecache_add_entry(timeseries_db_t *db, uint32_t offset,
                               const timeseries_page_header_t *hdr) {
@@ -72,13 +95,26 @@ void tsdb_pagecache_add_entry(timeseries_db_t *db, uint32_t offset,
     return;
   }
 
+  tsdb_page_cache_snapshot_t *clone = NULL;
+
   for (int attempt = 0; attempt < 10; attempt++) {
     tsdb_page_cache_snapshot_t *old = tsdb_snapshot_acquire_current(db);
-    tsdb_page_cache_snapshot_t *clone = tsdb_snapshot_clone(old);
+
     if (!clone) {
-      tsdb_snapshot_release(old);
-      ESP_LOGE(TAG, "OOM cloning snapshot for add_entry");
-      return;
+      clone = tsdb_snapshot_clone(old);
+      if (!clone) {
+        tsdb_snapshot_release(old);
+        ESP_LOGE(TAG, "OOM cloning snapshot for add_entry");
+        return;
+      }
+    } else {
+      // Reuse existing clone buffer — refresh from new current snapshot
+      if (!snapshot_refresh_clone(clone, old)) {
+        tsdb_snapshot_release(old);
+        tsdb_snapshot_release(clone);
+        ESP_LOGE(TAG, "OOM refreshing clone for add_entry retry");
+        return;
+      }
     }
 
     tsdb_pagecache_batch_add(clone, offset, hdr);
@@ -86,44 +122,60 @@ void tsdb_pagecache_add_entry(timeseries_db_t *db, uint32_t offset,
 
     if (tsdb_snapshot_compare_and_swap(db, old, clone)) {
       tsdb_snapshot_release(old);
-      return;  // Success
+      return;  // Success — clone is now the live snapshot
     }
-    // CAS failed - someone else modified the snapshot, retry
+    // CAS failed — retry with reused clone
     tsdb_snapshot_release(old);
-    tsdb_snapshot_release(clone);
   }
+
   ESP_LOGE(TAG, "add_entry CAS failed after max retries, forcing swap");
-  // Fallback: force swap (last resort)
+  // Fallback: force swap
   tsdb_page_cache_snapshot_t *old = tsdb_snapshot_acquire_current(db);
-  tsdb_page_cache_snapshot_t *clone = tsdb_snapshot_clone(old);
-  tsdb_snapshot_release(old);
-  if (clone) {
+  if (old && clone) {
+    snapshot_refresh_clone(clone, old);
+    tsdb_snapshot_release(old);
     tsdb_pagecache_batch_add(clone, offset, hdr);
     tsdb_pagecache_batch_sort(clone);
     tsdb_snapshot_swap(db, clone);
+  } else {
+    if (old) tsdb_snapshot_release(old);
+    if (clone) tsdb_snapshot_release(clone);
   }
 }
 
 /**
  * @brief Remove a page cache entry using CAS retry.
  * Thread-safe for concurrent readers and writers.
+ * Reuses clone buffer on retry to reduce allocation overhead.
  */
 bool tsdb_pagecache_remove_entry(timeseries_db_t *db, uint32_t offset) {
   if (!db) {
     return false;
   }
 
+  tsdb_page_cache_snapshot_t *clone = NULL;
+
   for (int attempt = 0; attempt < 10; attempt++) {
     tsdb_page_cache_snapshot_t *old = tsdb_snapshot_acquire_current(db);
     if (!old) {
+      if (clone) tsdb_snapshot_release(clone);
       return false;
     }
 
-    tsdb_page_cache_snapshot_t *clone = tsdb_snapshot_clone(old);
     if (!clone) {
-      tsdb_snapshot_release(old);
-      ESP_LOGE(TAG, "OOM cloning snapshot for remove_entry");
-      return false;
+      clone = tsdb_snapshot_clone(old);
+      if (!clone) {
+        tsdb_snapshot_release(old);
+        ESP_LOGE(TAG, "OOM cloning snapshot for remove_entry");
+        return false;
+      }
+    } else {
+      if (!snapshot_refresh_clone(clone, old)) {
+        tsdb_snapshot_release(old);
+        tsdb_snapshot_release(clone);
+        ESP_LOGE(TAG, "OOM refreshing clone for remove_entry retry");
+        return false;
+      }
     }
 
     bool found = tsdb_pagecache_batch_remove(clone, offset);
@@ -135,27 +187,30 @@ bool tsdb_pagecache_remove_entry(timeseries_db_t *db, uint32_t offset) {
 
     if (tsdb_snapshot_compare_and_swap(db, old, clone)) {
       tsdb_snapshot_release(old);
-      return true;  // Success
+      return true;  // Success — clone is now the live snapshot
     }
-    // CAS failed - someone else modified the snapshot, retry
+    // CAS failed — retry with reused clone
     tsdb_snapshot_release(old);
-    tsdb_snapshot_release(clone);
   }
+
   ESP_LOGE(TAG, "remove_entry CAS failed after max retries, forcing swap");
-  // Fallback: force swap (last resort)
+  // Fallback: force swap
   tsdb_page_cache_snapshot_t *old = tsdb_snapshot_acquire_current(db);
   if (!old) {
+    if (clone) tsdb_snapshot_release(clone);
     return false;
   }
-  tsdb_page_cache_snapshot_t *clone = tsdb_snapshot_clone(old);
-  tsdb_snapshot_release(old);
   if (clone) {
+    snapshot_refresh_clone(clone, old);
+    tsdb_snapshot_release(old);
     bool found = tsdb_pagecache_batch_remove(clone, offset);
     if (found) {
       tsdb_snapshot_swap(db, clone);
       return true;
     }
     tsdb_snapshot_release(clone);
+  } else {
+    tsdb_snapshot_release(old);
   }
   return false;
 }

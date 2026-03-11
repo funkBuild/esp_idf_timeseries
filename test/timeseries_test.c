@@ -7,7 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#define NUM_RECORDS 100
+#define NUM_RECORDS 50
 static heap_trace_record_t
     trace_record[NUM_RECORDS]; // This buffer must be in internal RAM
 

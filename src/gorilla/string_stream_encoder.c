@@ -1,7 +1,12 @@
 #include "gorilla/string_stream_encoder.h"
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+
+static const char *TAG = "StringStreamEncoder";
 
 /* A small buffer to hold compressed bytes before flushing. */
 #define STRING_STREAM_CHUNK_SIZE 128
@@ -64,6 +69,8 @@ StringStreamEncoder *string_stream_encoder_create(FlushCallback flush_cb,
 
   StringStreamEncoder *enc = (StringStreamEncoder *)calloc(1, sizeof(*enc));
   if (!enc) {
+    ESP_LOGE(TAG, "Failed to allocate StringStreamEncoder (%zu bytes), free heap: %" PRIu32 " bytes",
+             sizeof(*enc), (uint32_t)heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
     return NULL;
   }
 
@@ -80,15 +87,24 @@ StringStreamEncoder *string_stream_encoder_create(FlushCallback flush_cb,
    * deflateInit2 parameters:
    *   - compression level: Z_DEFAULT_COMPRESSION (or pick 1..9)
    *   - method: Z_DEFLATED
-   *   - windowBits: 15 for zlib header, or -15 for raw deflate
-   *   - memoryLevel: 1 (lowest memory usage) ... 9 (highest)
+   *   - windowBits: 9 is the minimum (512-byte window), keeps RAM usage low.
+   *     The decoder with windowBits=15 can still inflate streams from any
+   *     smaller window, so this is backwards-compatible.
+   *   - memoryLevel: 1 (lowest memory usage)
    *   - strategy: Z_DEFAULT_STRATEGY
    */
   int ret = deflateInit2(&enc->zstrm, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
-                         15, /* +16 if you want gzip, or -15 for raw deflate. */
-                         1,  /* minimal memory usage */
+                         9, /* minimum window (512 bytes) to reduce RAM */
+                         1, /* minimal memory usage */
                          Z_DEFAULT_STRATEGY);
   if (ret != Z_OK) {
+    const char *reason = (ret == Z_MEM_ERROR) ? "out of memory" :
+                         (ret == Z_STREAM_ERROR) ? "invalid parameter" :
+                         (ret == Z_VERSION_ERROR) ? "zlib version mismatch" : "unknown";
+    ESP_LOGE(TAG, "deflateInit2 failed: %s (ret=%d), free heap: %" PRIu32 " bytes, free internal: %" PRIu32 " bytes",
+             reason, ret,
+             (uint32_t)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+             (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     free(enc);
     return NULL;
   }
@@ -111,8 +127,13 @@ void string_stream_encoder_destroy(StringStreamEncoder *enc) {
 
 bool string_stream_encoder_add_value(StringStreamEncoder *enc, const char *data,
                                      size_t length) {
-  if (!enc || enc->finished || !data) {
+  if (!enc || enc->finished) {
     return false;
+  }
+
+  /* Treat NULL data as an empty string */
+  if (!data) {
+    length = 0;
   }
 
   /* 1) Write a 4-byte length prefix in little-endian format. */

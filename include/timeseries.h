@@ -271,6 +271,21 @@ bool timeseries_delete_measurement(const char* measurement_name);
  */
 bool timeseries_delete_measurement_and_field(const char* measurement_name, const char* field_name);
 
+/**
+ * @brief Get the timestamp range for a measurement by scanning page headers only.
+ *        Does not decompress any data.
+ *
+ * @param measurement_name  Measurement to query
+ * @param out_min_ms        Output: earliest timestamp in ms (0 if no data)
+ * @param out_max_ms        Output: latest timestamp in ms (0 if no data)
+ * @param out_point_count   Output: total point count across all headers (optional, NULL to skip)
+ * @return true if measurement exists and has data, false otherwise
+ */
+bool timeseries_get_timestamp_range(const char *measurement_name,
+                                    uint64_t *out_min_ms,
+                                    uint64_t *out_max_ms,
+                                    uint32_t *out_point_count);
+
 #ifdef __cplusplus
 }
 #endif

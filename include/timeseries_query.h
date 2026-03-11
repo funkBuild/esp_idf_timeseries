@@ -71,6 +71,16 @@ bool timeseries_query_execute(timeseries_db_t* db, const timeseries_query_t* que
  */
 void timeseries_query_free_result(timeseries_query_result_t* result);
 
+/**
+ * @brief Get the timestamp range for a measurement by scanning field data headers only.
+ *        No data decompression is performed.
+ */
+bool timeseries_query_get_timestamp_range(timeseries_db_t* db,
+                                          const char* measurement_name,
+                                          uint64_t* out_min_ms,
+                                          uint64_t* out_max_ms,
+                                          uint32_t* out_point_count);
+
 #ifdef __cplusplus
 }
 #endif

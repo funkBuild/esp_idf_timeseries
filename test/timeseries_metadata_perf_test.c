@@ -494,6 +494,7 @@ TEST_CASE("metadata_perf: entity_iterator_full_scan", "[metadata_perf][iterator]
         }
     }
 
+    timeseries_page_cache_iterator_deinit(&page_iter);
     TEST_ASSERT_GREATER_THAN(0, meta_count);
 
     const size_t NUM_SCANS = 50;

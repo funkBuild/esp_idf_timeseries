@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "timeseries.h"
 #include "unity.h"
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -457,4 +458,168 @@ TEST_CASE("api: delete_measurement_and_field NULL params",
   TEST_ASSERT_FALSE(timeseries_delete_measurement_and_field(NULL, NULL));
   TEST_ASSERT_FALSE(timeseries_delete_measurement_and_field("x", NULL));
   TEST_ASSERT_FALSE(timeseries_delete_measurement_and_field(NULL, "y"));
+}
+
+// ============================================================================
+// timeseries_get_timestamp_range
+// ============================================================================
+
+TEST_CASE("api: get_timestamp_range on empty db returns false",
+          "[api][timestamp_range]") {
+  clear_db();
+
+  uint64_t min_ms = 99, max_ms = 99;
+  uint32_t count = 99;
+  TEST_ASSERT_FALSE(
+      timeseries_get_timestamp_range("nonexistent", &min_ms, &max_ms, &count));
+}
+
+TEST_CASE("api: get_timestamp_range single point", "[api][timestamp_range]") {
+  clear_db();
+
+  const char *fields[] = {"value"};
+  insert_measurement("range_single", NULL, NULL, 0, fields, 1, 1);
+
+  uint64_t min_ms = 0, max_ms = 0;
+  uint32_t count = 0;
+  TEST_ASSERT_TRUE(
+      timeseries_get_timestamp_range("range_single", &min_ms, &max_ms, &count));
+
+  TEST_ASSERT_EQUAL_UINT64(0, min_ms);
+  TEST_ASSERT_EQUAL_UINT64(0, max_ms);
+  TEST_ASSERT_GREATER_THAN(0, count);
+}
+
+TEST_CASE("api: get_timestamp_range multiple points",
+          "[api][timestamp_range]") {
+  clear_db();
+
+  const char *fields[] = {"temp"};
+  // 10 points starting at ts=1000, step=1000 → 1000..10000
+  insert_measurement("range_multi", NULL, NULL, 0, fields, 1, 10);
+
+  uint64_t min_ms = 0, max_ms = 0;
+  uint32_t count = 0;
+  TEST_ASSERT_TRUE(
+      timeseries_get_timestamp_range("range_multi", &min_ms, &max_ms, &count));
+
+  TEST_ASSERT_EQUAL_UINT64(0, min_ms);       // first ts = 0 * 1000
+  TEST_ASSERT_EQUAL_UINT64(9000, max_ms);     // last ts = 9 * 1000
+  TEST_ASSERT_GREATER_THAN(0, count);
+
+  ESP_LOGI(TAG, "Range: min=%" PRIu64 " max=%" PRIu64 " count=%" PRIu32,
+           min_ms, max_ms, count);
+}
+
+TEST_CASE("api: get_timestamp_range multiple fields shares range",
+          "[api][timestamp_range]") {
+  clear_db();
+
+  const char *fields[] = {"temp", "humidity", "pressure"};
+  insert_measurement("range_mf", NULL, NULL, 0, fields, 3, 5);
+
+  uint64_t min_ms = 0, max_ms = 0;
+  uint32_t count = 0;
+  TEST_ASSERT_TRUE(
+      timeseries_get_timestamp_range("range_mf", &min_ms, &max_ms, &count));
+
+  // All 3 fields have the same timestamps, so range should be the same
+  TEST_ASSERT_EQUAL_UINT64(0, min_ms);
+  TEST_ASSERT_EQUAL_UINT64(4000, max_ms);
+  // count includes all fields × points (implementation detail)
+  TEST_ASSERT_GREATER_THAN(0, count);
+}
+
+TEST_CASE("api: get_timestamp_range nonexistent measurement returns false",
+          "[api][timestamp_range]") {
+  clear_db();
+
+  const char *fields[] = {"val"};
+  insert_measurement("exists", NULL, NULL, 0, fields, 1, 5);
+
+  uint64_t min_ms = 0, max_ms = 0;
+  TEST_ASSERT_FALSE(
+      timeseries_get_timestamp_range("ghost", &min_ms, &max_ms, NULL));
+}
+
+TEST_CASE("api: get_timestamp_range NULL params", "[api][timestamp_range]") {
+  ensure_init();
+
+  uint64_t min_ms, max_ms;
+  TEST_ASSERT_FALSE(timeseries_get_timestamp_range(NULL, &min_ms, &max_ms, NULL));
+  TEST_ASSERT_FALSE(timeseries_get_timestamp_range("x", NULL, &max_ms, NULL));
+  TEST_ASSERT_FALSE(timeseries_get_timestamp_range("x", &min_ms, NULL, NULL));
+}
+
+TEST_CASE("api: get_timestamp_range out_point_count is optional",
+          "[api][timestamp_range]") {
+  clear_db();
+
+  const char *fields[] = {"val"};
+  insert_measurement("range_nocount", NULL, NULL, 0, fields, 1, 3);
+
+  uint64_t min_ms = 0, max_ms = 0;
+  // NULL for out_point_count should not crash
+  TEST_ASSERT_TRUE(
+      timeseries_get_timestamp_range("range_nocount", &min_ms, &max_ms, NULL));
+  TEST_ASSERT_TRUE(max_ms >= min_ms);
+}
+
+// ============================================================================
+// Query edge cases: measurement exists but no field data
+// ============================================================================
+
+TEST_CASE("api: query after delete returns empty result without errors",
+          "[api][query_empty]") {
+  clear_db();
+
+  const char *fields[] = {"value"};
+  insert_measurement("del_then_query", NULL, NULL, 0, fields, 1, 10);
+
+  // Delete the measurement data
+  TEST_ASSERT_TRUE(timeseries_delete_measurement("del_then_query"));
+
+  // Query should succeed with empty result, no OOM errors
+  timeseries_query_t query = {
+      .measurement_name = "del_then_query",
+  };
+  timeseries_query_result_t result = {0};
+  TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+  TEST_ASSERT_EQUAL(0, result.num_points);
+  timeseries_query_free_result(&result);
+}
+
+TEST_CASE("api: get_timestamp_range after delete returns false",
+          "[api][timestamp_range]") {
+  clear_db();
+
+  const char *fields[] = {"val"};
+  insert_measurement("del_range", NULL, NULL, 0, fields, 1, 5);
+
+  // Verify range exists
+  uint64_t min_ms = 0, max_ms = 0;
+  TEST_ASSERT_TRUE(
+      timeseries_get_timestamp_range("del_range", &min_ms, &max_ms, NULL));
+
+  // Delete and verify range is gone
+  TEST_ASSERT_TRUE(timeseries_delete_measurement("del_range"));
+
+  TEST_ASSERT_FALSE(
+      timeseries_get_timestamp_range("del_range", &min_ms, &max_ms, NULL));
+}
+
+TEST_CASE("api: query on empty db returns empty result cleanly",
+          "[api][query_empty]") {
+  clear_db();
+
+  timeseries_query_t query = {
+      .measurement_name = "empty_meas",
+  };
+  timeseries_query_result_t result = {0};
+  TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+  TEST_ASSERT_EQUAL(0, result.num_points);
+  TEST_ASSERT_EQUAL(0, result.num_columns);
+  TEST_ASSERT_NULL(result.timestamps);
+  TEST_ASSERT_NULL(result.columns);
+  timeseries_query_free_result(&result);
 }

@@ -159,6 +159,35 @@ bool gorilla_decoder_get_string(gorilla_decoder_stream_t *decoder,
   return false;
 }
 
+bool gorilla_decoder_skip_value(gorilla_decoder_stream_t *decoder) {
+  if (!decoder || !decoder->decoder_impl) {
+    return false;
+  }
+
+  switch (decoder->stream_type) {
+  case GORILLA_STREAM_FLOAT: {
+    double dval;
+    return float_stream_decoder_get_value(
+        (FloatStreamDecoder *)decoder->decoder_impl, &dval);
+  }
+  case GORILLA_STREAM_INT: {
+    uint64_t i64;
+    return integer_stream_decoder_get_value(
+        (IntegerStreamDecoder *)decoder->decoder_impl, &i64);
+  }
+  case GORILLA_STREAM_BOOL: {
+    bool bval;
+    return boolean_stream_decoder_get_value(
+        (BooleanStreamDecoder *)decoder->decoder_impl, &bval);
+  }
+  case GORILLA_STREAM_STRING:
+    return string_stream_decoder_skip_value(
+        (StringStreamDecoder *)decoder->decoder_impl);
+  default:
+    return false;
+  }
+}
+
 bool gorilla_decoder_finish(gorilla_decoder_stream_t *decoder) {
   if (!decoder) {
     return false;

@@ -62,6 +62,14 @@ bool string_stream_decoder_get_value(StringStreamDecoder *decoder,
  * @param decoder Pointer to the StringStreamDecoder.
  * @return true on success, false on error.
  */
+/**
+ * @brief Skip one string value without allocating memory.
+ *
+ * Reads the 4-byte length prefix and advances past the string bytes
+ * by inflating into a small stack buffer. No heap allocation is performed.
+ */
+bool string_stream_decoder_skip_value(StringStreamDecoder *decoder);
+
 bool string_stream_decoder_finish(StringStreamDecoder *decoder);
 
 #endif /* STRING_STREAM_DECODER_H */

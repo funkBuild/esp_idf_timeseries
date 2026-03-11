@@ -278,7 +278,7 @@ typedef struct {
   size_t chunk_size;
 
   // Measurement ID cache (avoids per-insert flash scan)
-#define MEAS_ID_CACHE_SIZE 4
+#define MEAS_ID_CACHE_SIZE 16
   meas_cache_entry_t *meas_cache; // heap-allocated array of MEAS_ID_CACHE_SIZE
   uint8_t meas_cache_next;        // round-robin eviction index
 

@@ -110,12 +110,13 @@ esp_err_t tsdb_query_string_parse(const char* q, timeseries_query_t* out) {
       ENSURE(key && val);
 
       /* grow both arrays to size num_tags+1, then store the pair */
-      const char** new_keys = realloc(out->tag_keys, (out->num_tags + 1) * sizeof(char*));
-      ENSURE(new_keys);
+      size_t new_count = out->num_tags + 1;
+      const char** new_keys = realloc(out->tag_keys, new_count * sizeof(char*));
+      if (!new_keys) { free(key); free(val); ENSURE(0); }
       out->tag_keys = new_keys;
 
-      const char** new_vals = realloc(out->tag_values, (out->num_tags + 1) * sizeof(char*));
-      ENSURE(new_vals);
+      const char** new_vals = realloc(out->tag_values, new_count * sizeof(char*));
+      if (!new_vals) { free(key); free(val); ENSURE(0); }
       out->tag_values = new_vals;
 
       out->tag_keys[out->num_tags] = key;

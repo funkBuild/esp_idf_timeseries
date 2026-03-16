@@ -518,7 +518,7 @@ bool timeseries_points_iterator_next_value(
     switch (iter->series_type) {
     case TIMESERIES_FIELD_TYPE_FLOAT: {
       double d = iter->float_array[idx];
-      out_value->data.float_val = (float)d; // or keep double
+      out_value->data.float_val = d;
       return true;
     }
     case TIMESERIES_FIELD_TYPE_INT: {
@@ -565,7 +565,7 @@ bool timeseries_points_iterator_next_value(
       iter->valid = false;
       return false;
     }
-    out_value->data.float_val = (float)dval;
+    out_value->data.float_val = dval;
     break;
   }
   case TIMESERIES_FIELD_TYPE_INT: {

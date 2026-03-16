@@ -462,22 +462,41 @@ static size_t find_or_create_row(timeseries_query_result_t *result,
   result->timestamps = new_ts_array;
   result->timestamps[new_row_index] = ts;
 
-  // Expand each column's values array by 1
-  for (size_t c = 0; c < result->num_columns; c++) {
-    timeseries_field_value_t *new_values =
-        realloc(result->columns[c].values,
-                new_count * sizeof(timeseries_field_value_t));
-    if (!new_values) {
-      ESP_LOGE(TAG, "Out of memory expanding column=%zu", c);
-      // Rollback: shrink timestamps back and don't increment num_points
-      // Already-expanded columns have harmless extra capacity
+  // Pre-allocate all column expansions into temporaries so that either ALL
+  // succeed (and we swap them in) or NONE are applied, keeping the result
+  // structure fully consistent on OOM.
+  timeseries_field_value_t **new_col_values = NULL;
+  if (result->num_columns > 0) {
+    new_col_values = malloc(result->num_columns * sizeof(timeseries_field_value_t *));
+    if (!new_col_values) {
+      ESP_LOGE(TAG, "Out of memory allocating col_values array");
       return SIZE_MAX;
     }
-    result->columns[c].values = new_values;
-
-    // Initialize the new cell to type=0
-    memset(&result->columns[c].values[new_row_index], 0,
-           sizeof(timeseries_field_value_t));
+    for (size_t c = 0; c < result->num_columns; c++) {
+      new_col_values[c] =
+          realloc(result->columns[c].values,
+                  new_count * sizeof(timeseries_field_value_t));
+      if (!new_col_values[c]) {
+        ESP_LOGE(TAG, "Out of memory expanding column=%zu", c);
+        // Rollback: columns 0..c-1 were realloced in-place — their old
+        // pointers are now invalid, so commit the successful ones.
+        for (size_t k = 0; k < c; k++) {
+          result->columns[k].values = new_col_values[k];
+        }
+        // Don't increment num_points; timestamps has extra capacity but
+        // that is harmless since num_points still reflects the old count.
+        free(new_col_values);
+        return SIZE_MAX;
+      }
+    }
+    // All columns expanded successfully — commit them all.
+    for (size_t c = 0; c < result->num_columns; c++) {
+      result->columns[c].values = new_col_values[c];
+      // Initialize the new cell to type=0
+      memset(&result->columns[c].values[new_row_index], 0,
+             sizeof(timeseries_field_value_t));
+    }
+    free(new_col_values);
   }
 
   // Only increment num_points after all columns are successfully expanded

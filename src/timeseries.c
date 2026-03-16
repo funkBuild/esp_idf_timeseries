@@ -435,6 +435,9 @@ void timeseries_deinit(void) {
     s_tsdb.snapshot_mutex = NULL;
   }
 
+  // Free series ID cache
+  tsdb_cache_free(&s_tsdb);
+
   // Free write buffer
   if (s_tsdb.write_buffer) {
     free(s_tsdb.write_buffer);

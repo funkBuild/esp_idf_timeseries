@@ -64,7 +64,7 @@ static uint64_t pack_values(const uint64_t *values, size_t *offset, uint64_t n,
   out <<= 60;              // move selector to the top 4 bits
   for (uint64_t i = 0; i < n; i++) {
     if (bits > 0) {
-      out |= values[*offset + i] << (i * bits);
+      out |= (values[*offset + i] & ((1ULL << bits) - 1)) << (i * bits);
     }
     /* else: for bits==0, the value is implicitly 1 and no bits are stored */
   }

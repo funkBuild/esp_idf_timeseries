@@ -3,10 +3,20 @@
 #include <stddef.h>
 #include <string.h>
 
-/* Returns number of uint64_t words needed to pack `count` values at `bw` bits each */
+/* Returns number of uint64_t words actually used in the packed stream.
+ * Callers that allocate buffers for pack/unpack must add +1 word of headroom
+ * because the generic path may read/write one word past the last full word
+ * when a value straddles two words. Use alp_ffor_buf_words() for allocation. */
 static inline size_t alp_ffor_packed_words(size_t count, uint8_t bw) {
     if (bw == 0) return 0;
     return ((size_t)count * bw + 63) / 64;
+}
+
+/* Returns number of uint64_t words to allocate for pack/unpack buffers.
+ * This is packed_words + 1 overflow word for the generic spanning-value path. */
+static inline size_t alp_ffor_buf_words(size_t count, uint8_t bw) {
+    if (bw == 0) return 0;
+    return alp_ffor_packed_words(count, bw) + 1;
 }
 
 /* Pack `count` int64 values (relative to `base`) at `bw` bits each into `out` */
@@ -24,7 +34,7 @@ static inline void alp_ffor_pack(const int64_t *values, size_t count,
      * Cases 1/2/4 use |= into the same word so ivdep is omitted. */
     switch (bw) {
         case 1: {
-            size_t n_words = alp_ffor_packed_words(count, 1);
+            size_t n_words = alp_ffor_buf_words(count, 1);
             memset(out, 0, n_words * 8);
             for (size_t i = 0; i < count; i++) {
                 uint64_t delta = (uint64_t)(values[i] - base) & 1ULL;
@@ -33,7 +43,7 @@ static inline void alp_ffor_pack(const int64_t *values, size_t count,
             return;
         }
         case 2: {
-            size_t n_words = alp_ffor_packed_words(count, 2);
+            size_t n_words = alp_ffor_buf_words(count, 2);
             memset(out, 0, n_words * 8);
             for (size_t i = 0; i < count; i++) {
                 uint64_t delta = (uint64_t)(values[i] - base) & 3ULL;
@@ -42,7 +52,7 @@ static inline void alp_ffor_pack(const int64_t *values, size_t count,
             return;
         }
         case 4: {
-            size_t n_words = alp_ffor_packed_words(count, 4);
+            size_t n_words = alp_ffor_buf_words(count, 4);
             memset(out, 0, n_words * 8);
             for (size_t i = 0; i < count; i++) {
                 uint64_t delta = (uint64_t)(values[i] - base) & 0xFULL;
@@ -53,8 +63,8 @@ static inline void alp_ffor_pack(const int64_t *values, size_t count,
         default:
             break;
     }
-    size_t n_words = alp_ffor_packed_words(count, bw);
-    memset(out, 0, n_words * sizeof(uint64_t));
+    size_t n_words = alp_ffor_buf_words(count, bw);
+    memset(out, 0, n_words * sizeof(uint64_t)); /* includes overflow word */
     uint64_t mask = (bw < 64) ? ((1ULL << bw) - 1) : ~(uint64_t)0;
     size_t   word_idx = 0;
     unsigned bit_off  = 0;

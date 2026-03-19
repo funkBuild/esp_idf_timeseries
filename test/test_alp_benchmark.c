@@ -566,3 +566,147 @@ TEST_CASE("alp_int: benchmark vs float alp", "[alp][alp_int][benchmark]") {
     free(ivalues);
     free(fvalues);
 }
+
+/* =========================================================================
+ * ALP boundary test — exercises exact ALP_BLOCK_SIZE and chunk boundaries
+ * through the full DB pipeline (insert → compact → query → verify).
+ *
+ * ALP_BLOCK_SIZE = 128.
+ * CONFIG_TIMESERIES_ALP_CHUNK_MAX_POINTS = 200 in test_app sdkconfig.
+ *
+ * Sub-cases:
+ *   127 — single partial ALP block
+ *   128 — exactly 1 full ALP block, no partial
+ *   129 — 1 full ALP block + 1-element partial block
+ *   200 — exact chunk boundary (1 full + 1 partial ALP block within one chunk)
+ *   201 — chunk boundary + 1 (spills into a second chunk)
+ *   256 — exactly 2 full ALP blocks
+ * ========================================================================= */
+
+#include "timeseries.h"
+#include <inttypes.h>
+
+#define BOUNDARY_BASE_TS  5000000ULL   /* arbitrary, avoids zero */
+
+/**
+ * Insert `n` float points with value = i * 0.5, compact, query all back,
+ * and verify bit-exact round-trip for every point.
+ * Returns true on success.
+ */
+static bool boundary_insert_compact_query_verify(size_t n) {
+    /* 1. Clear previous data */
+    if (!timeseries_clear_all()) return false;
+
+    /* 2. Bulk-insert N points */
+    uint64_t *timestamps = (uint64_t *)malloc(n * sizeof(uint64_t));
+    timeseries_field_value_t *fvals =
+        (timeseries_field_value_t *)malloc(n * sizeof(timeseries_field_value_t));
+    if (!timestamps || !fvals) { free(timestamps); free(fvals); return false; }
+
+    for (size_t i = 0; i < n; i++) {
+        timestamps[i] = BOUNDARY_BASE_TS + (uint64_t)i;
+        fvals[i].type = TIMESERIES_FIELD_TYPE_FLOAT;
+        fvals[i].data.float_val = (double)i * 0.5;
+    }
+
+    const char *field_names[] = {"val"};
+    timeseries_insert_data_t ins = {
+        .measurement_name = "alp_bnd",
+        .tag_keys         = NULL,
+        .tag_values       = NULL,
+        .num_tags         = 0,
+        .field_names      = field_names,
+        .field_values     = fvals,
+        .num_fields       = 1,
+        .timestamps_ms    = timestamps,
+        .num_points       = n,
+    };
+
+    bool ok = timeseries_insert(&ins);
+    free(timestamps);
+    free(fvals);
+    if (!ok) return false;
+
+    /* 3. Force-compact so ALP encoding kicks in */
+    if (!timeseries_compact_force_sync()) return false;
+
+    /* 4. Query all points back */
+    timeseries_query_t q;
+    memset(&q, 0, sizeof(q));
+    q.measurement_name = "alp_bnd";
+    q.start_ms = (int64_t)BOUNDARY_BASE_TS;
+    q.end_ms   = (int64_t)(BOUNDARY_BASE_TS + (uint64_t)n);  /* inclusive upper bound */
+
+    timeseries_query_result_t result;
+    memset(&result, 0, sizeof(result));
+    if (!timeseries_query(&q, &result)) return false;
+
+    /* 5. Verify count */
+    if (result.num_points != n) {
+        printf("  boundary(%zu): expected %zu points, got %zu\n",
+               n, n, result.num_points);
+        timeseries_query_free_result(&result);
+        return false;
+    }
+
+    /* 6. Verify each value is bit-exact */
+    if (result.num_columns < 1 || !result.columns[0].values) {
+        timeseries_query_free_result(&result);
+        return false;
+    }
+
+    bool values_ok = true;
+    for (size_t i = 0; i < n; i++) {
+        double expected = (double)i * 0.5;
+        double actual   = result.columns[0].values[i].data.float_val;
+        uint64_t exp_bits, act_bits;
+        memcpy(&exp_bits, &expected, 8);
+        memcpy(&act_bits, &actual, 8);
+        if (exp_bits != act_bits) {
+            printf("  boundary(%zu): mismatch at i=%zu  expected=%.17g  actual=%.17g\n",
+                   n, i, expected, actual);
+            values_ok = false;
+            break;
+        }
+    }
+
+    /* 7. Also verify timestamps */
+    bool ts_ok = true;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t expected_ts = BOUNDARY_BASE_TS + (uint64_t)i;
+        if (result.timestamps[i] != expected_ts) {
+            printf("  boundary(%zu): ts mismatch at i=%zu  expected=%" PRIu64 "  actual=%" PRIu64 "\n",
+                   n, i, expected_ts, result.timestamps[i]);
+            ts_ok = false;
+            break;
+        }
+    }
+
+    timeseries_query_free_result(&result);
+    return values_ok && ts_ok;
+}
+
+TEST_CASE("alp: encode/decode at block and chunk boundaries", "[alp][boundary]") {
+    TEST_ASSERT_TRUE_MESSAGE(timeseries_init(), "timeseries_init failed");
+
+    /* ALP block boundary cases */
+    static const size_t cases[] = {
+        127,  /* 1 partial ALP block only */
+        128,  /* exactly 1 full ALP block, no partial */
+        129,  /* 1 full ALP block + 1-element partial */
+        200,  /* exact CHUNK_MAX_POINTS boundary */
+        201,  /* CHUNK_MAX_POINTS + 1 — spills to second chunk */
+        256,  /* exactly 2 full ALP blocks */
+    };
+    static const size_t num_cases = sizeof(cases) / sizeof(cases[0]);
+
+    for (size_t c = 0; c < num_cases; c++) {
+        size_t n = cases[c];
+        printf("  subcase: %zu points ...\n", n);
+        bool ok = boundary_insert_compact_query_verify(n);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "boundary round-trip failed for n=%zu", n);
+        TEST_ASSERT_TRUE_MESSAGE(ok, msg);
+        printf("  subcase: %zu points OK\n", n);
+    }
+}

@@ -8,7 +8,9 @@
 /* Compute the number of bits needed to represent the range [min_val, max_val]. */
 static uint8_t int_required_bw(int64_t min_val, int64_t max_val) {
     if (max_val <= min_val) return 0;
-    uint64_t range = (uint64_t)(max_val - min_val);
+    /* Subtract in unsigned to avoid signed overflow UB when
+     * min_val=INT64_MIN and max_val=INT64_MAX. */
+    uint64_t range = (uint64_t)max_val - (uint64_t)min_val;
     return (uint8_t)(64 - __builtin_clzll(range));
 }
 
@@ -22,7 +24,6 @@ static size_t encode_block_int(const int64_t *deltas, size_t count,
                                 uint8_t *out_buf) {
     /* Pass 1: find min and max */
     int64_t min_val = INT64_MAX, max_val = INT64_MIN;
-#pragma GCC ivdep
     for (size_t i = 0; i < count; i++) {
         if (deltas[i] < min_val) min_val = deltas[i];
         if (deltas[i] > max_val) max_val = deltas[i];
@@ -47,7 +48,7 @@ static size_t encode_block_int(const int64_t *deltas, size_t count,
 /*
  * Delta-FFOR encoder.
  *
- * Stream format (16-byte header):
+ * Stream format (20-byte header):
  *   magic(4) | count(4) | nblocks(2) | tail(2) | anchor(8)
  *
  * anchor = values[0].  Blocks contain deltas: delta[i] = values[i] - values[i-1],
@@ -74,12 +75,12 @@ size_t alp_encode_int(const int64_t *values, size_t count, uint8_t **out) {
 
     /* Conservative upper bound per block:
      *   header (16) + worst-case packed data (ALP_INT_BLOCK_SIZE * 8 bytes for bw=64)
-     * Plus stream header (16 bytes). */
-    size_t max_out = 16 + num_blocks * (16 + ALP_INT_BLOCK_SIZE * 8);
+     * Plus stream header (20 bytes). */
+    size_t max_out = 20 + num_blocks * (16 + (ALP_INT_BLOCK_SIZE + 1) * 8);
     uint8_t *buf = (uint8_t *)malloc(max_out);
     if (!buf) { free(deltas); return 0; }
 
-    /* Stream header (16 bytes) */
+    /* Stream header (20 bytes) */
     uint8_t *p = buf;
     uint32_t magic = ALP_INT_MAGIC;
     uint32_t total = (uint32_t)count;
@@ -125,8 +126,9 @@ bool alp_decode_int(const uint8_t * restrict data, size_t data_len,
     const uint8_t *p   = data;
     const uint8_t *end = data + data_len;
 
-    /* Stream header */
-    if (p + 16 > end) return false;
+    /* Stream header (20 bytes):
+     * magic(4) + total_values(4) + num_blocks(2) + tail(2) + anchor(8) */
+    if (p + 20 > end) return false;
 
     uint32_t magic;
     memcpy(&magic, p, 4); p += 4;
@@ -143,42 +145,58 @@ bool alp_decode_int(const uint8_t * restrict data, size_t data_len,
     int64_t anchor;
     memcpy(&anchor, p, 8); p += 8;
 
-    /*
-     * Scratch buffer: one block of decoded deltas, used only for the
-     * partial last block.  All full blocks unpack directly into `out`.
-     * Stack-allocated (1024 bytes) — within ESP32 task stack limits.
-     */
-    int64_t scratch[ALP_INT_BLOCK_SIZE];
+    int64_t *scratch = NULL;  /* heap-allocated only for partial last block */
+    uint64_t *aligned_buf = NULL; /* heap-allocated for alignment */
 
     size_t out_idx = 0;
 
     for (uint16_t block = 0; block < num_blocks && out_idx < count; block++) {
-        if (p + 16 > end) return false;
+        if (p + 16 > end) goto fail;
 
         uint64_t bh0; memcpy(&bh0, p, 8); p += 8;
         uint64_t bh1; memcpy(&bh1, p, 8); p += 8;
 
         uint8_t  bw          = (uint8_t)(bh0 & 0xFF);
+        if (bw > 64) goto fail;
         uint16_t block_count = (uint16_t)((bh0 >> 32) & 0xFFFF);
 
         int64_t for_base;
         memcpy(&for_base, &bh1, 8);
 
-        if (block_count == 0 || block_count > ALP_INT_BLOCK_SIZE) return false;
+        if (block_count == 0 || block_count > ALP_INT_BLOCK_SIZE) goto fail;
 
         size_t packed_words = alp_ffor_packed_words(block_count, bw);
-        if (p + packed_words * 8 > end) return false;
+        if (packed_words * 8 > (size_t)(end - p)) goto fail;
 
         size_t to_decode = block_count;
         if (to_decode > count - out_idx) to_decode = count - out_idx;
 
+        /* p may not be 8-byte aligned (stream header is 20 bytes + 16-byte
+         * block headers), so memcpy into an aligned buffer before calling
+         * alp_ffor_unpack which dereferences uint64_t pointers directly. */
+        const uint64_t *packed_ptr;
+        if (packed_words > 0 && ((uintptr_t)p & 7u) != 0) {
+            if (!aligned_buf) {
+                aligned_buf = (uint64_t *)malloc((ALP_INT_BLOCK_SIZE + 1) * sizeof(uint64_t));
+                if (!aligned_buf) goto fail;
+            }
+            memcpy(aligned_buf, p, packed_words * 8);
+            packed_ptr = aligned_buf;
+        } else {
+            packed_ptr = (const uint64_t *)p;
+        }
+
         if (to_decode == block_count) {
             /* Full block: unpack deltas directly into output */
-            alp_ffor_unpack((const uint64_t *)p, block_count,
+            alp_ffor_unpack(packed_ptr, block_count,
                             for_base, bw, out + out_idx);
         } else {
-            /* Partial block: unpack to scratch then copy */
-            alp_ffor_unpack((const uint64_t *)p, block_count,
+            /* Partial block: heap-allocate scratch on first need */
+            if (!scratch) {
+                scratch = (int64_t *)malloc(ALP_INT_BLOCK_SIZE * sizeof(int64_t));
+                if (!scratch) goto fail;
+            }
+            alp_ffor_unpack(packed_ptr, block_count,
                             for_base, bw, scratch);
             memcpy(out + out_idx, scratch, to_decode * sizeof(int64_t));
         }
@@ -186,6 +204,9 @@ bool alp_decode_int(const uint8_t * restrict data, size_t data_len,
         p += packed_words * 8;
         out_idx += to_decode;
     }
+
+    free(scratch);
+    free(aligned_buf);
 
     /* Prefix-sum: convert deltas back to absolute values.
      * out[0] is delta=0, so out[0] = anchor + 0 = anchor.
@@ -198,4 +219,9 @@ bool alp_decode_int(const uint8_t * restrict data, size_t data_len,
     }
 
     return (out_idx == count);
+
+fail:
+    free(scratch);
+    free(aligned_buf);
+    return false;
 }

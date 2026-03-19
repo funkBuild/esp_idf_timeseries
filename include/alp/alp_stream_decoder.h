@@ -28,13 +28,13 @@ typedef struct {
     uint16_t blocks_decoded;  /* blocks decoded so far */
     bool is_float;            /* true = ALP float, false = ALP int */
 
-    /* Current decoded block cache */
-    union {
-        double  floats[ALP_STREAM_BLOCK_SIZE];
-        int64_t ints[ALP_STREAM_BLOCK_SIZE];
-    } block;
+    /* Current decoded block cache (heap-allocated, ALP_STREAM_BLOCK_SIZE * 8 bytes).
+     * Cast to double* for float streams, int64_t* for int streams. */
+    void *block_buf;
     uint16_t block_count;     /* values in current decoded block */
     uint16_t block_offset;    /* next value index to return (0..block_count-1) */
+
+    uint8_t *scratch;         /* heap-allocated scratch for float FFOR decode */
 } alp_stream_decoder_t;
 
 /**
@@ -52,6 +52,15 @@ typedef struct {
 bool alp_stream_decoder_init(alp_stream_decoder_t *dec,
                               const uint8_t *data, size_t len,
                               bool is_float);
+
+/**
+ * @brief Release resources owned by the streaming decoder.
+ *
+ * Frees the internal scratch buffer allocated during init.  Must be called
+ * when the decoder is no longer needed.  Safe to call on a zero-initialised
+ * or already-deinited decoder (no-op).
+ */
+void alp_stream_decoder_deinit(alp_stream_decoder_t *dec);
 
 /**
  * @brief Get the next decoded float value.

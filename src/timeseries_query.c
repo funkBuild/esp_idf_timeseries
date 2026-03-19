@@ -333,7 +333,10 @@ bool timeseries_query_execute(timeseries_db_t *db,
 
   start_time = esp_timer_get_time();
 
-  fetch_series_data(db, fields_array, actual_fields_count, query, result);
+  size_t points_fetched = fetch_series_data(db, fields_array, actual_fields_count, query, result);
+  if (points_fetched == 0 && result->num_points == 0) {
+    ESP_LOGD(TAG, "fetch_series_data returned no points");
+  }
 
   ok = true; /* At this point the function succeeded – result is valid */
 
@@ -458,6 +461,11 @@ static bool ensure_result_capacity(timeseries_query_result_t *result,
   }
   result->timestamps = new_ts;
 
+  // Note: if a column realloc below fails, timestamps (and any earlier
+  // columns) will already be at new_cap while *capacity stays at the old
+  // value.  This is intentional — the oversized arrays waste a little memory
+  // but remain valid, and *capacity is only updated after ALL reallocs
+  // succeed so the caller never indexes beyond the smallest allocation.
   for (size_t c = 0; c < result->num_columns; c++) {
     timeseries_field_value_t *new_vals =
         realloc(result->columns[c].values,
@@ -851,13 +859,21 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
              (unsigned int)page_offset, (unsigned int)page_size, hdr.field_data_level, hdr.page_state);
 
     // Grow shared buffer if this page is larger
+    if (page_size <= sizeof(timeseries_page_header_t)) {
+      ESP_LOGW(TAG, "Corrupt page @0x%08X: page_size=%u too small, skipping",
+               (unsigned int)page_offset, (unsigned int)page_size);
+      continue;
+    }
     uint32_t data_size = page_size - sizeof(timeseries_page_header_t);
     if (data_size > shared_page_buf_cap) {
       uint8_t *new_buf = realloc(shared_page_buf, data_size);
-      if (new_buf) {
-        shared_page_buf = new_buf;
-        shared_page_buf_cap = data_size;
+      if (!new_buf) {
+        ESP_LOGW(TAG, "realloc(%u) failed for page @0x%08X, skipping",
+                 (unsigned int)data_size, (unsigned int)page_offset);
+        continue;
       }
+      shared_page_buf = new_buf;
+      shared_page_buf_cap = data_size;
     }
 
     timeseries_fielddata_iterator_t fdata_iter;
@@ -1111,8 +1127,21 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
         if (idx > 0) {
           timeseries_multi_points_iterator_t mpit;
           if (timeseries_multi_points_iterator_init(sub_iters, page_seqs, idx, &mpit)) {
+            // Pre-compute total record count to avoid repeated buffer doubling,
+            // which causes OOM due to peak memory (old + new buffer during realloc).
+            size_t total_records = 0;
+            for (size_t ri = 0; ri < srl->count; ri++) {
+              total_records += srl->records[ri].record_count;
+            }
+            // Apply query limit if set
+            if (query->limit != 0 && total_records > query->limit) {
+              total_records = query->limit;
+            }
+            // Use at least 64 to avoid zero-size alloc, cap at total_records
+            size_t buf_cap = (total_records > 64) ? total_records : 64;
+
             // Buffer points from iterator, then merge into result in O(n+m)
-            size_t buf_cap = 64, buf_count = 0;
+            size_t buf_count = 0;
             uint64_t *buf_ts = malloc(buf_cap * sizeof(uint64_t));
             timeseries_field_value_t *buf_vals = malloc(buf_cap * sizeof(timeseries_field_value_t));
             bool buf_ok = (buf_ts && buf_vals);
@@ -1169,7 +1198,24 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
                 if (!merge_sorted_field_data(result, col_index, buf_ts, buf_vals,
                                              buf_count, &result_capacity)) {
                   ESP_LOGE(TAG, "OOM merging result for field '%s'", fld->field_name);
-                  // Free any string values in buffer on failure
+                  // The forward pass in merge_sorted_field_data may have shallow-
+                  // copied some buf_vals entries into the result column.  NULL those
+                  // out so timeseries_query_free_result won't double-free them.
+                  for (size_t ri = 0; ri < result->num_points; ri++) {
+                    timeseries_field_value_t *rv =
+                        &result->columns[col_index].values[ri];
+                    if (rv->type == TIMESERIES_FIELD_TYPE_STRING &&
+                        rv->data.string_val.str) {
+                      for (size_t bi = 0; bi < buf_count; bi++) {
+                        if (buf_vals[bi].data.string_val.str ==
+                            rv->data.string_val.str) {
+                          rv->data.string_val.str = NULL;
+                          break;
+                        }
+                      }
+                    }
+                  }
+                  // Now safe to free all string values from the buffer
                   for (size_t bi = 0; bi < buf_count; bi++) {
                     if (buf_vals[bi].type == TIMESERIES_FIELD_TYPE_STRING &&
                         buf_vals[bi].data.string_val.str)
@@ -1427,13 +1473,21 @@ bool timeseries_query_get_timestamp_range(timeseries_db_t *db,
   while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &page_offset, &page_size)) {
     if (hdr.page_type != TIMESERIES_PAGE_TYPE_FIELD_DATA) continue;
 
+    if (page_size <= sizeof(timeseries_page_header_t)) {
+      ESP_LOGW(TAG, "Corrupt page @0x%08X: page_size=%u too small, skipping",
+               (unsigned int)page_offset, (unsigned int)page_size);
+      continue;
+    }
     uint32_t data_size = page_size - sizeof(timeseries_page_header_t);
     if (data_size > shared_buf_cap) {
       uint8_t *new_buf = realloc(shared_buf, data_size);
-      if (new_buf) {
-        shared_buf = new_buf;
-        shared_buf_cap = data_size;
+      if (!new_buf) {
+        ESP_LOGW(TAG, "realloc(%u) failed for page @0x%08X, skipping",
+                 (unsigned int)data_size, (unsigned int)page_offset);
+        continue;
       }
+      shared_buf = new_buf;
+      shared_buf_cap = data_size;
     }
 
     timeseries_fielddata_iterator_t fdata_iter;

@@ -4,7 +4,12 @@
 #include "timeseries_cache_base.h"
 #include <string.h>
 #include <stdlib.h>
+#include "esp_log.h"
 #include "esp_timer.h" /* or stub on non-ESP builds */
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+static const char* TAG = "ts_cache";
 
 #define DEFAULT_MAX_ENTRIES 256
 #define DEFAULT_MAX_MEMORY (128 * 1024) /* 128 KB */
@@ -44,6 +49,8 @@ struct ts_cache {
   lru_list_t lru;
 
   ts_cache_stats_t st;
+
+  SemaphoreHandle_t mutex;
 };
 
 /* ---------- helpers ---------------------------------------------------- */
@@ -65,9 +72,9 @@ static void unlink_from_bucket(ts_cache_t* c, entry_t* vict) {
   while (*pp && *pp != vict) pp = &(*pp)->next;
   if (*pp) *pp = vict->next;
 }
-static void evict_one(ts_cache_t* c) {
+static bool evict_one(ts_cache_t* c) {
   entry_t* vict = (entry_t*)lru_pop_tail(&c->lru);
-  if (!vict) return;
+  if (!vict) return false;
 
   unlink_from_bucket(c, vict);
 
@@ -78,9 +85,16 @@ static void evict_one(ts_cache_t* c) {
   free(vict->str_key);
   free(vict->blob);
   free(vict);
+  return true;
 }
 static void ensure_capacity(ts_cache_t* c, size_t extra) {
-  while ((c->entry_cnt >= c->entry_cap) || (c->mem_used + extra > c->mem_cap)) evict_one(c);
+  while ((c->entry_cnt >= c->entry_cap) || (c->mem_used + extra > c->mem_cap)) {
+    if (!evict_one(c)) {
+      ESP_LOGW(TAG, "ensure_capacity: LRU empty but entry_cnt=%u mem_used=%u (counter desync?)",
+               (unsigned)c->entry_cnt, (unsigned)c->mem_used);
+      break;
+    }
+  }
 }
 
 /* ---------- core create / destroy ------------------------------------- */
@@ -100,6 +114,13 @@ ts_cache_t* ts_cache_create(size_t max_entries, size_t max_mem, uint32_t ttl_ms)
     return NULL;
   }
 
+  c->mutex = xSemaphoreCreateMutex();
+  if (!c->mutex) {
+    free(c->buckets);
+    free(c);
+    return NULL;
+  }
+
   c->bucket_cnt = buckets;
   c->entry_cap = max_entries;
   c->mem_cap = max_mem;
@@ -108,14 +129,8 @@ ts_cache_t* ts_cache_create(size_t max_entries, size_t max_mem, uint32_t ttl_ms)
   lru_list_init(&c->lru);
   return c;
 }
-void ts_cache_destroy(ts_cache_t* c) {
-  if (!c) return;
-  ts_cache_clear(c);
-  free(c->buckets);
-  free(c);
-}
-void ts_cache_clear(ts_cache_t* c) {
-  if (!c) return;
+/* internal clear — caller must already hold c->mutex */
+static void clear_unlocked(ts_cache_t* c) {
   for (size_t b = 0; b < c->bucket_cnt; ++b) {
     entry_t* e = c->buckets[b];
     while (e) {
@@ -130,6 +145,22 @@ void ts_cache_clear(ts_cache_t* c) {
   lru_list_init(&c->lru);
   memset(&c->st, 0, sizeof c->st);
   c->entry_cnt = c->mem_used = 0;
+}
+
+void ts_cache_destroy(ts_cache_t* c) {
+  if (!c) return;
+  xSemaphoreTake(c->mutex, portMAX_DELAY);
+  clear_unlocked(c);
+  xSemaphoreGive(c->mutex);
+  vSemaphoreDelete(c->mutex);
+  free(c->buckets);
+  free(c);
+}
+void ts_cache_clear(ts_cache_t* c) {
+  if (!c) return;
+  xSemaphoreTake(c->mutex, portMAX_DELAY);
+  clear_unlocked(c);
+  xSemaphoreGive(c->mutex);
 }
 
 /* ---------- fast path: common look-up routine ------------------------- */
@@ -160,12 +191,15 @@ static bool expired(const ts_cache_t* c, const entry_t* e) {
 bool ts_cache_lookup_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, uint32_t meas_id, uint32_t* out_val) {
   if (!c || !out_val) return false;
 
+  xSemaphoreTake(c->mutex, portMAX_DELAY);
+
   uint32_t h = str_key ? djb2(str_key) : meas_id; /* cheap hash */
   entry_t* prev = NULL;
   entry_t* e = find_entry(c, kind, str_key, meas_id, h, &prev);
 
   if (!e) {
     c->st.misses++;
+    xSemaphoreGive(c->mutex);
     return false;
   }
 
@@ -180,8 +214,10 @@ bool ts_cache_lookup_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, ui
     c->entry_cnt--;
     c->st.evictions++;
     free(e->str_key);
+    free(e->blob);
     free(e);
     c->st.misses++;
+    xSemaphoreGive(c->mutex);
     return false;
   }
 
@@ -189,11 +225,15 @@ bool ts_cache_lookup_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, ui
   e->last_access_us = esp_timer_get_time();
   lru_move_front(&c->lru, &e->lru);
   c->st.hits++;
+  xSemaphoreGive(c->mutex);
   return true;
 }
 
 bool ts_cache_insert_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, uint32_t meas_id, uint32_t val) {
   if (!c) return false;
+
+  xSemaphoreTake(c->mutex, portMAX_DELAY);
+
   uint32_t h = str_key ? djb2(str_key) : meas_id;
 
   entry_t* e = find_entry(c, kind, str_key, meas_id, h, NULL);
@@ -203,6 +243,7 @@ bool ts_cache_insert_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, ui
     e->last_access_us = esp_timer_get_time();
     lru_move_front(&c->lru, &e->lru);
     c->st.updates++;
+    xSemaphoreGive(c->mutex);
     return true;
   }
 
@@ -210,11 +251,15 @@ bool ts_cache_insert_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, ui
   ensure_capacity(c, need);
 
   e = calloc(1, sizeof *e);
-  if (!e) return false;
+  if (!e) {
+    xSemaphoreGive(c->mutex);
+    return false;
+  }
   if (str_key) {
     e->str_key = strdup(str_key);
     if (!e->str_key) {
       free(e);
+      xSemaphoreGive(c->mutex);
       return false;
     }
   }
@@ -232,6 +277,7 @@ bool ts_cache_insert_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, ui
   c->entry_cnt++;
   c->mem_used += entry_mem(e);
   c->st.insertions++;
+  xSemaphoreGive(c->mutex);
   return true;
 }
 
@@ -242,12 +288,15 @@ bool ts_cache_lookup_blob(ts_cache_t* c, key_kind_e kind, const char* str_key, u
   *out_data = NULL;
   *out_sz = 0;
 
+  xSemaphoreTake(c->mutex, portMAX_DELAY);
+
   uint32_t h = str_key ? djb2(str_key) : meas_id;
   entry_t* prev = NULL;
   entry_t* e = find_entry(c, kind, str_key, meas_id, h, &prev);
 
   if (!e) {
     c->st.misses++;
+    xSemaphoreGive(c->mutex);
     return false;
   }
 
@@ -264,11 +313,15 @@ bool ts_cache_lookup_blob(ts_cache_t* c, key_kind_e kind, const char* str_key, u
     free(e->blob);
     free(e);
     c->st.misses++;
+    xSemaphoreGive(c->mutex);
     return false;
   }
 
   uint8_t* copy = malloc(e->blob_sz);
-  if (!copy) return false;
+  if (!copy) {
+    xSemaphoreGive(c->mutex);
+    return false;
+  }
   memcpy(copy, e->blob, e->blob_sz);
 
   *out_data = copy;
@@ -276,12 +329,16 @@ bool ts_cache_lookup_blob(ts_cache_t* c, key_kind_e kind, const char* str_key, u
   e->last_access_us = esp_timer_get_time();
   lru_move_front(&c->lru, &e->lru);
   c->st.hits++;
+  xSemaphoreGive(c->mutex);
   return true;
 }
 
 bool ts_cache_insert_blob(ts_cache_t* c, key_kind_e kind, const char* str_key, uint32_t meas_id, const void* data,
                           size_t size) {
   if (!c || !data || !size) return false;
+
+  xSemaphoreTake(c->mutex, portMAX_DELAY);
+
   uint32_t h = str_key ? djb2(str_key) : meas_id;
 
   entry_t* e = find_entry(c, kind, str_key, meas_id, h, NULL);
@@ -289,8 +346,12 @@ bool ts_cache_insert_blob(ts_cache_t* c, key_kind_e kind, const char* str_key, u
     /* resize if needed */
     if (e->blob_sz != size) {
       uint8_t* nb = realloc(e->blob, size);
-      if (!nb) return false;
-      c->mem_used += (size - e->blob_sz);
+      if (!nb) {
+        xSemaphoreGive(c->mutex);
+        return false;
+      }
+      c->mem_used -= e->blob_sz;
+      c->mem_used += size;
       e->blob = nb;
       e->blob_sz = size;
     }
@@ -298,6 +359,7 @@ bool ts_cache_insert_blob(ts_cache_t* c, key_kind_e kind, const char* str_key, u
     e->last_access_us = esp_timer_get_time();
     lru_move_front(&c->lru, &e->lru);
     c->st.updates++;
+    xSemaphoreGive(c->mutex);
     return true;
   }
 
@@ -305,11 +367,15 @@ bool ts_cache_insert_blob(ts_cache_t* c, key_kind_e kind, const char* str_key, u
   ensure_capacity(c, need);
 
   e = calloc(1, sizeof *e);
-  if (!e) return false;
+  if (!e) {
+    xSemaphoreGive(c->mutex);
+    return false;
+  }
   if (str_key) {
     e->str_key = strdup(str_key);
     if (!e->str_key) {
       free(e);
+      xSemaphoreGive(c->mutex);
       return false;
     }
   }
@@ -317,6 +383,7 @@ bool ts_cache_insert_blob(ts_cache_t* c, key_kind_e kind, const char* str_key, u
   if (!e->blob) {
     free(e->str_key);
     free(e);
+    xSemaphoreGive(c->mutex);
     return false;
   }
   memcpy(e->blob, data, size);
@@ -335,59 +402,23 @@ bool ts_cache_insert_blob(ts_cache_t* c, key_kind_e kind, const char* str_key, u
   c->entry_cnt++;
   c->mem_used += entry_mem(e);
   c->st.insertions++;
+  xSemaphoreGive(c->mutex);
   return true;
 }
 
 /* ---------- stats ------------------------------------------------------- */
 void ts_cache_get_stats(const ts_cache_t* c, ts_cache_stats_t* out) {
   if (!c || !out) return;
+  ts_cache_t* mc = (ts_cache_t*)(uintptr_t)c; /* cast away const for mutex */
+  xSemaphoreTake(mc->mutex, portMAX_DELAY);
   *out = c->st;
   out->entries = c->entry_cnt;
   out->bytes_in_use = c->mem_used;
+  xSemaphoreGive(mc->mutex);
 }
 
-bool ts_cache_remove(ts_cache_t* c, key_kind_e kind, const char* str_key, uint32_t meas_id) {
-  if (!c) return false;
-
-  uint32_t h = str_key ? djb2(str_key) : meas_id;
-  size_t b = bucket_of(h, c->bucket_cnt);
-  entry_t* e = c->buckets[b];
-  entry_t* prev = NULL;
-
-  while (e) {
-    if (e->hash == h && e->kind == kind && e->meas_id == meas_id &&
-        ((str_key == NULL && e->str_key == NULL) || (str_key && e->str_key && strcmp(e->str_key, str_key) == 0))) {
-      // Unlink from bucket chain
-      if (prev)
-        prev->next = e->next;
-      else
-        c->buckets[b] = e->next;
-
-      // Unlink from LRU list
-      lru_unlink(&c->lru, &e->lru);
-
-      // Update counters
-      c->mem_used -= entry_mem(e);
-      c->entry_cnt--;
-      c->st.evictions++;  // Count as eviction for consistency
-
-      // Free memory
-      free(e->str_key);
-      free(e->blob);
-      free(e);
-
-      return true;
-    }
-    prev = e;
-    e = e->next;
-  }
-  return false;  // Key not found
-}
-
-/* ---------- u32 removal API ------------------------------------------- */
-bool ts_cache_remove_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, uint32_t meas_id) {
-  if (!c) return false;
-
+/* internal remove — caller must already hold c->mutex */
+static bool remove_unlocked(ts_cache_t* c, key_kind_e kind, const char* str_key, uint32_t meas_id) {
   uint32_t h = str_key ? djb2(str_key) : meas_id;
   size_t b = bucket_of(h, c->bucket_cnt);
 
@@ -421,4 +452,21 @@ bool ts_cache_remove_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, ui
     e = e->next;
   }
   return false; /* not found */
+}
+
+bool ts_cache_remove(ts_cache_t* c, key_kind_e kind, const char* str_key, uint32_t meas_id) {
+  if (!c) return false;
+  xSemaphoreTake(c->mutex, portMAX_DELAY);
+  bool result = remove_unlocked(c, kind, str_key, meas_id);
+  xSemaphoreGive(c->mutex);
+  return result;
+}
+
+/* ---------- u32 removal API ------------------------------------------- */
+bool ts_cache_remove_u32(ts_cache_t* c, key_kind_e kind, const char* str_key, uint32_t meas_id) {
+  if (!c) return false;
+  xSemaphoreTake(c->mutex, portMAX_DELAY);
+  bool result = remove_unlocked(c, kind, str_key, meas_id);
+  xSemaphoreGive(c->mutex);
+  return result;
 }

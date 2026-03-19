@@ -183,15 +183,12 @@ bool chimp_float_encoder_finish(ChimpFloatEncoder *enc) {
   if (!enc)
     return false;
 
-  // Add sentinel NaN
-  chimp_float_encoder_add_value(enc, NAN);
-
-  // Write one extra bit (false)
-  if (!bitwriter_write(&enc->bw, 0, 1)) {
+  // Add sentinel NaN.
+  if (!chimp_float_encoder_add_value(enc, NAN))
     return false;
-  }
-
-  // Flush any remaining bits
+  // Write one extra bit (false).
+  if (!bitwriter_write(&enc->bw, 0, 1))
+    return false;
   return bitwriter_flush(&enc->bw);
 }
 

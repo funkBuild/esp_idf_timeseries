@@ -14,11 +14,17 @@ bool bitwriter_flush(BitWriter *bw) {
     return false;
 
   // Handle the remaining partial byte (0..7 bits)
-  int total = bw->byte_count;
   if (bw->bits_in_acc > 0) {
+    // If the buffer is full, flush it before appending the partial byte
+    if (bw->byte_count == BITWRITER_BUFFER_SIZE) {
+      if (!bw->flush_cb(bw->buffer, BITWRITER_BUFFER_SIZE, bw->flush_ctx))
+        return false;
+      bw->byte_count = 0;
+    }
     // Top bw->bits_in_acc bits of acc are valid; pad remaining bits with 0
-    bw->buffer[total++] = (uint8_t)(bw->acc >> 56);
+    bw->buffer[bw->byte_count++] = (uint8_t)(bw->acc >> 56);
   }
+  int total = bw->byte_count;
   if (total > 0) {
     if (!bw->flush_cb(bw->buffer, total, bw->flush_ctx))
       return false;

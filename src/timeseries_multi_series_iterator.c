@@ -85,6 +85,7 @@ static void update_aggregator(const timeseries_field_value_t *val,
     }
   }
   agg->last_val = *val;
+  agg->count++;
 
   if (val->type == TIMESERIES_FIELD_TYPE_STRING) {
     return;
@@ -122,8 +123,6 @@ static void update_aggregator(const timeseries_field_value_t *val,
     if (numeric < agg->f_min) agg->f_min = numeric;
     if (numeric > agg->f_max) agg->f_max = numeric;
   }
-
-  agg->count++;
 }
 
 /*-------------------------------------------------------------------------------------
@@ -425,8 +424,7 @@ bool timeseries_multi_series_iterator_next(
     }
 
     // If this window had no samples, skip it
-    if (agg.count == 0 &&
-        iter->aggregator != TSDB_AGGREGATION_LAST) {
+    if (agg.count == 0) {
       if (!has_more_data) {
         iter->valid = false;
         return false;
@@ -455,6 +453,9 @@ bool timeseries_multi_series_iterator_next(
     }
     if (out_val) {
       *out_val = aggregated;
+    } else if (aggregated.type == TIMESERIES_FIELD_TYPE_STRING &&
+               aggregated.data.string_val.str) {
+      free(aggregated.data.string_val.str);
     }
 
     if (!has_more_data) {

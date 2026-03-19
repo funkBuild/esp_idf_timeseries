@@ -16,6 +16,7 @@ extern "C" {
 typedef struct {
   uint64_t timestamp;
   timeseries_field_value_t field_val;
+  uint32_t page_seq;  // page sequence number; higher = newer
 } tsdb_compact_data_point_t;
 
 /**
@@ -72,21 +73,6 @@ typedef struct {
  * @return true if compaction succeeded, false otherwise.
  */
 bool timeseries_compact_level0_pages(timeseries_db_t *db);
-
-/**
- * @brief Create a new level-1 field data page. For demonstration,
- *        this might be 64KB or 128KB in size, with field_data_level=1.
- *
- * @param db          Pointer to the timeseries_db_t context.
- * @param out_offset  If successful, returns the absolute offset of the new page
- * in flash.
- * @return true if page creation succeeded, false otherwise.
- *
- * @note This function is a placeholder in the skeleton. You need to implement
- *       the actual logic to find free space, erase, and write the page header
- *       with field_data_level=1, etc.
- */
-bool tsdb_create_level1_field_page(timeseries_db_t *db, uint32_t *out_offset);
 
 size_t
 timeseries_field_value_serialize_size(const timeseries_field_value_t *val);

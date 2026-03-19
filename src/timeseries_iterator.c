@@ -32,30 +32,18 @@ bool timeseries_page_iterator_next(timeseries_page_iterator_t* iter, timeseries_
   }
 
   while (iter->current_offset < iter->db->partition->size) {
-    // Read 4 bytes for magic
-    uint32_t possible_magic = 0xFFFFFFFF;
-    esp_err_t err =
-        esp_partition_read(iter->db->partition, iter->current_offset, &possible_magic, sizeof(possible_magic));
+    // Read the full page header in one call
+    timeseries_page_header_t hdr;
+    esp_err_t err = esp_partition_read(iter->db->partition, iter->current_offset, &hdr, sizeof(hdr));
     if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed reading magic @0x%08" PRIx32 " (err=0x%x)", iter->current_offset, err);
+      ESP_LOGE(TAG, "Failed reading header @0x%08" PRIx32 " (err=0x%x)", iter->current_offset, err);
       iter->valid = false;
       return false;
     }
 
-    // If it might be a page header
-    if (possible_magic == TIMESERIES_MAGIC_NUM) {
-      // Read the full page header
-      timeseries_page_header_t hdr;
-      err = esp_partition_read(iter->db->partition, iter->current_offset, &hdr, sizeof(hdr));
-      if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed reading header @0x%08" PRIx32 " (err=0x%x)", iter->current_offset, err);
-        iter->valid = false;
-        return false;
-      }
-
-      // Validate magic, type, etc.
-      if (hdr.magic_number == TIMESERIES_MAGIC_NUM &&
-          (hdr.page_type == TIMESERIES_PAGE_TYPE_METADATA || hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA)) {
+    // Validate magic, type, etc.
+    if (hdr.magic_number == TIMESERIES_MAGIC_NUM) {
+      if (hdr.page_type == TIMESERIES_PAGE_TYPE_METADATA || hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA) {
         uint32_t page_size = hdr.page_size;
         if (page_size < sizeof(hdr) || (iter->current_offset + page_size) > iter->db->partition->size) {
           // Invalid size => skip one sector

@@ -5,12 +5,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "gorilla/gorilla_stream_types.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-// FlushCallback: Function pointer for flushing buffered data.
-typedef bool (*FlushCallback)(const uint8_t *data, size_t len, void *ctx);
 
 // Opaque BooleanStreamEncoder type.
 typedef struct BooleanStreamEncoder BooleanStreamEncoder;

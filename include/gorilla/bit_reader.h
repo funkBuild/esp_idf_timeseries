@@ -89,8 +89,10 @@ static inline bool bitreader_read(BitReader *br, int nbits, uint64_t *out) {
     uint64_t high_part = br->window >> (64 - have);
     br->window = 0;
     br->window_bits = 0;
-    if (!br_load_byte(br))
-      return false;
+    while (br->window_bits < need) {
+      if (!br_load_byte(br))
+        return false;
+    }
     uint64_t low_part = br->window >> (64 - need);
     br->window <<= need;
     br->window_bits -= need;
@@ -113,9 +115,6 @@ bool bitreader_refill(BitReader *br);
 
 // Ensure that at least nbits are available in the BitReader.
 bool bitreader_ensure(BitReader *br, int nbits);
-
-// Peek at the next nbits without consuming them.
-bool bitreader_peek(BitReader *br, int nbits, uint64_t *out);
 
 #ifdef __cplusplus
 }

@@ -33,6 +33,12 @@ bool tsdb_measser_cache_lookup(ts_cache_t* cache, uint32_t meas_id, timeseries_s
 bool tsdb_measser_cache_insert(ts_cache_t* cache, uint32_t meas_id, const timeseries_series_id_list_t* lst) {
   if (!cache || !lst) return false;
 
+  /* empty list: remove any stale entry rather than inserting a NULL blob */
+  if (lst->count == 0) {
+    ts_cache_remove(cache, K_MEASUREMENT_SER, NULL, meas_id);
+    return true;
+  }
+
   uint8_t* blob;
   size_t sz;
   if (!pack(lst, &blob, &sz)) return false;

@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "gorilla/gorilla_stream_types.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -13,10 +15,6 @@ extern "C" {
 #ifndef BITWRITER_BUFFER_SIZE
 #define BITWRITER_BUFFER_SIZE 64
 #endif
-
-// Callback type used to flush the contents of the BitWriter buffer.
-// It should return true on success and false on failure.
-typedef bool (*FlushCallback)(const uint8_t *data, size_t len, void *ctx);
 
 // BitWriter struct holds the buffer and state for writing bits.
 // Uses a 64-bit accumulator for word-level bit packing (O(1) per write).

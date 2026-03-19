@@ -71,6 +71,7 @@ bool timeseries_points_iterator_init(
     return false;
   }
 
+#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
   // Profiling for Phase 3 investigation
   uint64_t prof_start, prof_end;
   uint64_t prof_hdr_read = 0;
@@ -79,6 +80,7 @@ bool timeseries_points_iterator_init(
   uint64_t prof_val_malloc = 0;
   uint64_t prof_val_read = 0;
   uint64_t prof_decoder_init = 0;
+#endif
 
   // 1) Read col_data_header
   if (record_length < sizeof(timeseries_col_data_header_t)) {
@@ -93,10 +95,14 @@ bool timeseries_points_iterator_init(
 
   // 2) If compressed => single flash read for header + ts + val blocks
   if (compressed) {
+#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
     prof_start = esp_timer_get_time();
+#endif
     uint8_t *record_buf = (uint8_t *)malloc(record_length);
+#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
     prof_end = esp_timer_get_time();
     prof_ts_malloc = prof_end - prof_start;
+#endif
 
     if (!record_buf) {
       ESP_LOGE(TAG, "OOM for record buffer of size %u",
@@ -105,11 +111,15 @@ bool timeseries_points_iterator_init(
       return false;
     }
 
+#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
     prof_start = esp_timer_get_time();
+#endif
     esp_err_t err = esp_partition_read(db->partition, record_data_offset,
                                        record_buf, record_length);
+#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
     prof_end = esp_timer_get_time();
     prof_hdr_read = prof_end - prof_start;
+#endif
 
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed reading record at 0x%08X (err=0x%x)",
@@ -183,6 +193,7 @@ bool timeseries_points_iterator_init(
         if (!alp_stream_decoder_init(iter->alp_val_dec, val_data,
                                       col_hdr.val_len, is_float)) {
           ESP_LOGE(TAG, "ALP stream decoder init failed");
+          alp_stream_decoder_deinit(iter->alp_val_dec);
           free(iter->alp_val_dec);
           free(iter->alp_ts);
           free(record_buf);
@@ -255,7 +266,9 @@ bool timeseries_points_iterator_init(
     iter->val_comp_buf = NULL;        // val data is inside record_buf
 
     // Now initialize Gorilla decoders (timestamps + values) in zero-copy mode
+#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
     prof_start = esp_timer_get_time();
+#endif
 
     if (!gorilla_decoder_init_direct(&iter->ts_decoder, GORILLA_STREAM_INT,
                                      ts_data, col_hdr.ts_len)) {
@@ -337,6 +350,7 @@ bool timeseries_points_iterator_init(
     // ts_decoder is fully consumed — deinit it
     gorilla_decoder_deinit(&iter->ts_decoder);
 
+#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
     prof_end = esp_timer_get_time();
     prof_decoder_init = prof_end - prof_start;
 
@@ -353,6 +367,7 @@ bool timeseries_points_iterator_init(
              prof_decoder_init / 1000.0,
              (unsigned)col_hdr.ts_len,
              (unsigned)col_hdr.val_len);
+#endif
 
     ESP_LOGV(TAG, "Iterator init: compressed, record_count=%u", record_count);
   } else {
@@ -467,6 +482,10 @@ bool timeseries_points_iterator_init(
       for (size_t i = 0; i < record_count; i++) {
         if (offset + 1 > uc_hdr.val_len) {
           ESP_LOGE(TAG, "Value buffer too small for bool at i=%zu", i);
+          free(iter->ts_array);
+          free(iter->bool_array);
+          iter->ts_array = NULL;
+          iter->bool_array = NULL;
           iter->valid = false;
           break;
         }
@@ -480,6 +499,7 @@ bool timeseries_points_iterator_init(
       // Allocate array for string values
       iter->string_array =
           (string_array_t *)malloc(record_count * sizeof(string_array_t));
+      iter->string_array_count = record_count;
 
       if (!iter->string_array) {
         ESP_LOGE(TAG, "OOM for string_array of size=%u", record_count);
@@ -550,6 +570,8 @@ bool timeseries_points_iterator_init(
     }
     default: {
       ESP_LOGE(TAG, "Unsupported uncompressed type=%d", (int)series_type);
+      free(iter->ts_array);
+      iter->ts_array = NULL;
       iter->valid = false;
       break;
     }
@@ -557,7 +579,7 @@ bool timeseries_points_iterator_init(
 
     free(val_buf);
     if (!iter->valid) {
-      // we already freed ts_array => done
+      // error paths above already freed ts_array and type-specific arrays
       return false;
     }
 
@@ -731,7 +753,7 @@ bool timeseries_points_iterator_next_value(
     switch (iter->series_type) {
     case TIMESERIES_FIELD_TYPE_FLOAT: {
       double d = iter->float_array[idx];
-      out_value->data.float_val = (float)d; // or keep double
+      out_value->data.float_val = d;
       return true;
     }
     case TIMESERIES_FIELD_TYPE_INT: {
@@ -769,7 +791,7 @@ bool timeseries_points_iterator_next_value(
       iter->valid = false;
       return false;
     }
-    out_value->data.float_val = (float)dval;
+    out_value->data.float_val = dval;
     break;
   }
   case TIMESERIES_FIELD_TYPE_INT: {
@@ -834,7 +856,8 @@ void timeseries_points_iterator_deinit(timeseries_points_iterator_t *iter) {
     free(iter->alp_ts);
     iter->alp_ts = NULL;
     if (iter->alp_val_dec) {
-      // Streaming ALP: free decoder and retained compressed buffer
+      // Streaming ALP: release scratch, then free decoder and retained compressed buffer
+      alp_stream_decoder_deinit(iter->alp_val_dec);
       free(iter->alp_val_dec);
       iter->alp_val_dec = NULL;
       if (iter->alp_comp_buf) {
@@ -884,8 +907,9 @@ void timeseries_points_iterator_deinit(timeseries_points_iterator_t *iter) {
       iter->bool_array = NULL;
     }
     if (iter->string_array) {
-      // Free each string allocation
-      for (size_t i = 0; i < iter->ts_count; i++) {
+      // Free each string allocation (use string_array_count, not ts_count,
+      // because set_time_range may have narrowed ts_count)
+      for (size_t i = 0; i < iter->string_array_count; i++) {
         if (iter->string_array[i].str) {
           free(iter->string_array[i].str);
         }

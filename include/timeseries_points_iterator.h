@@ -44,6 +44,7 @@ typedef struct {
 
   // Uncompressed arrays
   uint64_t *ts_array;
+  uint16_t string_array_count; // original count at allocation time (ts_count may shrink)
   union {
     double *float_array;
     int64_t *int_array;

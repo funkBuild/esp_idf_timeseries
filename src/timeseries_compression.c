@@ -1,9 +1,14 @@
+// NOTE: This module is currently only used by tests and may be removed in a future cleanup.
 #include "timeseries_compression.h"
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
+#include "esp_log.h"
+
+static const char *TAG = "tsdb_compress";
 
 #define CHUNK_SIZE 16384
+#define TSDB_MAX_DECOMPRESS_SIZE (256 * 1024)
 
 /**
  * @brief Implementation using zlib under the hood.
@@ -25,6 +30,7 @@ bool timeseries_compression_compress(const uint8_t *in_data, size_t in_size,
   int ret = deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
                          12, 4, Z_DEFAULT_STRATEGY);
   if (ret != Z_OK) {
+    ESP_LOGE(TAG, "deflateInit2 failed: %d", ret);
     return false;
   }
 
@@ -32,6 +38,7 @@ bool timeseries_compression_compress(const uint8_t *in_data, size_t in_size,
   size_t max_out = deflateBound(&strm, (uLong)in_size);
   uint8_t *temp = (uint8_t *)malloc(max_out);
   if (!temp) {
+    ESP_LOGE(TAG, "compress malloc failed (%u bytes)", (unsigned)max_out);
     deflateEnd(&strm);
     return false;
   }
@@ -43,6 +50,7 @@ bool timeseries_compression_compress(const uint8_t *in_data, size_t in_size,
 
   ret = deflate(&strm, Z_FINISH);
   if (ret != Z_STREAM_END) {
+    ESP_LOGE(TAG, "deflate failed: %d", ret);
     deflateEnd(&strm);
     free(temp);
     return false;
@@ -76,6 +84,7 @@ bool timeseries_compression_decompress(const uint8_t *in_data, size_t in_size,
   // Use windowBits=12 to match the compressor
   int ret = inflateInit2(&strm, 12);
   if (ret != Z_OK) {
+    ESP_LOGE(TAG, "inflateInit2 failed: %d", ret);
     return false;
   }
 
@@ -83,6 +92,7 @@ bool timeseries_compression_decompress(const uint8_t *in_data, size_t in_size,
   size_t buffer_capacity = CHUNK_SIZE;
   uint8_t *buffer = (uint8_t *)malloc(buffer_capacity);
   if (!buffer) {
+    ESP_LOGE(TAG, "decompress malloc failed (%u bytes)", (unsigned)buffer_capacity);
     inflateEnd(&strm);
     return false;
   }
@@ -93,8 +103,15 @@ bool timeseries_compression_decompress(const uint8_t *in_data, size_t in_size,
   do {
     if (total_output + CHUNK_SIZE > buffer_capacity) {
       size_t new_capacity = buffer_capacity * 2;
+      if (new_capacity > TSDB_MAX_DECOMPRESS_SIZE) {
+        ESP_LOGE(TAG, "decompress buffer exceeded limit (%d bytes)", TSDB_MAX_DECOMPRESS_SIZE);
+        free(buffer);
+        inflateEnd(&strm);
+        return false;
+      }
       uint8_t *new_buffer = (uint8_t *)realloc(buffer, new_capacity);
       if (!new_buffer) {
+        ESP_LOGE(TAG, "decompress realloc failed (%u bytes)", (unsigned)new_capacity);
         free(buffer);
         inflateEnd(&strm);
         return false;
@@ -109,6 +126,7 @@ bool timeseries_compression_decompress(const uint8_t *in_data, size_t in_size,
     inflate_ret = inflate(&strm, Z_NO_FLUSH);
 
     if (inflate_ret != Z_OK && inflate_ret != Z_STREAM_END) {
+      ESP_LOGE(TAG, "inflate failed: %d", inflate_ret);
       free(buffer);
       inflateEnd(&strm);
       return false;
@@ -119,6 +137,13 @@ bool timeseries_compression_decompress(const uint8_t *in_data, size_t in_size,
   } while (inflate_ret != Z_STREAM_END);
 
   inflateEnd(&strm);
+
+  if (total_output == 0) {
+    free(buffer);
+    *out_data = NULL;
+    *out_size = 0;
+    return true;
+  }
 
   uint8_t *final_buffer = (uint8_t *)realloc(buffer, total_output);
   if (final_buffer != NULL) {

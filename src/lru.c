@@ -37,6 +37,7 @@ void lru_link_front(lru_list_t* lst, lru_node_t* n) {
 }
 
 void lru_unlink(lru_list_t* lst, lru_node_t* n) {
+  if (n->prev == NULL && n->next == NULL && lst->head != n) return;
   if (n->prev)
     n->prev->next = n->next;
   else

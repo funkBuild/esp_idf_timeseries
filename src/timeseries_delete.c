@@ -1,11 +1,14 @@
 #include "esp_timer.h"
 #include "timeseries_id_list.h"
+#include "timeseries_flash_utils.h"
 #include "timeseries_internal.h"
 #include "timeseries_iterator.h"
 #include "timeseries_metadata.h"
 #include "timeseries_string_list.h"
 
 #include "esp_log.h"
+
+#include <stddef.h>
 
 static const char* TAG = "TimeseriesDelete";
 
@@ -39,13 +42,14 @@ static bool tsdb_mark_series_deleted_in_page(timeseries_db_t* db, uint32_t page_
     }
 
     // Mark this record as deleted by clearing the deleted flag
-    fdh.flags &= ~TSDB_FIELDDATA_FLAG_DELETED;
+    uint8_t new_flags = fdh.flags & ~TSDB_FIELDDATA_FLAG_DELETED;
 
     // Calculate the absolute offset for the header
     uint32_t header_offset = page_offset + fdata_iter.current_record_offset;
 
-    // Write the updated header back to the partition
-    esp_err_t err = esp_partition_write(db->partition, header_offset, &fdh, sizeof(fdh));
+    esp_err_t err = tsdb_flash_write_byte(db->partition,
+        header_offset + offsetof(timeseries_field_data_header_t, flags),
+        new_flags);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed to write updated header at offset 0x%08X: %s", (unsigned int)header_offset,
                esp_err_to_name(err));
@@ -62,8 +66,82 @@ static bool tsdb_mark_series_deleted_in_page(timeseries_db_t* db, uint32_t page_
 
 static bool tsdb_mark_metadata_deleted_in_page(timeseries_db_t* db, uint32_t page_offset, uint32_t page_size,
                                                timeseries_series_id_list_t* series_to_delete) {
-  // Implementation for marking metadata as deleted in the specified page
-  return true;
+  timeseries_entity_iterator_t ent_iter;
+  if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+    ESP_LOGW(TAG, "Failed to init entity_iterator on metadata page @0x%08X", (unsigned int)page_offset);
+    return false;
+  }
+
+  bool success = true;
+  timeseries_entry_header_t e_hdr;
+
+  while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
+    // Skip already-deleted entries
+    if (e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
+      continue;
+    }
+
+    bool should_delete = false;
+
+    if (e_hdr.key_type == TIMESERIES_KEYTYPE_FIELDINDEX) {
+      // FIELDINDEX: key is a 16-byte series_id, value is 1-byte field type
+      if (e_hdr.key_len == 16 && e_hdr.value_len == 1) {
+        unsigned char key_buf[16];
+        uint8_t dummy_val = 0;
+        if (timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key_buf, &dummy_val)) {
+          for (size_t i = 0; i < series_to_delete->count; i++) {
+            if (memcmp(key_buf, series_to_delete->ids[i].bytes, 16) == 0) {
+              should_delete = true;
+              break;
+            }
+          }
+        }
+      }
+    } else if (e_hdr.key_type == TIMESERIES_KEYTYPE_FIELDLISTINDEX ||
+               e_hdr.key_type == TIMESERIES_KEYTYPE_TAGINDEX) {
+      // FIELDLISTINDEX / TAGINDEX: value is an array of 16-byte series_ids
+      if (e_hdr.value_len >= 16 && (e_hdr.value_len % 16 == 0)) {
+        unsigned char* series_ids = malloc(e_hdr.value_len);
+        if (!series_ids) {
+          ESP_LOGE(TAG, "OOM reading metadata entry value");
+          success = false;
+          break;
+        }
+        char key_buf[128];
+        if (e_hdr.key_len >= sizeof(key_buf)) { free(series_ids); continue; }
+        if (timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key_buf, series_ids)) {
+          size_t num_ids = e_hdr.value_len / 16;
+          for (size_t s = 0; s < num_ids && !should_delete; s++) {
+            for (size_t d = 0; d < series_to_delete->count; d++) {
+              if (memcmp(series_ids + s * 16, series_to_delete->ids[d].bytes, 16) == 0) {
+                should_delete = true;
+                break;
+              }
+            }
+          }
+        }
+        free(series_ids);
+      }
+    }
+
+    if (should_delete) {
+      // NOR-flash soft-delete: clear the delete_marker byte to 0x00
+      uint32_t marker_addr = page_offset + ent_iter.current_entry_offset +
+                             offsetof(timeseries_entry_header_t, delete_marker);
+      // Use tsdb_flash_write_byte for proper 4-byte-aligned read-modify-write
+      // (esp_partition_write requires 4-byte aligned size)
+      esp_err_t err = tsdb_flash_write_byte(db->partition, marker_addr,
+                                             TIMESERIES_DELETE_MARKER_DELETED);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to soft-delete metadata entry @0x%08X: %s",
+                 (unsigned int)marker_addr, esp_err_to_name(err));
+        success = false;
+      }
+    }
+  }
+
+  timeseries_entity_iterator_deinit(&ent_iter);
+  return success;
 }
 
 bool tsdb_series_delete(timeseries_db_t* db, timeseries_series_id_list_t* series_to_delete) {

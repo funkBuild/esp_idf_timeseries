@@ -44,31 +44,6 @@ bool tsdb_find_measurement_id(timeseries_db_t *db, const char *measurement_name,
 bool tsdb_create_measurement_id(timeseries_db_t *db,
                                 const char *measurement_name, uint32_t *out_id);
 
-/**
- * @brief Insert a single field (with tags) into the time-series database.
- *        This will:
- *          1) Calculate the series ID (MD5 over measurement, tags, field).
- *          2) Ensure that the field type is tracked in metadata.
- *          3) Index the tags for this series in metadata.
- *          4) Append the actual data point to a field data page.
- *
- * @param db                Pointer to the database context
- * @param measurement_id    Numeric measurement ID
- * @param measurement_name  Name of the measurement
- * @param field_name        The field key name
- * @param field_val         Pointer to the field value (numeric/string)
- * @param tag_keys          Array of tag keys
- * @param tag_values        Array of corresponding tag values
- * @param num_tags          Number of tags
- * @param timestamp_ms      The timestamp in milliseconds
- * @return true if successfully inserted, false otherwise
- */
-bool tsdb_insert_single_field(timeseries_db_t *db, uint32_t measurement_id,
-                              const char *measurement_name,
-                              const char *field_name,
-                              const timeseries_field_value_t *field_val,
-                              const char **tag_keys, const char **tag_values,
-                              size_t num_tags, uint64_t timestamp_ms);
 
 /**
  * @brief Look up the existing field type for a given 16-byte series ID.

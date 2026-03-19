@@ -1,28 +1,12 @@
 #include "alp/alp_encoder.h"
+#include "alp/alp_constants.h"
 #include "alp_ffor.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
-/*
- * Lookup tables for scaling:
- *   FACT_ARR[i] = 10^i  (used during encode: multiply by this to scale up)
- *   FRAC_ARR[i] = 10^i  (used during decode: multiply by this to scale back)
- * Both arrays are identical; they exist separately so the encode/decode sides
- * are semantically distinct and can diverge if needed.
- */
-static const double FACT_ARR[19] = {
-    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
-    1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18
-};
-
-static const double FRAC_ARR[19] = {
-    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
-    1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18
-};
-
-/* Integer divisor table: (int64_t)FACT_ARR[i] — avoids double->int64 cast in hot path */
+/* Integer divisor table: (int64_t)ALP_SCALE_FACTORS[i] — avoids double->int64 cast in hot path */
 static const int64_t FACT_INT_ARR[19] = {
     1LL, 10LL, 100LL, 1000LL, 10000LL, 100000LL, 1000000LL, 10000000LL,
     100000000LL, 1000000000LL, 10000000000LL, 100000000000LL,
@@ -34,15 +18,16 @@ static const int64_t FACT_INT_ARR[19] = {
 /* Compute the number of bits needed to represent the range [0, range] */
 static uint8_t required_bw(int64_t min_val, int64_t max_val) {
     if (max_val <= min_val) return 0;
-    uint64_t range = (uint64_t)(max_val - min_val);
+    /* Subtract in unsigned to avoid signed overflow UB. */
+    uint64_t range = (uint64_t)max_val - (uint64_t)min_val;
     return (uint8_t)(64 - __builtin_clzll(range));
 }
 
 /*
  * Fast inline encoder — precomputed scale factors, no isfinite check.
- * fact_e  = FACT_ARR[exp]
+ * fact_e  = ALP_SCALE_FACTORS[exp]
  * fac_div = FACT_INT_ARR[fac]  (integer divisor)
- * inv_scale = FRAC_ARR[fac] / FACT_ARR[exp]  (round-trip scale)
+ * inv_scale = ALP_SCALE_FACTORS[fac] / ALP_SCALE_FACTORS[exp]  (round-trip scale)
  *
  * The caller must guarantee v is finite before calling this.
  */
@@ -113,11 +98,11 @@ static void find_best_exp_fac(const double *values, size_t count,
     size_t p1_best_exceptions = sample8 + 1;
 
     for (uint8_t e = 0; e <= PHASE1_MAX_EXP && !found_perfect; e++) {
-        double   fact_e   = FACT_ARR[e];
+        double   fact_e   = ALP_SCALE_FACTORS[e];
         uint8_t  f_limit  = (e < PHASE1_MAX_FAC) ? e : PHASE1_MAX_FAC;
         for (uint8_t f = 0; f <= f_limit && !found_perfect; f++) {
             int64_t  fac_div  = FACT_INT_ARR[f];
-            double   inv_scale = FRAC_ARR[f] / fact_e;
+            double   inv_scale = ALP_SCALE_FACTORS[f] / fact_e;
             size_t   exceptions = 0;
             for (size_t i = 0; i < sample8; i++) {
                 double v = values[i * step8];
@@ -173,10 +158,10 @@ static void find_best_exp_fac(const double *values, size_t count,
         size_t abandon_at = sample128 / 4;  /* abandon after 25% of sample */
 
         for (uint8_t e = 0; e <= ALP_MAX_EXP; e++) {
-            double   fact_e   = FACT_ARR[e];
+            double   fact_e   = ALP_SCALE_FACTORS[e];
             for (uint8_t f = 0; f <= e; f++) {
                 int64_t  fac_div   = FACT_INT_ARR[f];
-                double   inv_scale = FRAC_ARR[f] / fact_e;
+                double   inv_scale = ALP_SCALE_FACTORS[f] / fact_e;
                 size_t   exceptions = 0;
                 bool     abandoned  = false;
                 for (size_t i = 0; i < sample128; i++) {
@@ -208,31 +193,7 @@ static void find_best_exp_fac(const double *values, size_t count,
     }
 
 phase3:
-    /* -----------------------------------------------------------------------
-     * Phase 3: validate the winner on 32 samples.  If it fails, fall back to
-     * (0, 0) which always works (exp=0, fac=0 means integers are exact; all
-     * others become exceptions, which is safe).
-     * -------------------------------------------------------------------- */
-    {
-        uint8_t  ve = *best_exp;
-        uint8_t  vf = *best_fac;
-        double   fact_e    = FACT_ARR[ve];
-        int64_t  fac_div   = FACT_INT_ARR[vf];
-        double   inv_scale = FRAC_ARR[vf] / fact_e;
-        size_t   exc32     = 0;
-        for (size_t i = 0; i < sample32; i++) {
-            double v = values[i * step32];
-            if (!isfinite(v) ||
-                !try_encode_fast(v, fact_e, fac_div, inv_scale, &dummy)) {
-                exc32++;
-            }
-        }
-        /* If Phase 3 shows much worse than Phase 1/2, reset to (0,0) */
-        size_t threshold = sample32 + 1; /* accept anything */
-        (void)threshold; /* Phase 3 is a sanity-gate, not a rejection filter */
-        /* Nothing to reject — the winner is already the best we found */
-        (void)exc32;
-    }
+    ; /* goto target — Phase 3 validation was dead code and has been removed */
 }
 
 /*
@@ -268,9 +229,9 @@ size_t alp_encode(const double *values, size_t count, uint8_t **out) {
     bool    *is_exc  = (bool *)calloc(count, sizeof(bool));
     if (!encoded || !is_exc) { free(encoded); free(is_exc); return 0; }
 
-    double  fact_e    = FACT_ARR[exp];
+    double  fact_e    = ALP_SCALE_FACTORS[exp];
     int64_t fac_div   = FACT_INT_ARR[fac];
-    double  inv_scale = FRAC_ARR[fac] / fact_e;
+    double  inv_scale = ALP_SCALE_FACTORS[fac] / fact_e;
 
     bool all_finite = true;
     for (size_t i = 0; i < count; i++) {
@@ -351,9 +312,14 @@ size_t alp_encode(const double *values, size_t count, uint8_t **out) {
     memset(p, 0, 3);       p += 3;
     memcpy(p, &anchor, 8); p += 8;
 
-    /* Scratch for FFOR packing (one block at a time) */
-    uint64_t *packed = (uint64_t *)malloc((ALP_BLOCK_SIZE + 1) * sizeof(uint64_t));
+    /* Scratch for FFOR packing + exception collection (reused across blocks).
+     * Single allocation: packed[129] | exc_val[128] | exc_pos[128] */
+    size_t scratch_size = (ALP_BLOCK_SIZE + 1 + ALP_BLOCK_SIZE) * sizeof(uint64_t)
+                        + ALP_BLOCK_SIZE * sizeof(uint16_t);
+    uint64_t *packed = (uint64_t *)malloc(scratch_size);
     if (!packed) { free(buf); free(encoded); free(is_exc); return 0; }
+    uint64_t *exc_val = packed + (ALP_BLOCK_SIZE + 1);
+    uint16_t *exc_pos = (uint16_t *)(exc_val + ALP_BLOCK_SIZE);
 
     /* --- Encode each block of deltas --- */
     for (size_t b = 0; b < num_blocks; b++) {
@@ -367,7 +333,6 @@ size_t alp_encode(const double *values, size_t count, uint8_t **out) {
 
         /* Find min/max of deltas in this block */
         int64_t min_val = INT64_MAX, max_val = INT64_MIN;
-#pragma GCC ivdep
         for (size_t i = 0; i < bcount; i++) {
             if (blk_deltas[i] < min_val) min_val = blk_deltas[i];
             if (blk_deltas[i] > max_val) max_val = blk_deltas[i];
@@ -382,8 +347,6 @@ size_t alp_encode(const double *values, size_t count, uint8_t **out) {
 
         /* Collect exceptions for this block */
         uint16_t exc_count = 0;
-        uint16_t exc_pos[ALP_BLOCK_SIZE];
-        uint64_t exc_val[ALP_BLOCK_SIZE];
         for (size_t i = 0; i < bcount; i++) {
             if (blk_exc[i]) {
                 exc_pos[exc_count] = (uint16_t)i;

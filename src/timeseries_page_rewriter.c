@@ -2,8 +2,9 @@
 
 #include "esp_log.h"
 #include "esp_partition.h"
-#include "timeseries_data.h"     // for tsdb_reserve_blank_region
-#include "timeseries_iterator.h" // Ensure the blank iterator definitions are available
+#include "timeseries_data.h"        // for tsdb_reserve_blank_region
+#include "timeseries_flash_utils.h" // for tsdb_round_up_4k, tsdb_safe_rewrite_page_header
+#include "timeseries_iterator.h"    // Ensure the blank iterator definitions are available
 #include "timeseries_page_cache.h"
 #include "timeseries_page_cache_snapshot.h"
 #include <inttypes.h>
@@ -11,65 +12,6 @@
 #include <string.h>
 
 static const char *TAG = "PAGE_REWRITER";
-
-/**
- * Internal helper: Round up x to the next multiple of 4K.
- */
-static uint32_t round_up_4k(uint32_t x) {
-  const uint32_t align = 4096;
-  return ((x + align - 1) / align) * align;
-}
-
-/**
- * Safely rewrite a page header with an updated page_size field.
- * See timeseries_page_stream_writer.c for full documentation.
- */
-static bool safe_rewrite_page_header(const esp_partition_t *part,
-                                     uint32_t page_offset,
-                                     timeseries_page_header_t *hdr,
-                                     uint32_t old_page_size) {
-  uint32_t new_page_size = hdr->page_size;
-
-  if ((old_page_size & new_page_size) == new_page_size) {
-    return esp_partition_write(part, page_offset, hdr, sizeof(*hdr)) == ESP_OK;
-  }
-
-  ESP_LOGW(TAG, "page_size 0x%" PRIx32 "->0x%" PRIx32 " requires sector erase @0x%" PRIx32,
-           old_page_size, new_page_size, page_offset);
-
-  uint8_t *sector_buf = malloc(4096);
-  if (!sector_buf) {
-    ESP_LOGE(TAG, "OOM allocating sector buffer for header rewrite");
-    return false;
-  }
-
-  if (esp_partition_read(part, page_offset, sector_buf, 4096) != ESP_OK) {
-    free(sector_buf);
-    return false;
-  }
-
-  memcpy(sector_buf, hdr, sizeof(*hdr));
-
-  if (esp_partition_erase_range(part, page_offset, 4096) != ESP_OK) {
-    free(sector_buf);
-    return false;
-  }
-
-  // Write the sector back -- retry on failure since data is lost if we don't
-  esp_err_t err = ESP_FAIL;
-  for (int retry = 0; retry < 3; retry++) {
-    err = esp_partition_write(part, page_offset, sector_buf, 4096);
-    if (err == ESP_OK) {
-      break;
-    }
-    ESP_LOGE(TAG, "Failed rewriting sector after erase (attempt %d/3)", retry + 1);
-  }
-  free(sector_buf);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "CRITICAL: sector data lost after erase @0x%" PRIx32, page_offset);
-  }
-  return err == ESP_OK;
-}
 
 /**
  * Internal helper: Write a new page header placeholder at base_offset.
@@ -82,7 +24,7 @@ static bool write_initial_page_header(timeseries_page_rewriter_t *rewriter) {
   hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
   hdr.sequence_num = ++(rewriter->db->sequence_num);
   hdr.field_data_level = rewriter->level;
-  // The page_size will be updated upon finalization.
+  hdr.page_size = rewriter->capacity;
   if (esp_partition_write(rewriter->db->partition, rewriter->base_offset, &hdr,
                           sizeof(hdr)) != ESP_OK) {
     ESP_LOGE(TAG, "Failed writing initial page header at 0x%08X",
@@ -107,7 +49,7 @@ bool timeseries_page_rewriter_start(timeseries_db_t *db, uint8_t level,
   rewriter->finalized = false;
 
   // Calculate the initial size rounded up to 4K.
-  uint32_t initial_size = round_up_4k(prev_data_size);
+  uint32_t initial_size = tsdb_round_up_4k(prev_data_size);
 
   // Reserve a blank region (mutex-protected, registers placeholder in snapshots)
   uint32_t region_ofs = 0, region_size = 0;
@@ -124,6 +66,7 @@ bool timeseries_page_rewriter_start(timeseries_db_t *db, uint8_t level,
 
   // Write the placeholder page header.
   if (!write_initial_page_header(rewriter)) {
+    timeseries_page_rewriter_abort(rewriter);
     return false;
   }
 
@@ -191,12 +134,11 @@ bool timeseries_page_rewriter_finalize(timeseries_page_rewriter_t *rewriter) {
   if (!rewriter || rewriter->finalized) {
     return false;
   }
-  rewriter->finalized = true;
 
   // Determine the number of bytes used.
   uint32_t used_bytes = rewriter->write_ptr - rewriter->base_offset;
   // Round up to next 4K.
-  uint32_t final_size = round_up_4k(used_bytes);
+  uint32_t final_size = tsdb_round_up_4k(used_bytes);
 
   // Read the existing page header.
   timeseries_page_header_t hdr;
@@ -210,7 +152,7 @@ bool timeseries_page_rewriter_finalize(timeseries_page_rewriter_t *rewriter) {
   // Update the header with the final page size (NOR-flash-safe rewrite).
   uint32_t old_page_size = hdr.page_size;
   hdr.page_size = final_size;
-  if (!safe_rewrite_page_header(rewriter->db->partition, rewriter->base_offset, &hdr, old_page_size)) {
+  if (!tsdb_safe_rewrite_page_header(rewriter->db->partition, rewriter->base_offset, &hdr, old_page_size)) {
     ESP_LOGE(TAG, "Failed patching final page header at 0x%08X",
              (unsigned int)rewriter->base_offset);
     return false;
@@ -220,11 +162,19 @@ bool timeseries_page_rewriter_finalize(timeseries_page_rewriter_t *rewriter) {
            (unsigned int)rewriter->base_offset, (unsigned int)final_size);
   // Add the new page to the page cache.
   if (rewriter->batch_snapshot) {
-    tsdb_pagecache_batch_add(rewriter->batch_snapshot, rewriter->base_offset, &hdr);
+    if (!tsdb_pagecache_batch_add(rewriter->batch_snapshot, rewriter->base_offset, &hdr)) {
+      ESP_LOGE(TAG, "OOM updating batch cache in rewriter finalize");
+      return false;
+    }
     tsdb_pagecache_batch_sort(rewriter->batch_snapshot);
   } else {
-    tsdb_pagecache_add_entry(rewriter->db, rewriter->base_offset, &hdr);
+    if (!tsdb_pagecache_add_entry(rewriter->db, rewriter->base_offset, &hdr)) {
+      ESP_LOGE(TAG, "OOM updating page cache in rewriter finalize @0x%08X",
+               (unsigned int)rewriter->base_offset);
+      return false;
+    }
   }
+  rewriter->finalized = true;
   return true;
 }
 

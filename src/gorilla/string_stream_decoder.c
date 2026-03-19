@@ -15,6 +15,12 @@ static const char *TAG = "STRING_DECODER";
 #define STRING_DECODER_IN_CHUNK_SIZE 128
 
 /**
+ * Maximum allowed string length decoded from the stream.
+ * Protects against corrupted length prefixes requesting up to 4GB of memory.
+ */
+#define TSDB_STRING_MAX_LEN 65536
+
+/**
  * Internal structure for our decoder:
  *   - We store the zlib `z_stream` for inflating data.
  *   - We store the user-supplied fill callback for reading compressed bytes.
@@ -54,15 +60,14 @@ StringStreamDecoder *string_stream_decoder_create(FillCallback fill_cb,
 
   /* Initialize zlib for inflate. windowBits must be >= the encoder's
    * windowBits. The encoder uses windowBits=9 (512-byte window) to
-   * minimize RAM. We use 9 here to match, saving ~31KB vs windowBits=15.
-   * Note: data compressed with a larger window (e.g. old data from when
-   * the encoder used windowBits=15) cannot be decoded with windowBits=9.
+   * minimize RAM. We use 15 here so the decoder can inflate streams
+   * compressed with any windowBits <= 15 (including old data).
    */
   dec->zstrm.zalloc = Z_NULL;
   dec->zstrm.zfree = Z_NULL;
   dec->zstrm.opaque = Z_NULL;
 
-  int ret = inflateInit2(&dec->zstrm, 9);
+  int ret = inflateInit2(&dec->zstrm, 15);
   if (ret != Z_OK) {
     free(dec);
     return NULL;
@@ -238,6 +243,12 @@ bool string_stream_decoder_get_value(StringStreamDecoder *dec,
     return true;
   }
 
+  if (length > TSDB_STRING_MAX_LEN) {
+    ESP_LOGE(TAG, "String length %u exceeds maximum %u (corrupt data?)",
+             (unsigned int)length, (unsigned int)TSDB_STRING_MAX_LEN);
+    return false;
+  }
+
   /* Allocate a buffer to hold the string data. */
   uint8_t *buf = (uint8_t *)malloc(length);
   if (!buf) {
@@ -273,6 +284,12 @@ bool string_stream_decoder_skip_value(StringStreamDecoder *dec) {
   uint32_t length = from_little_endian_u32(prefix);
   if (length == 0) {
     return true;
+  }
+
+  if (length > TSDB_STRING_MAX_LEN) {
+    ESP_LOGE(TAG, "String length %u exceeds maximum %u (corrupt data?)",
+             (unsigned int)length, (unsigned int)TSDB_STRING_MAX_LEN);
+    return false;
   }
 
   /* Inflate into a stack buffer and discard — no malloc needed */

@@ -494,3 +494,172 @@ TEST_CASE("compact_sync_basic", "[concurrency]") {
     ESP_LOGI(TAG, "compact_sync_basic: query returned %zu points", result.num_points);
     timeseries_query_free_result(&result);
 }
+
+// ============================================================================
+// TEST: Concurrent inserts from multiple tasks to the same measurement
+// ============================================================================
+
+#define CONCURRENT_INSERT_NUM_TASKS   3
+#define CONCURRENT_INSERT_POINTS_PER  50
+
+typedef struct {
+    int task_id;
+    const char *field_name;
+    uint64_t start_ts;
+    SemaphoreHandle_t start_sem;
+    _Atomic bool success;
+    TaskHandle_t notify_task;
+} concurrent_insert_params_t;
+
+static void concurrent_insert_task(void *param) {
+    concurrent_insert_params_t *p = (concurrent_insert_params_t *)param;
+
+    // Wait for the go signal so all tasks begin simultaneously
+    xSemaphoreTake(p->start_sem, portMAX_DELAY);
+
+    timeseries_field_value_t *values =
+        calloc(CONCURRENT_INSERT_POINTS_PER, sizeof(timeseries_field_value_t));
+    uint64_t *timestamps =
+        calloc(CONCURRENT_INSERT_POINTS_PER, sizeof(uint64_t));
+
+    if (!values || !timestamps) {
+        free(values);
+        free(timestamps);
+        atomic_store(&p->success, false);
+        xTaskNotifyGive(p->notify_task);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    for (int i = 0; i < CONCURRENT_INSERT_POINTS_PER; i++) {
+        timestamps[i] = p->start_ts + (uint64_t)i;
+        values[i].type = TIMESERIES_FIELD_TYPE_FLOAT;
+        values[i].data.float_val = (double)(p->task_id * 1000 + i) * 0.1;
+    }
+
+    const char *field_names[] = {p->field_name};
+    timeseries_insert_data_t data = {
+        .measurement_name = "concurrent_meas",
+        .tag_keys = NULL,
+        .tag_values = NULL,
+        .num_tags = 0,
+        .field_names = field_names,
+        .field_values = values,
+        .num_fields = 1,
+        .timestamps_ms = timestamps,
+        .num_points = CONCURRENT_INSERT_POINTS_PER,
+    };
+
+    bool ok = timeseries_insert(&data);
+    atomic_store(&p->success, ok);
+
+    free(values);
+    free(timestamps);
+
+    ESP_LOGI(TAG, "concurrent_insert task %d finished: %s",
+             p->task_id, ok ? "OK" : "FAIL");
+
+    xTaskNotifyGive(p->notify_task);
+    vTaskDelete(NULL);
+}
+
+TEST_CASE("concurrent_multi_task_insert", "[concurrency][insert]") {
+    ensure_db_initialized();
+
+    // Counting semaphore: tasks take, main gives N times to release all at once
+    SemaphoreHandle_t start_sem = xSemaphoreCreateCounting(
+        CONCURRENT_INSERT_NUM_TASKS, 0);
+    TEST_ASSERT_NOT_NULL(start_sem);
+
+    const char *field_names[CONCURRENT_INSERT_NUM_TASKS] = {
+        "field_t0", "field_t1", "field_t2"
+    };
+    uint64_t start_timestamps[CONCURRENT_INSERT_NUM_TASKS] = {
+        1000, 2000, 3000
+    };
+
+    concurrent_insert_params_t params[CONCURRENT_INSERT_NUM_TASKS];
+    for (int i = 0; i < CONCURRENT_INSERT_NUM_TASKS; i++) {
+        params[i].task_id = i;
+        params[i].field_name = field_names[i];
+        params[i].start_ts = start_timestamps[i];
+        params[i].start_sem = start_sem;
+        atomic_store(&params[i].success, false);
+        params[i].notify_task = xTaskGetCurrentTaskHandle();
+    }
+
+    // Create all tasks (they block on the semaphore)
+    for (int i = 0; i < CONCURRENT_INSERT_NUM_TASKS; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "ins_t%d", i);
+        BaseType_t ret = xTaskCreate(concurrent_insert_task, name, 8192,
+                                      &params[i], tskIDLE_PRIORITY + 1, NULL);
+        TEST_ASSERT_EQUAL(pdPASS, ret);
+    }
+
+    // Small delay to let all tasks reach the semaphore wait
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Release all tasks simultaneously
+    for (int i = 0; i < CONCURRENT_INSERT_NUM_TASKS; i++) {
+        xSemaphoreGive(start_sem);
+    }
+
+    // Wait for all tasks to complete
+    for (int i = 0; i < CONCURRENT_INSERT_NUM_TASKS; i++) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10000));
+    }
+
+    // Verify all tasks succeeded
+    for (int i = 0; i < CONCURRENT_INSERT_NUM_TASKS; i++) {
+        TEST_ASSERT_TRUE_MESSAGE(
+            atomic_load(&params[i].success),
+            "Insert task reported failure");
+    }
+
+    // Query each field separately and verify 50 points each
+    for (int i = 0; i < CONCURRENT_INSERT_NUM_TASKS; i++) {
+        const char *qfield[] = {field_names[i]};
+        timeseries_query_t query = {
+            .measurement_name = "concurrent_meas",
+            .field_names = qfield,
+            .num_fields = 1,
+            .start_ms = 0,
+            .end_ms = 0,
+            .limit = 0,
+        };
+        timeseries_query_result_t result = {0};
+        TEST_ASSERT_TRUE(timeseries_query(&query, &result));
+
+        ESP_LOGI(TAG, "Field %s: %zu points, %zu columns",
+                 field_names[i], result.num_points, result.num_columns);
+        TEST_ASSERT_EQUAL(CONCURRENT_INSERT_POINTS_PER, result.num_points);
+        TEST_ASSERT_EQUAL(1, result.num_columns);
+
+        timeseries_query_free_result(&result);
+    }
+
+    // Query all fields and verify total of 150 points
+    timeseries_query_t all_query = {
+        .measurement_name = "concurrent_meas",
+        .start_ms = 0,
+        .end_ms = 0,
+        .limit = 0,
+    };
+    timeseries_query_result_t all_result = {0};
+    TEST_ASSERT_TRUE(timeseries_query(&all_query, &all_result));
+
+    ESP_LOGI(TAG, "All fields: %zu points, %zu columns",
+             all_result.num_points, all_result.num_columns);
+    TEST_ASSERT_EQUAL(CONCURRENT_INSERT_NUM_TASKS * CONCURRENT_INSERT_POINTS_PER,
+                      all_result.num_points);
+    TEST_ASSERT_EQUAL(CONCURRENT_INSERT_NUM_TASKS, all_result.num_columns);
+
+    timeseries_query_free_result(&all_result);
+    vSemaphoreDelete(start_sem);
+
+    ESP_LOGI(TAG, "concurrent_multi_task_insert: all %d tasks inserted %d "
+             "points each, total %d verified",
+             CONCURRENT_INSERT_NUM_TASKS, CONCURRENT_INSERT_POINTS_PER,
+             CONCURRENT_INSERT_NUM_TASKS * CONCURRENT_INSERT_POINTS_PER);
+}

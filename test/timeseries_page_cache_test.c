@@ -90,15 +90,15 @@ TEST_CASE("page_cache: add entry with NULL db", "[page_cache][null]") {
         .sequence_num = 1,
         .field_data_level = 0
     };
-    // Should not crash
-    tsdb_pagecache_add_entry(NULL, 0x10000, &hdr);
+    // Should not crash, should return false
+    TEST_ASSERT_FALSE(tsdb_pagecache_add_entry(NULL, 0x10000, &hdr));
     TEST_PASS();
 }
 
 TEST_CASE("page_cache: add entry with NULL header", "[page_cache][null]") {
     setup_database();
-    // Should not crash
-    tsdb_pagecache_add_entry(db, 0x10000, NULL);
+    // Should not crash, should return false
+    TEST_ASSERT_FALSE(tsdb_pagecache_add_entry(db, 0x10000, NULL));
     teardown_database();
     TEST_PASS();
 }

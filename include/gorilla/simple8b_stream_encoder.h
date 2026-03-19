@@ -5,12 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/**
- * @brief Flush callback type.
- * The callback should write out `len` bytes from `data` using the user‐supplied
- * context.
- */
-typedef bool (*FlushCallback)(const uint8_t *data, size_t len, void *context);
+#include "gorilla/gorilla_stream_types.h"
 
 /**
  * @brief Streaming Simple8b encoder.

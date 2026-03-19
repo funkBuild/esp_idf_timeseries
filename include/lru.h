@@ -54,7 +54,7 @@ void lru_list_init(lru_list_t* lst);
 /* Insert `n` at the MRU end.  Caller guarantees `n` is detached. */
 void lru_link_front(lru_list_t* lst, lru_node_t* n);
 
-/* Detach `n` from whichever list it is on; no‑op if already detached. */
+/* Detach `n` from `lst`.  Caller must ensure `n` is in `lst`. */
 void lru_unlink(lru_list_t* lst, lru_node_t* n);
 
 /* Promote `n` to MRU if it is already in `lst`. */

@@ -66,15 +66,19 @@ static bool read_word(Simple8bStreamDecoder *decoder, uint64_t *word) {
     return true;
   }
   uint8_t buffer[8];
-  size_t filled = 0;
-  if (!decoder->decoder.fill_cb(decoder->decoder.fill_ctx, buffer,
-                                sizeof(buffer), &filled)) {
-    ESP_LOGE(TAG, "Failed to fill buffer");
-    return false;
-  }
-  if (filled < sizeof(buffer)) {
-    ESP_LOGE(TAG, "Failed to read full word");
-    return false;
+  size_t got = 0;
+  while (got < sizeof(buffer)) {
+    size_t filled = 0;
+    if (!decoder->decoder.fill_cb(decoder->decoder.fill_ctx, buffer + got,
+                                  sizeof(buffer) - got, &filled)) {
+      ESP_LOGE(TAG, "Failed to fill buffer");
+      return false;
+    }
+    if (filled == 0) {
+      ESP_LOGE(TAG, "Fill callback returned zero bytes");
+      return false;
+    }
+    got += filled;
   }
   memcpy(word, buffer, sizeof(buffer));
   return true;

@@ -4,7 +4,8 @@
 #include "esp_log.h"
 #include "esp_partition.h"
 
-#include "timeseries_compaction.h" // timeseries_compact_page_list() signature
+#include "timeseries_compaction.h"  // timeseries_compact_page_list() signature
+#include "timeseries_flash_utils.h" // tsdb_flash_write_byte()
 #include "timeseries_data.h"       // TSDB_FIELDDATA_FLAG_DELETED, etc.
 #include "timeseries_internal.h"   // timeseries_page_cache_iterator_t
 #include "timeseries_iterator.h"   // timeseries_fielddata_iterator_t
@@ -35,6 +36,7 @@ typedef struct {
   uint32_t page_offset;   // Base offset of the page in the partition
   uint32_t record_offset; // Offset from the start of the page to the record
   uint32_t record_length; // Size of this record, in bytes
+  unsigned char series_id[16]; // Series ID for TOCTOU validation in mark phase
 } tsdb_oldest_fd_entry_t;
 
 /**
@@ -58,7 +60,8 @@ static void mark_entries_deleted(timeseries_db_t *db,
                                  const tsdb_oldest_fd_entry_t *entries,
                                  size_t count, uint32_t bytes_to_free,
                                  tsdb_modified_pages_list_t *modified_out);
-static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs);
+static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs,
+                                const tsdb_oldest_fd_entry_t *expected);
 
 static void modified_pages_list_init(tsdb_modified_pages_list_t *list);
 static void modified_pages_list_add(tsdb_modified_pages_list_t *list,
@@ -135,58 +138,68 @@ bool timeseries_expiration_run(timeseries_db_t *db, float usage_threshold,
            "Target: freeing at least %u bytes (reduction_threshold=%.2f%%).",
            (unsigned int)bytes_to_free, reduction_threshold * 100.0f);
 
-  // 3) Hold flash_write_mutex across gather+mark to prevent TOCTOU:
-  //    gathered record offsets must remain valid until marking completes.
-  if (db->flash_write_mutex) {
-    xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+  // 3) Gather the 25 oldest (non-deleted) field-data entries by `start_time`.
+  //    This only reads flash and iterates over a ref-counted page cache
+  //    snapshot, so no mutex is needed — inserts are not blocked.
+  tsdb_oldest_fd_entry_t *top25 = calloc(25, sizeof(tsdb_oldest_fd_entry_t));
+  if (!top25) {
+    ESP_LOGE(TAG, "OOM allocating expiration candidates");
+    return false;
   }
-
-  // Gather the 25 oldest (non-deleted) field-data entries by `start_time`
-  tsdb_oldest_fd_entry_t top25[25]; // static array for max-25
-  memset(top25, 0, sizeof(top25));
   size_t found_count = 0;
 
   if (!gather_25_oldest_fielddata(db, top25, &found_count)) {
     ESP_LOGE(TAG, "Failed scanning DB to find oldest field-data entries.");
-    if (db->flash_write_mutex) {
-      xSemaphoreGive(db->flash_write_mutex);
-    }
+    free(top25);
     return false;
   }
   if (found_count == 0) {
     ESP_LOGI(TAG, "No active field-data records => nothing to expire.");
-    if (db->flash_write_mutex) {
-      xSemaphoreGive(db->flash_write_mutex);
-    }
+    free(top25);
     return true;
   }
 
   ESP_LOGI(TAG, "Found %zu oldest field-data record(s).", found_count);
 
-  // 4) Mark them as deleted, oldest-first, until we've freed enough space
+  // 4) Mark them as deleted, oldest-first, until we've freed enough space.
+  //    Acquire flash_write_mutex only for the mark phase (flash writes).
   tsdb_modified_pages_list_t modified;
   modified_pages_list_init(&modified);
 
+  if (db->flash_write_mutex) {
+    xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+  }
   mark_entries_deleted(db, top25, found_count, bytes_to_free, &modified);
-
   if (db->flash_write_mutex) {
     xSemaphoreGive(db->flash_write_mutex);
   }
 
-  // 5) If any pages got modified, run a page-list compaction
+  // 5) If any pages got modified, run a page-list compaction.
+  //    Use CAS to atomically claim the compaction slot, preventing races
+  //    with background compaction starting between the check and the call.
   if (modified.used > 0) {
-    ESP_LOGI(TAG, "Compacting %zu modified pages...", modified.used);
-    if (!timeseries_compact_page_list(db, modified.pages, modified.used)) {
-      ESP_LOGE(TAG, "timeseries_compact_page_list failed");
-      modified_pages_list_free(&modified);
-      return false;
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&db->compaction_in_progress, &expected, true)) {
+      ESP_LOGW(TAG, "Compaction already in progress, skipping compact_page_list for %zu modified pages",
+               modified.used);
+    } else {
+      ESP_LOGI(TAG, "Compacting %zu modified pages...", modified.used);
+      bool compact_ok = timeseries_compact_page_list(db, modified.pages, modified.used);
+      atomic_store(&db->compaction_in_progress, false);
+      if (!compact_ok) {
+        ESP_LOGE(TAG, "timeseries_compact_page_list failed");
+        modified_pages_list_free(&modified);
+        free(top25);
+        return false;
+      }
+      ESP_LOGI(TAG, "Compaction of modified pages complete.");
     }
-    ESP_LOGI(TAG, "Compaction of modified pages complete.");
   } else {
     ESP_LOGI(TAG, "No pages were modified => no compaction needed.");
   }
 
   modified_pages_list_free(&modified);
+  free(top25);
   return true;
 }
 
@@ -354,6 +367,7 @@ static bool gather_25_oldest_fielddata(timeseries_db_t *db,
         candidate.record_offset = f_iter.current_record_offset;
         // Make sure your actual field name matches what's in your header:
         candidate.record_length = fd_hdr.record_length;
+        memcpy(candidate.series_id, fd_hdr.series_id, 16);
 
         // Insert into the max-heap
         heap_insert_max25(heap_25, out_count, &candidate);
@@ -408,7 +422,7 @@ static void mark_entries_deleted(timeseries_db_t *db,
       break;
     }
     uint32_t record_hdr_abs = sorted[i].page_offset + sorted[i].record_offset;
-    if (!mark_record_deleted(db, record_hdr_abs)) {
+    if (!mark_record_deleted(db, record_hdr_abs, &sorted[i])) {
       ESP_LOGW(TAG, "Failed marking record as deleted @0x%08" PRIx32,
                record_hdr_abs);
       continue;
@@ -438,7 +452,8 @@ static void mark_entries_deleted(timeseries_db_t *db,
  *
  * @return true on success, false on error
  */
-static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs) {
+static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs,
+                                const tsdb_oldest_fd_entry_t *expected) {
   timeseries_field_data_header_t fd_hdr;
   esp_err_t err = esp_partition_read(db->partition, record_hdr_abs, &fd_hdr,
                                      sizeof(fd_hdr));
@@ -446,6 +461,20 @@ static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs) {
     ESP_LOGE(TAG, "Failed reading record header @0x%08" PRIx32 " (err=0x%x)",
              record_hdr_abs, err);
     return false;
+  }
+
+  // TOCTOU validation: verify the record still matches what was gathered
+  // (the gather phase ran without flash_write_mutex, so the record could
+  // have been modified by a concurrent insert or compaction).
+  if (expected) {
+    if (memcmp(fd_hdr.series_id, expected->series_id, 16) != 0 ||
+        fd_hdr.start_time != expected->start_time) {
+      ESP_LOGW(TAG,
+               "TOCTOU: record @0x%08" PRIx32
+               " changed since gather phase (series_id or start_time mismatch), skipping",
+               record_hdr_abs);
+      return false;
+    }
   }
 
   // Check if it's already cleared
@@ -457,10 +486,10 @@ static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs) {
   // Clear the bit
   fd_hdr.flags &= ~(TSDB_FIELDDATA_FLAG_DELETED);
 
-  err = esp_partition_write(db->partition,
-                            record_hdr_abs +
-                                offsetof(timeseries_field_data_header_t, flags),
-                            &fd_hdr.flags, sizeof(fd_hdr.flags));
+  err = tsdb_flash_write_byte(db->partition,
+                              record_hdr_abs +
+                                  offsetof(timeseries_field_data_header_t, flags),
+                              fd_hdr.flags);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed clearing DELETED bit @0x%08" PRIx32 " (err=0x%x)",
              record_hdr_abs, err);

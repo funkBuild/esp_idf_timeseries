@@ -228,7 +228,7 @@ bool timeseries_query(const timeseries_query_t* query, timeseries_query_result_t
 
 void timeseries_query_free_result(timeseries_query_result_t* result);
 
-bool timeseries_clear_all();
+bool timeseries_clear_all(void);
 
 /**
  * @brief Set the chunk size for large inserts

@@ -38,7 +38,7 @@ static _Atomic bool s_init_in_progress = false;
 
 // Compaction task: loops while work remains, then self-deletes.
 // Using a loop instead of re-triggering via tsdb_launch_compaction avoids
-// creating a new task (12 KiB stack) before the current task's stack is freed
+// creating a new task (4 KiB stack) before the current task's stack is freed
 // by the IDLE task, which caused progressive heap exhaustion.
 static _Atomic uint32_t s_compaction_consecutive_failures = 0;
 #define COMPACTION_MAX_CONSECUTIVE_FAILURES 3
@@ -70,7 +70,11 @@ static void tsdb_compaction_oneshot_task(void *param) {
         ESP_LOGI(TAG, "Re-running compaction: %" PRIu32 " L0 pages accumulated", l0_count);
     }
 
-    db->compaction_task_handle = NULL;
+    UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "Compaction task stack high water mark: %u bytes free", (unsigned int)(hwm * sizeof(StackType_t)));
+
+    atomic_store(&db->compaction_task_handle, (TaskHandle_t)NULL);
+    xSemaphoreGive(db->compaction_done_sem);
     atomic_store(&db->compaction_in_progress, false);
     vTaskDelete(NULL);
 }
@@ -80,14 +84,16 @@ bool tsdb_launch_compaction(timeseries_db_t *db) {
     if (!atomic_compare_exchange_strong(&db->compaction_in_progress, &expected, true)) {
         return false;  // already running
     }
+    TaskHandle_t handle = NULL;
     BaseType_t ret = xTaskCreate(tsdb_compaction_oneshot_task, "tsdb_compact",
-                                  12288, db, tskIDLE_PRIORITY + 1,
-                                  &db->compaction_task_handle);
+                                  TSDB_COMPACTION_TASK_STACK_SIZE, db, tskIDLE_PRIORITY + 1,
+                                  &handle);
     if (ret != pdPASS) {
         ESP_LOGW(TAG, "Failed to create compaction task");
         atomic_store(&db->compaction_in_progress, false);
         return false;
     }
+    atomic_store(&db->compaction_task_handle, handle);
     return true;
 }
 
@@ -197,9 +203,14 @@ bool timeseries_init(void) {
   // Initialize on-demand compaction state
   atomic_store(&s_tsdb.compaction_in_progress, false);
   atomic_store(&s_tsdb.compaction_generation, 0);
-  s_tsdb.compaction_task_handle = NULL;
+  atomic_store(&s_tsdb.compaction_task_handle, (TaskHandle_t)NULL);
+  s_tsdb.compaction_done_sem = xSemaphoreCreateBinary();
+  if (!s_tsdb.compaction_done_sem) {
+    ESP_LOGE(TAG, "Failed to create compaction_done semaphore");
+    goto init_fail;
+  }
 
-  s_tsdb.initialized = true;
+  atomic_store(&s_tsdb.initialized, true);
   atomic_store(&s_init_in_progress, false);
 
   ESP_LOGI(TAG, "Timeseries DB initialized successfully.");
@@ -207,21 +218,40 @@ bool timeseries_init(void) {
 
 init_fail:
   // Clean up any resources allocated during partial init
+  if (s_tsdb.write_buffer) {
+    free(s_tsdb.write_buffer);
+    s_tsdb.write_buffer = NULL;
+    s_tsdb.write_buffer_capacity = 0;
+  }
+  if (s_tsdb.meas_cache) {
+    free(s_tsdb.meas_cache);
+    s_tsdb.meas_cache = NULL;
+  }
+  if (s_tsdb.type_cache) {
+    free(s_tsdb.type_cache);
+    s_tsdb.type_cache = NULL;
+    s_tsdb.type_cache_size = 0;
+  }
+  tsdb_cache_free(&s_tsdb);
   if (s_tsdb.current_snapshot) {
     tsdb_snapshot_release(s_tsdb.current_snapshot);
     s_tsdb.current_snapshot = NULL;
   }
-  if (s_tsdb.snapshot_mutex) {
-    vSemaphoreDelete(s_tsdb.snapshot_mutex);
-    s_tsdb.snapshot_mutex = NULL;
+  if (s_tsdb.compaction_done_sem) {
+    vSemaphoreDelete(s_tsdb.compaction_done_sem);
+    s_tsdb.compaction_done_sem = NULL;
+  }
+  if (s_tsdb.region_alloc_mutex) {
+    vSemaphoreDelete(s_tsdb.region_alloc_mutex);
+    s_tsdb.region_alloc_mutex = NULL;
   }
   if (s_tsdb.flash_write_mutex) {
     vSemaphoreDelete(s_tsdb.flash_write_mutex);
     s_tsdb.flash_write_mutex = NULL;
   }
-  if (s_tsdb.region_alloc_mutex) {
-    vSemaphoreDelete(s_tsdb.region_alloc_mutex);
-    s_tsdb.region_alloc_mutex = NULL;
+  if (s_tsdb.snapshot_mutex) {
+    vSemaphoreDelete(s_tsdb.snapshot_mutex);
+    s_tsdb.snapshot_mutex = NULL;
   }
   s_tsdb.partition = NULL;
   atomic_store(&s_init_in_progress, false);
@@ -248,9 +278,19 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
 
   uint64_t start_time = esp_timer_get_time();
 
-  // 1) Find or create measurement ID (LRU cache avoids per-insert flash scan)
+  // 1) Find or create measurement ID.
+  //    The meas_cache (and meas_cache_next round-robin index) is shared across
+  //    concurrent insert tasks, so all access is serialized under flash_write_mutex
+  //    to prevent torn reads/writes.  On a cache hit the mutex is held only for
+  //    the brief 16-entry scan; on a miss the mutex is already needed for the
+  //    flash lookup / create that follows.
   uint32_t measurement_id = 0;
   bool meas_cached = false;
+
+  if (s_tsdb.flash_write_mutex) {
+    xSemaphoreTake(s_tsdb.flash_write_mutex, portMAX_DELAY);
+  }
+
   if (s_tsdb.meas_cache) {
     for (int mc = 0; mc < MEAS_ID_CACHE_SIZE; mc++) {
       if (s_tsdb.meas_cache[mc].valid &&
@@ -263,20 +303,11 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
   }
   if (!meas_cached) {
     if (!tsdb_find_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
-      if (s_tsdb.flash_write_mutex) {
-        xSemaphoreTake(s_tsdb.flash_write_mutex, portMAX_DELAY);
-      }
-      // Double-check after acquiring mutex (another task may have created it)
-      if (!tsdb_find_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
-        if (!tsdb_create_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
-          if (s_tsdb.flash_write_mutex) {
-            xSemaphoreGive(s_tsdb.flash_write_mutex);
-          }
-          return false;
+      if (!tsdb_create_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
+        if (s_tsdb.flash_write_mutex) {
+          xSemaphoreGive(s_tsdb.flash_write_mutex);
         }
-      }
-      if (s_tsdb.flash_write_mutex) {
-        xSemaphoreGive(s_tsdb.flash_write_mutex);
+        return false;
       }
     }
     // Cache the result (round-robin eviction)
@@ -289,6 +320,10 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
       s_tsdb.meas_cache[slot].valid = true;
       s_tsdb.meas_cache_next = (slot + 1) % MEAS_ID_CACHE_SIZE;
     }
+  }
+
+  if (s_tsdb.flash_write_mutex) {
+    xSemaphoreGive(s_tsdb.flash_write_mutex);
   }
 
   // Log if this is a large insert
@@ -492,11 +527,23 @@ void timeseries_deinit(void) {
     return;
   }
 
-  // Wait for any in-progress compaction to finish
-  int wait_ms = 30000;
-  while (atomic_load(&s_tsdb.compaction_in_progress) && wait_ms > 0) {
-    vTaskDelay(pdMS_TO_TICKS(10));
-    wait_ms -= 10;
+  // Mark as not initialized FIRST to prevent new inserts and compaction launches
+  atomic_store(&s_tsdb.initialized, false);
+
+  // Wait for any in-progress compaction task to fully exit
+  if (atomic_load(&s_tsdb.compaction_in_progress)) {
+    ESP_LOGI(TAG, "Waiting for compaction task to finish...");
+    if (xSemaphoreTake(s_tsdb.compaction_done_sem, pdMS_TO_TICKS(30000)) != pdTRUE) {
+      ESP_LOGW(TAG, "Timed out waiting for compaction task to finish");
+    }
+  }
+  // Prevent any new compaction from being launched during cleanup
+  atomic_store(&s_tsdb.compaction_in_progress, true);
+
+  // Delete compaction semaphore
+  if (s_tsdb.compaction_done_sem) {
+    vSemaphoreDelete(s_tsdb.compaction_done_sem);
+    s_tsdb.compaction_done_sem = NULL;
   }
 
   // Delete synchronization primitives
@@ -540,7 +587,10 @@ void timeseries_deinit(void) {
     s_tsdb.type_cache_size = 0;
   }
 
-  s_tsdb.initialized = false;
+  tsdb_cache_free(&s_tsdb);
+
+  atomic_store(&s_compaction_consecutive_failures, 0);
+  atomic_store(&s_tsdb.compaction_in_progress, false);
   ESP_LOGI(TAG, "Timeseries DB deinitialized.");
 }
 
@@ -562,6 +612,9 @@ bool timeseries_expire(void) {
 }
 
 bool timeseries_query(const timeseries_query_t* query, timeseries_query_result_t* result) {
+  if (!s_tsdb.initialized) {
+    return false;
+  }
   return timeseries_query_execute(&s_tsdb, query, result);
 }
 
@@ -613,7 +666,7 @@ void timeseries_query_free_result(timeseries_query_result_t* result) {
   result->num_columns = 0;
 }
 
-bool timeseries_clear_all() {
+bool timeseries_clear_all(void) {
   if (!s_tsdb.initialized) {
     ESP_LOGE(TAG, "Timeseries DB not initialized yet.");
     return false;
@@ -622,8 +675,13 @@ bool timeseries_clear_all() {
   // Wait for any in-progress compaction to finish before erasing
   if (atomic_load(&s_tsdb.compaction_in_progress)) {
     ESP_LOGI(TAG, "Waiting for in-progress compaction before clear_all...");
-    while (atomic_load(&s_tsdb.compaction_in_progress)) {
+    int timeout_ms = 60000;
+    while (atomic_load(&s_tsdb.compaction_in_progress) && timeout_ms > 0) {
       vTaskDelay(pdMS_TO_TICKS(10));
+      timeout_ms -= 10;
+    }
+    if (timeout_ms <= 0) {
+      ESP_LOGW(TAG, "Timed out waiting for compaction to finish; proceeding with clear_all");
     }
   }
 
@@ -819,7 +877,12 @@ bool timeseries_delete_measurement(const char* measurement_name) {
   if (!s_tsdb.initialized || !measurement_name) {
     return false;
   }
-  // Invalidate measurement ID cache entry if deleting a cached measurement
+  // Hold flash_write_mutex for the entire delete operation to prevent
+  // concurrent inserts from writing to flash while we soft-delete records.
+  if (s_tsdb.flash_write_mutex) {
+    xSemaphoreTake(s_tsdb.flash_write_mutex, portMAX_DELAY);
+  }
+  // Invalidate measurement ID cache entry
   if (s_tsdb.meas_cache) {
     for (int mc = 0; mc < MEAS_ID_CACHE_SIZE; mc++) {
       if (s_tsdb.meas_cache[mc].valid &&
@@ -829,14 +892,49 @@ bool timeseries_delete_measurement(const char* measurement_name) {
       }
     }
   }
-  return timeseries_delete_by_measurement(&s_tsdb, measurement_name);
+  bool result = timeseries_delete_by_measurement(&s_tsdb, measurement_name);
+  if (result) {
+    // Invalidate all caches that may reference the deleted measurement's data
+    tsdb_cache_clear(&s_tsdb);        // Series ID cache
+    tsdb_clear_type_cache(&s_tsdb);   // Series type cache
+    s_tsdb.cached_metadata_valid = false;  // Metadata page offset cache
+  }
+  if (s_tsdb.flash_write_mutex) {
+    xSemaphoreGive(s_tsdb.flash_write_mutex);
+  }
+  return result;
 }
 
 bool timeseries_delete_measurement_and_field(const char* measurement_name, const char* field_name) {
   if (!s_tsdb.initialized || !measurement_name || !field_name) {
     return false;
   }
-  return timeseries_delete_by_measurement_and_field(&s_tsdb, measurement_name, field_name);
+  // Hold flash_write_mutex for the entire delete operation to prevent
+  // concurrent inserts from writing to flash while we soft-delete records.
+  if (s_tsdb.flash_write_mutex) {
+    xSemaphoreTake(s_tsdb.flash_write_mutex, portMAX_DELAY);
+  }
+  bool result = timeseries_delete_by_measurement_and_field(&s_tsdb, measurement_name, field_name);
+  if (result) {
+    // Invalidate all caches that may reference the deleted field's data
+    tsdb_cache_clear(&s_tsdb);        // Series ID cache
+    tsdb_clear_type_cache(&s_tsdb);   // Series type cache
+    s_tsdb.cached_metadata_valid = false;  // Metadata page offset cache
+    // Invalidate measurement ID cache for this measurement
+    if (s_tsdb.meas_cache) {
+      for (int mc = 0; mc < MEAS_ID_CACHE_SIZE; mc++) {
+        if (s_tsdb.meas_cache[mc].valid &&
+            strcmp(measurement_name, s_tsdb.meas_cache[mc].name) == 0) {
+          s_tsdb.meas_cache[mc].valid = false;
+          break;
+        }
+      }
+    }
+  }
+  if (s_tsdb.flash_write_mutex) {
+    xSemaphoreGive(s_tsdb.flash_write_mutex);
+  }
+  return result;
 }
 
 bool timeseries_get_timestamp_range(const char *measurement_name,

@@ -10,12 +10,8 @@ typedef struct {
   uint32_t val_len; // number of bytes in compressed values
 } timeseries_col_data_header_t;
 
-bool tsdb_append_field_data(timeseries_db_t *db,
-                            const unsigned char series_id[16],
-                            uint64_t timestamp_ms,
-                            const timeseries_field_value_t *field_val);
+_Static_assert(sizeof(timeseries_col_data_header_t) == 8, "unexpected padding in col_data_header");
 
-bool tsdb_create_level1_field_page(timeseries_db_t *db, uint32_t *out_offset);
 bool tsdb_append_multiple_points(timeseries_db_t *db,
                                  const unsigned char series_id[16],
                                  const uint64_t *timestamps,

@@ -50,8 +50,3 @@ bool bitreader_refill(BitReader *br) {
 bool bitreader_ensure(BitReader *br, int nbits) {
   return br_fill_window(br, nbits);
 }
-
-bool bitreader_peek(BitReader *br, int nbits, uint64_t *out) {
-  BitReader copy = *br;
-  return bitreader_read(&copy, nbits, out);
-}

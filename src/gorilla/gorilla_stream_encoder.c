@@ -11,7 +11,7 @@
 
 #include "esp_log.h"
 
-const char *TAG = "GorillaStreamEncoder";
+static const char *TAG = "GorillaStreamEncoder";
 
 /*
  * The original flush callback type (from gorilla_stream_flush_cb)

@@ -7,13 +7,6 @@
 #include <stdint.h>
 
 /**
- * @brief Flush callback type.
- * The callback writes out `len` bytes from `data` using the user-supplied
- * context.
- */
-typedef bool (*FlushCallback)(const uint8_t *data, size_t len, void *context);
-
-/**
  * @brief IntegerStreamEncoder implements a streaming encoder for 64-bit
  * integers. It uses a Simple8bStreamEncoder to accumulate encoded values,
  * flushing every 64 bytes. The first value is stored as-is, the second as a

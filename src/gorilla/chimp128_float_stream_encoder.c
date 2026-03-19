@@ -2,11 +2,14 @@
 
 #include "gorilla/bit_writer.h"
 #include "gorilla/float_stream_common.h"
-#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+// Integer log2 for power-of-2 values. Avoids FP rounding issues with
+// log()/log(2).
+static inline int ilog2(int v) { return 31 - __builtin_clz(v); }
 
 // Use the standard NAN from math.h for the sentinel.
 #ifndef NAN
@@ -63,6 +66,10 @@ Chimp128FloatEncoder *chimp128_float_encoder_create(FlushCallback flush_cb,
   if (!flush_cb || previous_values <= 0)
     return NULL;
 
+  // previous_values must be a power of 2 for CHIMP128 to work correctly.
+  if (previous_values == 0 || (previous_values & (previous_values - 1)) != 0)
+    return NULL;
+
   Chimp128FloatEncoder *enc = malloc(sizeof(Chimp128FloatEncoder));
   if (!enc)
     return NULL;
@@ -78,7 +85,7 @@ Chimp128FloatEncoder *chimp128_float_encoder_create(FlushCallback flush_cb,
     free(enc);
     return NULL;
   }
-  enc->previous_values_log2 = (int)(log(previous_values) / log(2));
+  enc->previous_values_log2 = ilog2(previous_values);
   enc->threshold = 6 + enc->previous_values_log2;
   enc->set_lsb = (1 << (enc->threshold + 1)) - 1;
   int indices_size = 1 << (enc->threshold + 1);

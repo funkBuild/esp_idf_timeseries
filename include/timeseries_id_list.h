@@ -70,6 +70,7 @@ tsdb_series_id_list_reserve_one(timeseries_series_id_list_t *list) {
 static inline bool
 tsdb_series_id_list_append(timeseries_series_id_list_t *list,
                            const unsigned char series_id[16]) {
+  if (!series_id) return false;
   if (!tsdb_series_id_list_reserve_one(list)) {
     return false;
   }

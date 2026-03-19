@@ -1,3 +1,4 @@
+// NOTE: This module is currently only used by tests and may be removed in a future cleanup.
 #ifndef TIMESERIES_COMPRESSION_H
 #define TIMESERIES_COMPRESSION_H
 
@@ -28,9 +29,7 @@ bool timeseries_compression_compress(const uint8_t *in_data, size_t in_size,
 /**
  * @brief Decompress data using zlib.
  *
- * The default implementation below assumes the first 4 bytes of the
- * compressed block store the uncompressed size (as a 32-bit value).
- * Then the rest of `in_data` is the actual zlib-compressed bytes.
+ * The input data is raw zlib-compressed bytes with no size prefix.
  *
  * @param in_data    Pointer to compressed data buffer
  * @param in_size    Size of the compressed data buffer

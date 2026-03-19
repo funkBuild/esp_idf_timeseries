@@ -29,7 +29,11 @@ static char* dup_n(const char* s, size_t n) {
 #endif
 }
 
-static esp_err_t push(const char*** arr, size_t* len, const char* s) {
+#define TSDB_PARSER_MAX_FIELDS 64
+#define TSDB_PARSER_MAX_TAGS   32
+
+static esp_err_t push(const char*** arr, size_t* len, size_t max_len, const char* s) {
+  if (*len >= max_len) return ESP_ERR_INVALID_ARG;
   const char** tmp = realloc(*arr, (*len + 1) * sizeof(char*));
   if (!tmp) return ESP_ERR_NO_MEM;
   tmp[*len] = s;
@@ -38,15 +42,29 @@ static esp_err_t push(const char*** arr, size_t* len, const char* s) {
   return ESP_OK;
 }
 
+/* local: map method string to aggregation enum */
+static timeseries_aggregation_method_e parse_agg_method(const char* s, size_t len) {
+  if (len == 3 && strncasecmp(s, "avg", 3) == 0) return TSDB_AGGREGATION_AVG;
+  if (len == 4 && strncasecmp(s, "mean", 4) == 0) return TSDB_AGGREGATION_AVG;
+  if (len == 3 && strncasecmp(s, "sum", 3) == 0) return TSDB_AGGREGATION_SUM;
+  if (len == 3 && strncasecmp(s, "min", 3) == 0) return TSDB_AGGREGATION_MIN;
+  if (len == 3 && strncasecmp(s, "max", 3) == 0) return TSDB_AGGREGATION_MAX;
+  if (len == 5 && strncasecmp(s, "count", 5) == 0) return TSDB_AGGREGATION_COUNT;
+  if (len == 4 && strncasecmp(s, "last", 4) == 0) return TSDB_AGGREGATION_LAST;
+  return TSDB_AGGREGATION_NONE;
+}
+
 /* public API ------------------------------------------------------------ */
 esp_err_t tsdb_query_string_parse(const char* q, timeseries_query_t* out) {
+  if (!q || !out) return ESP_ERR_INVALID_ARG;
   memset(out, 0, sizeof(*out));
   esp_err_t err = ESP_OK;
   const char* p = q;
 
-  /* 1) aggregation method (skip) */
+  /* 1) aggregation method */
   const char* colon = strchr(p, ':');
   ENSURE(colon && colon != p);
+  out->aggregate_method = parse_agg_method(p, (size_t)(colon - p));
   p = colon + 1;
 
   /* 2) measurement name */
@@ -71,8 +89,8 @@ esp_err_t tsdb_query_string_parse(const char* q, timeseries_query_t* out) {
       if (e > s) {
         char* token = dup_n(s, (size_t)(e - s));
         ENSURE(token);
-        err = push(&out->field_names, &out->num_fields, token);
-        if (err) goto fail;
+        err = push(&out->field_names, &out->num_fields, TSDB_PARSER_MAX_FIELDS, token);
+        if (err) { free(token); goto fail; }
       }
       if (!comma) break;
       s = comma + 1;
@@ -107,15 +125,36 @@ esp_err_t tsdb_query_string_parse(const char* q, timeseries_query_t* out) {
 
       char* key = dup_n(k1, (size_t)(k2 - k1));
       char* val = dup_n(v1, (size_t)(v2 - v1));
-      ENSURE(key && val);
+      if (!key || !val) {
+        free(key);
+        free(val);
+        err = ESP_ERR_INVALID_ARG;
+        goto fail;
+      }
 
       /* grow both arrays to size num_tags+1, then store the pair */
+      if (out->num_tags >= TSDB_PARSER_MAX_TAGS) {
+        free(key);
+        free(val);
+        err = ESP_ERR_INVALID_ARG;
+        goto fail;
+      }
       const char** new_keys = realloc(out->tag_keys, (out->num_tags + 1) * sizeof(char*));
-      ENSURE(new_keys);
+      if (!new_keys) {
+        free(key);
+        free(val);
+        err = ESP_ERR_NO_MEM;
+        goto fail;
+      }
       out->tag_keys = new_keys;
 
       const char** new_vals = realloc(out->tag_values, (out->num_tags + 1) * sizeof(char*));
-      ENSURE(new_vals);
+      if (!new_vals) {
+        free(key);
+        free(val);
+        err = ESP_ERR_NO_MEM;
+        goto fail;
+      }
       out->tag_values = new_vals;
 
       out->tag_keys[out->num_tags] = key;

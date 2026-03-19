@@ -50,7 +50,7 @@ static size_t count_valid_cache_entries(timeseries_db_t *db) {
     size_t count = 0;
     if (db && db->series_cache) {
         for (size_t i = 0; i < SERIES_ID_CACHE_SIZE; i++) {
-            if (db->series_cache[i].valid) {
+            if (db->series_cache[i].state == TSDB_CACHE_VALID) {
                 count++;
             }
         }
@@ -71,7 +71,7 @@ static series_id_cache_entry_t* find_cache_entry(timeseries_db_t *db, const char
     truncated_key[sizeof(truncated_key) - 1] = '\0';
 
     for (size_t i = 0; i < SERIES_ID_CACHE_SIZE; i++) {
-        if (db->series_cache[i].valid && strcmp(db->series_cache[i].key, truncated_key) == 0) {
+        if (db->series_cache[i].state == TSDB_CACHE_VALID && strcmp(db->series_cache[i].key, truncated_key) == 0) {
             return &db->series_cache[i];
         }
     }
@@ -110,7 +110,7 @@ TEST_CASE("cache initialization allocates memory correctly", "[cache][init]") {
 
     // Verify all entries are initialized as invalid
     for (size_t i = 0; i < SERIES_ID_CACHE_SIZE; i++) {
-        TEST_ASSERT_FALSE(db->series_cache[i].valid);
+        TEST_ASSERT_EQUAL(TSDB_CACHE_EMPTY, db->series_cache[i].state);
         TEST_ASSERT_EQUAL(0, db->series_cache[i].last_access);
     }
 }

@@ -48,7 +48,11 @@ bool tsdb_build_page_cache(timeseries_db_t *db) {
   timeseries_page_header_t hdr;
   uint32_t offset = 0, size = 0;
   while (timeseries_page_iterator_next(&flash_iter, &hdr, &offset, &size)) {
-    tsdb_pagecache_batch_add(snap, offset, &hdr);
+    if (!tsdb_pagecache_batch_add(snap, offset, &hdr)) {
+      ESP_LOGE(TAG, "OOM building page cache at offset 0x%08" PRIx32, offset);
+      tsdb_snapshot_release(snap);
+      return false;
+    }
   }
 
   // Sort the entries by ascending offset
@@ -89,10 +93,10 @@ static bool snapshot_refresh_clone(tsdb_page_cache_snapshot_t *clone,
  * Thread-safe for concurrent readers and writers.
  * Reuses clone buffer on retry to reduce allocation overhead.
  */
-void tsdb_pagecache_add_entry(timeseries_db_t *db, uint32_t offset,
+bool tsdb_pagecache_add_entry(timeseries_db_t *db, uint32_t offset,
                               const timeseries_page_header_t *hdr) {
   if (!db || !hdr) {
-    return;
+    return false;
   }
 
   tsdb_page_cache_snapshot_t *clone = NULL;
@@ -105,7 +109,7 @@ void tsdb_pagecache_add_entry(timeseries_db_t *db, uint32_t offset,
       if (!clone) {
         tsdb_snapshot_release(old);
         ESP_LOGE(TAG, "OOM cloning snapshot for add_entry");
-        return;
+        return false;
       }
     } else {
       // Reuse existing clone buffer — refresh from new current snapshot
@@ -113,16 +117,21 @@ void tsdb_pagecache_add_entry(timeseries_db_t *db, uint32_t offset,
         tsdb_snapshot_release(old);
         tsdb_snapshot_release(clone);
         ESP_LOGE(TAG, "OOM refreshing clone for add_entry retry");
-        return;
+        return false;
       }
     }
 
-    tsdb_pagecache_batch_add(clone, offset, hdr);
+    if (!tsdb_pagecache_batch_add(clone, offset, hdr)) {
+      tsdb_snapshot_release(old);
+      tsdb_snapshot_release(clone);
+      ESP_LOGE(TAG, "OOM in add_entry batch_add");
+      return false;
+    }
     tsdb_pagecache_batch_sort(clone);
 
     if (tsdb_snapshot_compare_and_swap(db, old, clone)) {
       tsdb_snapshot_release(old);
-      return;  // Success — clone is now the live snapshot
+      return true;  // Success — clone is now the live snapshot
     }
     // CAS failed — retry with reused clone
     tsdb_snapshot_release(old);
@@ -132,14 +141,25 @@ void tsdb_pagecache_add_entry(timeseries_db_t *db, uint32_t offset,
   // Fallback: force swap
   tsdb_page_cache_snapshot_t *old = tsdb_snapshot_acquire_current(db);
   if (old && clone) {
-    snapshot_refresh_clone(clone, old);
+    if (!snapshot_refresh_clone(clone, old)) {
+      tsdb_snapshot_release(old);
+      tsdb_snapshot_release(clone);
+      ESP_LOGE(TAG, "OOM refreshing clone for add_entry fallback");
+      return false;
+    }
     tsdb_snapshot_release(old);
-    tsdb_pagecache_batch_add(clone, offset, hdr);
+    if (!tsdb_pagecache_batch_add(clone, offset, hdr)) {
+      tsdb_snapshot_release(clone);
+      ESP_LOGE(TAG, "OOM in add_entry fallback batch_add");
+      return false;
+    }
     tsdb_pagecache_batch_sort(clone);
     tsdb_snapshot_swap(db, clone);
+    return true;
   } else {
     if (old) tsdb_snapshot_release(old);
     if (clone) tsdb_snapshot_release(clone);
+    return false;
   }
 }
 
@@ -201,7 +221,12 @@ bool tsdb_pagecache_remove_entry(timeseries_db_t *db, uint32_t offset) {
     return false;
   }
   if (clone) {
-    snapshot_refresh_clone(clone, old);
+    if (!snapshot_refresh_clone(clone, old)) {
+      tsdb_snapshot_release(old);
+      tsdb_snapshot_release(clone);
+      ESP_LOGE(TAG, "OOM refreshing clone for remove_entry fallback");
+      return false;
+    }
     tsdb_snapshot_release(old);
     bool found = tsdb_pagecache_batch_remove(clone, offset);
     if (found) {
@@ -288,17 +313,17 @@ tsdb_page_cache_snapshot_t *tsdb_pagecache_begin_batch(timeseries_db_t *db) {
   return batch;
 }
 
-void tsdb_pagecache_batch_add(tsdb_page_cache_snapshot_t *snap, uint32_t offset,
+bool tsdb_pagecache_batch_add(tsdb_page_cache_snapshot_t *snap, uint32_t offset,
                               const timeseries_page_header_t *hdr) {
   if (!snap || !hdr) {
-    return;
+    return false;
   }
 
   // Check if an entry at this offset already exists -- update it in place
   for (size_t i = 0; i < snap->count; i++) {
     if (snap->entries[i].offset == offset) {
       memcpy(&snap->entries[i].header, hdr, sizeof(timeseries_page_header_t));
-      return;  // Updated existing entry
+      return true;  // Updated existing entry
     }
   }
 
@@ -309,7 +334,7 @@ void tsdb_pagecache_batch_add(tsdb_page_cache_snapshot_t *snap, uint32_t offset,
         realloc(snap->entries, newcap * sizeof(*newarr));
     if (!newarr) {
       ESP_LOGE(TAG, "OOM expanding batch snapshot");
-      return;
+      return false;
     }
     snap->entries = newarr;
     snap->capacity = newcap;
@@ -318,6 +343,7 @@ void tsdb_pagecache_batch_add(tsdb_page_cache_snapshot_t *snap, uint32_t offset,
   timeseries_cached_page_t *entry = &snap->entries[snap->count++];
   entry->offset = offset;
   memcpy(&entry->header, hdr, sizeof(timeseries_page_header_t));
+  return true;
 }
 
 bool tsdb_pagecache_batch_remove(tsdb_page_cache_snapshot_t *snap, uint32_t offset) {
@@ -385,18 +411,21 @@ void tsdb_pagecache_commit_batch(timeseries_db_t *db, tsdb_page_cache_snapshot_t
   timeseries_cached_page_t *saved_entries = NULL;
   if (batch_base_count > 0) {
     saved_entries = malloc(batch_base_count * sizeof(timeseries_cached_page_t));
-    if (saved_entries) {
-      memcpy(saved_entries, batch->entries, batch_base_count * sizeof(timeseries_cached_page_t));
+    if (!saved_entries) {
+      // Cannot safely retry CAS without backup — force-swap immediately
+      ESP_LOGW(TAG, "OOM saving batch state, skipping CAS merge — forcing swap");
+      tsdb_pagecache_batch_sort(batch);
+      tsdb_snapshot_swap(db, batch);
+      return;
     }
+    memcpy(saved_entries, batch->entries, batch_base_count * sizeof(timeseries_cached_page_t));
   }
 
   for (int attempt = 0; attempt < 10; attempt++) {
     // Restore batch to its base state on retry
     if (attempt > 0) {
       batch->count = batch_base_count;
-      if (saved_entries) {
-        memcpy(batch->entries, saved_entries, batch_base_count * sizeof(timeseries_cached_page_t));
-      }
+      memcpy(batch->entries, saved_entries, batch_base_count * sizeof(timeseries_cached_page_t));
     }
 
     // Acquire the current live snapshot
@@ -436,7 +465,15 @@ void tsdb_pagecache_commit_batch(timeseries_db_t *db, tsdb_page_cache_snapshot_t
 
       if (!already_in_batch) {
         // This entry was added by another thread during the batch -- merge it in
-        tsdb_pagecache_batch_add(batch, live_offset, &live->entries[i].header);
+        if (!tsdb_pagecache_batch_add(batch, live_offset, &live->entries[i].header)) {
+          ESP_LOGE(TAG, "OOM merging live entry in commit_batch, forcing swap with partial merge");
+          tsdb_snapshot_release(live);
+          free(saved_entries);
+          // Force-swap the batch as-is rather than leaking it
+          tsdb_pagecache_batch_sort(batch);
+          tsdb_snapshot_swap(db, batch);
+          return;
+        }
       }
     }
 
@@ -454,7 +491,48 @@ void tsdb_pagecache_commit_batch(timeseries_db_t *db, tsdb_page_cache_snapshot_t
   }
 
   ESP_LOGE(TAG, "commit_batch CAS failed after max retries, forcing swap");
-  // Fallback: force swap
+
+  // Final merge with live snapshot before force-swap to avoid dropping
+  // entries added by concurrent inserts since the last retry.
+  batch->count = batch_base_count;
+  if (saved_entries) {
+    memcpy(batch->entries, saved_entries, batch_base_count * sizeof(timeseries_cached_page_t));
+  }
+
+  tsdb_page_cache_snapshot_t *live = tsdb_snapshot_acquire_current(db);
+  if (live) {
+    for (size_t i = 0; i < live->count; i++) {
+      uint32_t live_offset = live->entries[i].offset;
+
+      bool was_removed = false;
+      for (size_t r = 0; r < batch->removed_count; r++) {
+        if (batch->removed_offsets[r] == live_offset) {
+          was_removed = true;
+          break;
+        }
+      }
+      if (was_removed) {
+        continue;
+      }
+
+      bool already_in_batch = false;
+      for (size_t j = 0; j < batch->count; j++) {
+        if (batch->entries[j].offset == live_offset) {
+          already_in_batch = true;
+          break;
+        }
+      }
+
+      if (!already_in_batch) {
+        if (!tsdb_pagecache_batch_add(batch, live_offset, &live->entries[i].header)) {
+          ESP_LOGE(TAG, "OOM merging live entry in force-swap fallback");
+          break;
+        }
+      }
+    }
+    tsdb_snapshot_release(live);
+  }
+
   tsdb_pagecache_batch_sort(batch);
   tsdb_snapshot_swap(db, batch);
   free(saved_entries);

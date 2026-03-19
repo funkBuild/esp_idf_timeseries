@@ -2,12 +2,15 @@
 
 #include "gorilla/bit_reader.h"
 #include "gorilla/float_stream_common.h"
-#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Integer log2 for power-of-2 values. Avoids FP rounding issues with
+// log()/log(2).
+static inline int ilog2(int v) { return 31 - __builtin_clz(v); }
 
 // Sentinel value (NaN) used by CHIMP.
 #define NAN_LONG 0x7ff8000000000000ULL
@@ -50,6 +53,11 @@ Chimp128FloatDecoder *chimp128_float_decoder_create(FillCallback fill_cb,
                                                     int previous_values) {
   if (!fill_cb || previous_values <= 0)
     return NULL;
+
+  // previous_values must be a power of 2 for CHIMP128 to work correctly.
+  if (previous_values == 0 || (previous_values & (previous_values - 1)) != 0)
+    return NULL;
+
   Chimp128FloatDecoder *dec = malloc(sizeof(Chimp128FloatDecoder));
   if (!dec)
     return NULL;
@@ -65,13 +73,13 @@ Chimp128FloatDecoder *chimp128_float_decoder_create(FillCallback fill_cb,
   dec->stored_trailing_zeros = 0;
 
   dec->previous_values = previous_values;
-  dec->stored_values = malloc(previous_values * sizeof(uint64_t));
+  dec->stored_values = calloc(previous_values, sizeof(uint64_t));
   if (!dec->stored_values) {
     free(dec);
     return NULL;
   }
   // Compute floor(log2(previous_values)).
-  dec->previous_values_log2 = (int)(log(previous_values) / log(2));
+  dec->previous_values_log2 = ilog2(previous_values);
   dec->initial_fill = dec->previous_values_log2 + 9;
   dec->current = 0;
   return dec;
@@ -159,11 +167,15 @@ static bool chimp128_next_value(Chimp128FloatDecoder *dec) {
     dec->stored_leading_zeros = leadingRepresentation[lz_index];
     fill -= 6;
     int significant_bits = (int)((temp >> fill) & ((1 << 6) - 1));
+    if (index_val < 0 || index_val >= dec->previous_values)
+      return false;
     dec->stored_value = dec->stored_values[index_val];
     if (significant_bits == 0)
       significant_bits = 64;
     dec->stored_trailing_zeros =
         64 - significant_bits - dec->stored_leading_zeros;
+    if (dec->stored_trailing_zeros < 0)
+      return false;
     int bits_to_read =
         64 - dec->stored_leading_zeros - dec->stored_trailing_zeros;
     uint64_t value_bits = 0;

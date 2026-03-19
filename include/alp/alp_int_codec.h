@@ -20,7 +20,7 @@ extern "C" {
  * Compression is loss-less. Every value round-trips exactly.
  *
  * Stream format:
- *   [16 bytes] stream header: magic(4) | count(4) | nblocks(2) | tail(2) | pad(8)
+ *   [20 bytes] stream header: magic(4) | count(4) | nblocks(2) | tail(2) | anchor(8)
  *   For each block:
  *     [8 bytes] bh0: bw(8) | pad(24) | block_count(16) | pad(16)
  *     [8 bytes] bh1: for_base (int64, little-endian)

@@ -88,6 +88,17 @@ bool timeseries_page_stream_writer_end_series(
 bool timeseries_page_stream_writer_finalize(
     timeseries_page_stream_writer_t *writer);
 
+/**
+ * Abort the stream writer, cleaning up any in-progress state.
+ *
+ * Marks the partially-written page as OBSOLETE on flash so it will not
+ * be re-scanned on reboot, and removes it from the page cache (or batch).
+ * Must be called instead of finalize() when the write sequence fails
+ * partway through.
+ */
+void timeseries_page_stream_writer_abort(
+    timeseries_page_stream_writer_t *writer);
+
 bool timeseries_page_stream_writer_finalize_timestamp(
     timeseries_page_stream_writer_t *writer);
 

@@ -69,6 +69,11 @@ static bool multi_iter_advance_sub(timeseries_multi_points_iterator_t* multi, si
 
   if (!timeseries_points_iterator_next_value(sub->sub_iter, &val)) {
     sub->valid = false;
+    // Free any owned string before abandoning this sub-iterator
+    if (sub->current_val.type == TIMESERIES_FIELD_TYPE_STRING) {
+      free(sub->current_val.data.string_val.str);
+      sub->current_val.data.string_val.str = NULL;
+    }
     return false;
   }
 

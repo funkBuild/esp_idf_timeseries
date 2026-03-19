@@ -38,3 +38,14 @@ typedef enum {
   GORILLA_STREAM_BOOL,
   GORILLA_STREAM_STRING,
 } gorilla_stream_type_t;
+
+/**
+ * @brief Callback signature for flushing encoded data from a stream encoder.
+ *
+ * @param data  Pointer to the data to flush.
+ * @param len   Number of bytes to flush.
+ * @param ctx   Opaque user-supplied context.
+ *
+ * @return true on success, false on failure.
+ */
+typedef bool (*FlushCallback)(const uint8_t *data, size_t len, void *ctx);

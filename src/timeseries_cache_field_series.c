@@ -37,6 +37,12 @@ bool tsdb_fieldseries_cache_insert(ts_cache_t* cache, uint32_t measurement_id, c
                                    const timeseries_series_id_list_t* list) {
   if (!cache || !field_name || !list) return false;
 
+  /* empty list: remove any stale entry rather than inserting a NULL blob */
+  if (list->count == 0) {
+    ts_cache_remove(cache, K_FIELD_LIST, field_name, measurement_id);
+    return true;
+  }
+
   uint8_t* blob;
   size_t sz;
   if (!pack_ids(list, &blob, &sz)) return false;

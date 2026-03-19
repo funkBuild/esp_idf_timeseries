@@ -1,31 +1,23 @@
 #include "alp/alp_stream_decoder.h"
 #include "alp/alp_encoder.h"
 #include "alp/alp_int_codec.h"
+#include "alp/alp_constants.h"
 #include "alp_ffor.h"
 
+#include <stdlib.h>
 #include <string.h>
-
-/* Scaling tables — same values as in alp_decoder.c / alp_encoder.c */
-static const double FACT_ARR[19] = {
-    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
-    1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18
-};
-static const double FRAC_ARR[19] = {
-    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
-    1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18
-};
 
 /*
  * Scratch buffer for FFOR unpack + exception handling.
  * Reuses packed_data space for exc_values (same as alp_decoder.c).
  */
 #define SCRATCH_INT_SZ   (ALP_STREAM_BLOCK_SIZE * sizeof(int64_t))  /* 1024 */
-#define SCRATCH_PACK_SZ  (ALP_STREAM_BLOCK_SIZE * sizeof(uint64_t)) /* 1024 */
+#define SCRATCH_PACK_SZ  ((ALP_STREAM_BLOCK_SIZE + 1) * sizeof(uint64_t)) /* 1032 */
 #define SCRATCH_POS_SZ   (ALP_STREAM_BLOCK_SIZE * sizeof(uint16_t)) /*  256 */
 #define SCRATCH_TOTAL    (SCRATCH_INT_SZ + SCRATCH_PACK_SZ + SCRATCH_POS_SZ)
 
 /* ------------------------------------------------------------------ */
-/* Float ALP: decode one block into dec->block.floats                 */
+/* Float ALP: decode one block into dec->block_buf (as double[])      */
 /* ------------------------------------------------------------------ */
 static bool decode_next_float_block(alp_stream_decoder_t *dec) {
     if (dec->blocks_decoded >= dec->num_blocks)
@@ -43,6 +35,7 @@ static bool decode_next_float_block(alp_stream_decoder_t *dec) {
     uint8_t  exp             = (uint8_t) (bh0        & 0xFF);
     uint8_t  fac             = (uint8_t) ((bh0 >>  8) & 0xFF);
     uint8_t  bw              = (uint8_t) ((bh0 >> 16) & 0xFF);
+    if (bw > 64) return false;
     uint16_t exception_count = (uint16_t)((bh0 >> 32) & 0xFFFF);
     uint16_t block_count     = (uint16_t)((bh0 >> 48) & 0xFFFF);
 
@@ -51,9 +44,12 @@ static bool decode_next_float_block(alp_stream_decoder_t *dec) {
 
     if (block_count == 0 || block_count > ALP_STREAM_BLOCK_SIZE)
         return false;
+    if (exception_count > block_count)
+        return false;
 
-    /* Stack scratch (2304 bytes) */
-    uint8_t scratch[SCRATCH_TOTAL] __attribute__((aligned(8)));
+    /* Heap scratch cached in struct (2304 bytes, allocated once in init) */
+    uint8_t *scratch = dec->scratch;
+    if (!scratch) return false;
     int64_t  *decoded_ints  = (int64_t  *)(scratch);
     uint64_t *packed_data   = (uint64_t *)(scratch + SCRATCH_INT_SZ);
     uint16_t *exc_positions = (uint16_t *)(scratch + SCRATCH_INT_SZ + SCRATCH_PACK_SZ);
@@ -61,7 +57,7 @@ static bool decode_next_float_block(alp_stream_decoder_t *dec) {
 
     /* FFOR-packed data */
     size_t packed_words = alp_ffor_packed_words(block_count, bw);
-    if (p + packed_words * 8 > end) return false;
+    if (packed_words * 8 > (size_t)(end - p)) return false;
     memcpy(packed_data, p, packed_words * 8);
     p += packed_words * 8;
 
@@ -76,7 +72,7 @@ static bool decode_next_float_block(alp_stream_decoder_t *dec) {
     /* Exception data */
     if (exception_count > 0) {
         size_t pos_words = ((size_t)exception_count * 2 + 7) / 8;
-        if (p + pos_words * 8 > end) return false;
+        if (pos_words * 8 > (size_t)(end - p)) return false;
 
         for (uint16_t i = 0; i < exception_count; i++) {
             size_t word_idx = i / 4;
@@ -87,7 +83,7 @@ static bool decode_next_float_block(alp_stream_decoder_t *dec) {
         }
         p += pos_words * 8;
 
-        if (p + (size_t)exception_count * 8 > end) return false;
+        if ((size_t)exception_count * 8 > (size_t)(end - p)) return false;
         memcpy(exc_values, p, (size_t)exception_count * 8);
         p += (size_t)exception_count * 8;
     }
@@ -95,19 +91,20 @@ static bool decode_next_float_block(alp_stream_decoder_t *dec) {
     /* Reconstruct doubles */
     if (exp > 18) exp = 18;
     if (fac > 18) fac = 18;
-    double scale = FRAC_ARR[fac] / FACT_ARR[exp];
+    double scale = ALP_SCALE_FACTORS[fac] / ALP_SCALE_FACTORS[exp];
+    double *out_f64 = (double *)dec->block_buf;
 
     if (exception_count == 0) {
         for (size_t i = 0; i < block_count; i++)
-            dec->block.floats[i] = (double)decoded_ints[i] * scale;
+            out_f64[i] = (double)decoded_ints[i] * scale;
     } else {
         uint16_t exc_idx = 0;
         for (size_t i = 0; i < block_count; i++) {
             if (exc_idx < exception_count && exc_positions[exc_idx] == (uint16_t)i) {
-                memcpy(&dec->block.floats[i], &exc_values[exc_idx], 8);
+                memcpy(&out_f64[i], &exc_values[exc_idx], 8);
                 exc_idx++;
             } else {
-                dec->block.floats[i] = (double)decoded_ints[i] * scale;
+                out_f64[i] = (double)decoded_ints[i] * scale;
             }
         }
     }
@@ -120,7 +117,7 @@ static bool decode_next_float_block(alp_stream_decoder_t *dec) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Int ALP: decode one block into dec->block.ints                     */
+/* Int ALP: decode one block into dec->block_buf (as int64_t[])       */
 /* ------------------------------------------------------------------ */
 static bool decode_next_int_block(alp_stream_decoder_t *dec) {
     if (dec->blocks_decoded >= dec->num_blocks)
@@ -136,6 +133,7 @@ static bool decode_next_int_block(alp_stream_decoder_t *dec) {
     uint64_t bh1; memcpy(&bh1, p, 8); p += 8;
 
     uint8_t  bw          = (uint8_t)(bh0 & 0xFF);
+    if (bw > 64) return false;
     uint16_t block_count = (uint16_t)((bh0 >> 32) & 0xFFFF);
 
     int64_t for_base;
@@ -144,19 +142,27 @@ static bool decode_next_int_block(alp_stream_decoder_t *dec) {
     if (block_count == 0 || block_count > ALP_STREAM_BLOCK_SIZE)
         return false;
 
-    /* FFOR-packed data — unpack directly into block.ints */
+    /* FFOR-packed data — copy into aligned scratch before unpacking.
+     * The stream pointer p may not be 8-byte aligned (20-byte stream header
+     * + 16-byte block headers), and alp_ffor_unpack dereferences uint64_t*. */
     size_t packed_words = alp_ffor_packed_words(block_count, bw);
-    if (p + packed_words * 8 > end) return false;
+    if (packed_words * 8 > (size_t)(end - p)) return false;
 
-    alp_ffor_unpack((const uint64_t *)p, block_count,
-                    for_base, bw, dec->block.ints);
+    int64_t *out_i64 = (int64_t *)dec->block_buf;
+    if (packed_words > 0) {
+        uint64_t *aligned = (uint64_t *)dec->scratch;
+        memcpy(aligned, p, packed_words * 8);
+        alp_ffor_unpack(aligned, block_count, for_base, bw, out_i64);
+    } else {
+        alp_ffor_unpack((const uint64_t *)p, block_count, for_base, bw, out_i64);
+    }
     p += packed_words * 8;
 
     /* Delta decode with running carry (prefix-sum) */
-    dec->block.ints[0] += dec->running;
+    out_i64[0] += dec->running;
     for (size_t i = 1; i < block_count; i++)
-        dec->block.ints[i] += dec->block.ints[i - 1];
-    dec->running = dec->block.ints[block_count - 1];
+        out_i64[i] += out_i64[i - 1];
+    dec->running = out_i64[block_count - 1];
 
     dec->block_count = block_count;
     dec->block_offset = 0;
@@ -206,8 +212,9 @@ bool alp_stream_decoder_init(alp_stream_decoder_t *dec,
 
         dec->running = anchor;
     } else {
-        /* ALP int stream header: 16 bytes */
-        if (len < 16) return false;
+        /* ALP int stream header: 20 bytes
+         * magic(4) + total_values(4) + num_blocks(2) + tail(2) + anchor(8) */
+        if (len < 20) return false;
 
         uint32_t magic;
         memcpy(&magic, p, 4); p += 4;
@@ -231,7 +238,31 @@ bool alp_stream_decoder_init(alp_stream_decoder_t *dec,
     dec->blocks_decoded = 0;
     dec->block_count = 0;
     dec->block_offset = 0;
+
+    /* Allocate block buffer for decoded values (both float and int paths) */
+    dec->block_buf = malloc(ALP_STREAM_BLOCK_SIZE * sizeof(double));
+    if (!dec->block_buf) return false;
+
+    /* Allocate scratch buffer for FFOR decode.
+     * Float path needs full SCRATCH_TOTAL (decoded_ints + packed_data + exc_positions).
+     * Int path needs only packed_data region for alignment copy before FFOR unpack. */
+    size_t scratch_sz = is_float ? SCRATCH_TOTAL : SCRATCH_PACK_SZ;
+    dec->scratch = (uint8_t *)malloc(scratch_sz);
+    if (!dec->scratch) {
+        free(dec->block_buf);
+        dec->block_buf = NULL;
+        return false;
+    }
+
     return true;
+}
+
+void alp_stream_decoder_deinit(alp_stream_decoder_t *dec) {
+    if (!dec) return;
+    free(dec->block_buf);
+    dec->block_buf = NULL;
+    free(dec->scratch);
+    dec->scratch = NULL;
 }
 
 bool alp_stream_decoder_next_float(alp_stream_decoder_t *dec, double *out) {
@@ -244,7 +275,7 @@ bool alp_stream_decoder_next_float(alp_stream_decoder_t *dec, double *out) {
             return false;
     }
 
-    *out = dec->block.floats[dec->block_offset++];
+    *out = ((double *)dec->block_buf)[dec->block_offset++];
     return true;
 }
 
@@ -258,7 +289,7 @@ bool alp_stream_decoder_next_int(alp_stream_decoder_t *dec, int64_t *out) {
             return false;
     }
 
-    *out = dec->block.ints[dec->block_offset++];
+    *out = ((int64_t *)dec->block_buf)[dec->block_offset++];
     return true;
 }
 

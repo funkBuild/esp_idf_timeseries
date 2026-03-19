@@ -4,15 +4,18 @@
 #include <string.h>
 
 #define SID_BYTES 16
-#define MAX_KEY 256 /* safety guard for combo key            */
+#define MAX_KEY 256      /* safety guard for combo key            */
+#define TSDB_MAX_TAGS 32 /* max tag pairs per combo key           */
 
 /* ------------------------------------------------------------------ */
 /*  helpers: build canonical key, pack/unpack id blobs                */
 /* ------------------------------------------------------------------ */
 static bool build_combo_key(uint32_t mid, size_t n, const char* const* k, const char* const* v, char* buf,
                             size_t buf_sz) {
-  /* indices to sort deterministically */
-  size_t idx[n];
+  if (n == 0 || n > TSDB_MAX_TAGS) return false;
+
+  /* fixed-size index array avoids VLA stack overflow */
+  size_t idx[TSDB_MAX_TAGS];
   for (size_t i = 0; i < n; ++i) idx[i] = i;
 
   for (size_t i = 0; i < n - 1; ++i)
@@ -76,6 +79,12 @@ bool tsdb_tagcombo_cache_insert(ts_cache_t* cache, uint32_t mid, size_t n_tags, 
 
   char key_buf[MAX_KEY];
   if (!build_combo_key(mid, n_tags, keys, vals, key_buf, sizeof key_buf)) return false;
+
+  /* empty list: remove any stale entry rather than inserting a NULL blob */
+  if (lst->count == 0) {
+    ts_cache_remove(cache, K_TAG_COMBO, key_buf, mid);
+    return true;
+  }
 
   uint8_t* blob;
   size_t sz;

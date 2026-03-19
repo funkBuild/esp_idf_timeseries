@@ -34,9 +34,9 @@ bool tsdb_cache_init(timeseries_db_t *db) {
     return false;
   }
 
-  // Initialize all entries as invalid
+  // Initialize all entries as empty
   for (size_t i = 0; i < SERIES_ID_CACHE_SIZE; i++) {
-    db->series_cache[i].valid = false;
+    db->series_cache[i].state = TSDB_CACHE_EMPTY;
     db->series_cache[i].last_access = 0;
   }
 
@@ -65,7 +65,7 @@ bool tsdb_cache_lookup_series_id(timeseries_db_t *db, const char *key,
     uint32_t index = (start_index + i) % SERIES_ID_CACHE_SIZE;
     series_id_cache_entry_t *entry = &db->series_cache[index];
 
-    if (entry->valid && strcmp(entry->key, key) == 0) {
+    if (entry->state == TSDB_CACHE_VALID && strcmp(entry->key, key) == 0) {
       // Cache hit!
       memcpy(series_id, entry->series_id, 16);
 
@@ -82,7 +82,7 @@ bool tsdb_cache_lookup_series_id(timeseries_db_t *db, const char *key,
     }
 
     // If we hit an empty slot, key is not in cache
-    if (!entry->valid) {
+    if (entry->state == TSDB_CACHE_EMPTY) {
       break;
     }
   }
@@ -101,6 +101,14 @@ void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
     return;
   }
 
+  // Reject keys that would be truncated — silent truncation causes incorrect
+  // cache hits when two long keys share the same prefix up to the limit.
+  if (strlen(key) >= sizeof(((series_id_cache_entry_t *)0)->key)) {
+    ESP_LOGW(TAG, "Cache key too long (%zu >= %zu), refusing to cache",
+             strlen(key), sizeof(((series_id_cache_entry_t *)0)->key));
+    return;
+  }
+
   // Calculate hash index
   uint32_t hash = hash_string(key);
   uint32_t start_index = hash % SERIES_ID_CACHE_SIZE;
@@ -110,7 +118,7 @@ void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
     uint32_t index = (start_index + i) % SERIES_ID_CACHE_SIZE;
     series_id_cache_entry_t *entry = &db->series_cache[index];
 
-    if (entry->valid && strcmp(entry->key, key) == 0) {
+    if (entry->state == TSDB_CACHE_VALID && strcmp(entry->key, key) == 0) {
       // Update existing entry
       memcpy(entry->series_id, series_id, 16);
 #ifdef CONFIG_TIMESERIES_CACHE_USE_LRU
@@ -121,23 +129,23 @@ void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
     }
 
     // If we hit an empty slot, key doesn't exist in cache - stop searching
-    if (!entry->valid) {
+    if (entry->state == TSDB_CACHE_EMPTY) {
       break;
     }
   }
 
   // Not found, need to insert new entry
-  // First try to find an empty slot
+  // Try to find an empty slot
   for (size_t i = 0; i < SERIES_ID_CACHE_SIZE; i++) {
     uint32_t index = (start_index + i) % SERIES_ID_CACHE_SIZE;
     series_id_cache_entry_t *entry = &db->series_cache[index];
 
-    if (!entry->valid) {
-      // Found empty slot
+    if (entry->state == TSDB_CACHE_EMPTY) {
+      // Found empty slot -- insert here
       strncpy(entry->key, key, sizeof(entry->key) - 1);
       entry->key[sizeof(entry->key) - 1] = '\0';
       memcpy(entry->series_id, series_id, 16);
-      entry->valid = true;
+      entry->state = TSDB_CACHE_VALID;
 #ifdef CONFIG_TIMESERIES_CACHE_USE_LRU
       entry->last_access = ++db->cache_access_counter;
 #endif
@@ -153,15 +161,19 @@ void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
 
   // No empty slots, need to evict
 #ifdef CONFIG_TIMESERIES_CACHE_USE_LRU
-  // Find least recently used entry among VALID entries only
+  // Find least recently used entry among VALID entries only.
+  // Use unsigned distance (counter - last_access) so that wraparound of
+  // cache_access_counter is handled correctly without renormalization.
   uint32_t lru_index = SERIES_ID_CACHE_SIZE;  // Sentinel value
-  uint32_t lru_access = UINT32_MAX;           // Start with max
+  uint32_t lru_age = 0;                       // Largest age = least recently used
 
-  // Find the least recently used VALID entry
   for (size_t i = 0; i < SERIES_ID_CACHE_SIZE; i++) {
-    if (db->series_cache[i].valid && db->series_cache[i].last_access < lru_access) {
-      lru_index = i;
-      lru_access = db->series_cache[i].last_access;
+    if (db->series_cache[i].state == TSDB_CACHE_VALID) {
+      uint32_t age = db->cache_access_counter - db->series_cache[i].last_access;
+      if (age >= lru_age) {
+        lru_index = i;
+        lru_age = age;
+      }
     }
   }
 
@@ -182,26 +194,77 @@ void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
     return;
   }
 
-  // Evict and replace
-  series_id_cache_entry_t *entry = &db->series_cache[lru_index];
-  if (entry->valid) {
-    ESP_LOGV(TAG, "Cache EVICT key: %.32s... from index=%" PRIu32, entry->key, lru_index);
-  }
-
-  strncpy(entry->key, key, sizeof(entry->key) - 1);
-  entry->key[sizeof(entry->key) - 1] = '\0';
-  memcpy(entry->series_id, series_id, 16);
-  entry->valid = true;
-#ifdef CONFIG_TIMESERIES_CACHE_USE_LRU
-  entry->last_access = ++db->cache_access_counter;
-#endif
+  // Evict the victim using backshift deletion to preserve probe chain invariants.
+  // This avoids tombstones entirely: after deletion the slot is EMPTY and all
+  // entries that were displaced past the victim are shifted back toward their
+  // natural hash positions.
+  ESP_LOGV(TAG, "Cache EVICT key: %.32s... from index=%" PRIu32,
+           db->series_cache[lru_index].key, lru_index);
+  db->series_cache[lru_index].state = TSDB_CACHE_EMPTY;
 
 #ifdef CONFIG_TIMESERIES_ENABLE_CACHE_STATS
   db->cache_stats.evictions++;
-  db->cache_stats.insertions++;
 #endif
 
-  ESP_LOGV(TAG, "Cache INSERT after eviction for key: %.32s... (index=%" PRIu32 ")", key, lru_index);
+  // Backshift: close the gap left by the evicted entry.  For each subsequent
+  // occupied slot, if its natural hash position is at or before the gap
+  // (accounting for wraparound), move it into the gap and advance the gap.
+  {
+    uint32_t gap = lru_index;
+    for (size_t i = 1; i < SERIES_ID_CACHE_SIZE; i++) {
+      uint32_t j = (lru_index + i) % SERIES_ID_CACHE_SIZE;
+      series_id_cache_entry_t *entry = &db->series_cache[j];
+
+      if (entry->state != TSDB_CACHE_VALID) {
+        break;  // Hit an empty slot; probe chain is closed
+      }
+
+      // Compute this entry's natural (home) slot
+      uint32_t home = hash_string(entry->key) % SERIES_ID_CACHE_SIZE;
+
+      // Determine whether 'home' is "at or before" 'gap' in the circular
+      // probe order starting from 'home' through 'j'.  Equivalently: would
+      // a probe starting at 'home' pass through 'gap' on its way to 'j'?
+      // Using the circular distance: dist(a,b) = (b - a) mod N
+      uint32_t dist_home_to_gap = (gap - home + SERIES_ID_CACHE_SIZE) % SERIES_ID_CACHE_SIZE;
+      uint32_t dist_home_to_j   = (j   - home + SERIES_ID_CACHE_SIZE) % SERIES_ID_CACHE_SIZE;
+
+      if (dist_home_to_gap <= dist_home_to_j) {
+        // This entry's home is between 'home' and 'j' inclusive, passing
+        // through 'gap', so shift it back into the gap.
+        db->series_cache[gap] = *entry;
+        entry->state = TSDB_CACHE_EMPTY;
+        gap = j;
+      }
+    }
+  }
+
+  // Now do a standard probe-based insert from the new key's natural hash
+  // position.  There is at least one EMPTY slot after backshift deletion.
+  for (size_t i = 0; i < SERIES_ID_CACHE_SIZE; i++) {
+    uint32_t index = (start_index + i) % SERIES_ID_CACHE_SIZE;
+    series_id_cache_entry_t *entry = &db->series_cache[index];
+
+    if (entry->state == TSDB_CACHE_EMPTY) {
+      strncpy(entry->key, key, sizeof(entry->key) - 1);
+      entry->key[sizeof(entry->key) - 1] = '\0';
+      memcpy(entry->series_id, series_id, 16);
+      entry->state = TSDB_CACHE_VALID;
+#ifdef CONFIG_TIMESERIES_CACHE_USE_LRU
+      entry->last_access = ++db->cache_access_counter;
+#endif
+
+#ifdef CONFIG_TIMESERIES_ENABLE_CACHE_STATS
+      db->cache_stats.insertions++;
+#endif
+
+      ESP_LOGV(TAG, "Cache INSERT after eviction for key: %.32s... (index=%" PRIu32 ")", key, index);
+      return;
+    }
+  }
+
+  // Should never reach here since backshift deletion freed a slot, but be safe
+  ESP_LOGE(TAG, "ERROR: Failed to find slot after eviction for key: %.32s...", key);
 }
 
 void tsdb_cache_clear(timeseries_db_t *db) {
@@ -261,7 +324,7 @@ void tsdb_cache_log_stats(const timeseries_db_t *db) {
   uint32_t valid_entries = 0;
   if (db->series_cache) {
     for (size_t i = 0; i < SERIES_ID_CACHE_SIZE; i++) {
-      if (db->series_cache[i].valid) {
+      if (db->series_cache[i].state == TSDB_CACHE_VALID) {
         valid_entries++;
       }
     }

@@ -1,5 +1,6 @@
 #include "alp/alp_decoder.h"
 #include "alp/alp_encoder.h"
+#include "alp/alp_constants.h"
 #include "alp_ffor.h"
 #include <string.h>
 #include <stdlib.h>
@@ -8,32 +9,17 @@
 #include <limits.h>
 
 /*
- * Scaling tables — same values as in the encoder.
- * FRAC_ARR[i] = 10^i is used to multiply the stored integer back out.
- * FACT_ARR[i] = 10^i is used as the divisor to undo the original scale.
- */
-static const double FACT_ARR[19] = {
-    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
-    1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18
-};
-
-static const double FRAC_ARR[19] = {
-    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
-    1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18
-};
-
-/*
  * Scratch buffer layout (single allocation):
  *
- *   [ decoded_ints  | packed_data   | exc_positions ]
- *   [ 128 × int64  | 128 × uint64  | 128 × uint16  ]
- *   [ 1024 B        | 1024 B        | 256 B          ]
+ *   [ decoded_ints  | packed_data    | exc_positions ]
+ *   [ 128 × int64  | 129 × uint64   | 128 × uint16  ]
+ *   [ 1024 B        | 1032 B         | 256 B          ]
  *
  * exc_values reuses packed_data's memory — FFOR unpack is complete before
  * exception data is read, so the two never overlap in time. Saves 1024 bytes.
  */
 #define SCRATCH_INT_SZ   (ALP_BLOCK_SIZE * sizeof(int64_t))   /* 1024 */
-#define SCRATCH_PACK_SZ  (ALP_BLOCK_SIZE * sizeof(uint64_t))  /* 1024 */
+#define SCRATCH_PACK_SZ  ((ALP_BLOCK_SIZE + 1) * sizeof(uint64_t))  /* 1032 */
 #define SCRATCH_POS_SZ   (ALP_BLOCK_SIZE * sizeof(uint16_t))  /*  256 */
 #define SCRATCH_TOTAL    (SCRATCH_INT_SZ + SCRATCH_PACK_SZ + SCRATCH_POS_SZ)
 
@@ -71,10 +57,11 @@ bool alp_decode(const uint8_t * restrict data, size_t data_len,
     if (scheme != ALP_SCHEME_ALP) return false;
 
     /* ------------------------------------------------------------------ */
-    /* Stack scratch for all temporary buffers (3328 B — fits in query    */
-    /* task stack, avoids malloc/free overhead per decode call)            */
+    /* Heap scratch for all temporary buffers (2304 B — avoids blowing   */
+    /* 4096-byte FreeRTOS task stacks)                                    */
     /* ------------------------------------------------------------------ */
-    uint8_t scratch[SCRATCH_TOTAL] __attribute__((aligned(8)));
+    uint8_t *scratch = (uint8_t *)malloc(SCRATCH_TOTAL);
+    if (!scratch) return false;
 
     int64_t  *decoded_ints  = (int64_t  *)(scratch);
     uint64_t *packed_data   = (uint64_t *)(scratch + SCRATCH_INT_SZ);
@@ -97,7 +84,10 @@ bool alp_decode(const uint8_t * restrict data, size_t data_len,
 
         uint8_t  exp             = (uint8_t) (bh0        & 0xFF);
         uint8_t  fac             = (uint8_t) ((bh0 >>  8) & 0xFF);
+        if (exp > 18) exp = 18;
+        if (fac > 18) fac = 18;
         uint8_t  bw              = (uint8_t) ((bh0 >> 16) & 0xFF);
+        if (bw > 64) goto fail;
         uint16_t exception_count = (uint16_t)((bh0 >> 32) & 0xFFFF);
         uint16_t block_count     = (uint16_t)((bh0 >> 48) & 0xFFFF);
 
@@ -105,12 +95,13 @@ bool alp_decode(const uint8_t * restrict data, size_t data_len,
         memcpy(&for_base, &bh1, 8);
 
         if (block_count == 0 || block_count > ALP_BLOCK_SIZE) goto fail;
+        if (exception_count > block_count) goto fail;
 
         /* ---------------------------------------------------------------- */
         /* FFOR-packed data                                                 */
         /* ---------------------------------------------------------------- */
         size_t packed_words = alp_ffor_packed_words(block_count, bw);
-        if (p + packed_words * 8 > end) goto fail;
+        if (packed_words * 8 > (size_t)(end - p)) goto fail;
         memcpy(packed_data, p, packed_words * 8);
         p += packed_words * 8;
 
@@ -134,7 +125,7 @@ bool alp_decode(const uint8_t * restrict data, size_t data_len,
         /* ---------------------------------------------------------------- */
         if (exception_count > 0) {
             size_t pos_words = ((size_t)exception_count * 2 + 7) / 8;
-            if (p + pos_words * 8 > end) goto fail;
+            if (pos_words * 8 > (size_t)(end - p)) goto fail;
 
             for (uint16_t i = 0; i < exception_count; i++) {
                 size_t word_idx = i / 4;
@@ -145,7 +136,7 @@ bool alp_decode(const uint8_t * restrict data, size_t data_len,
             }
             p += pos_words * 8;
 
-            if (p + (size_t)exception_count * 8 > end) goto fail;
+            if ((size_t)exception_count * 8 > (size_t)(end - p)) goto fail;
             memcpy(exc_values, p, (size_t)exception_count * 8);
             p += (size_t)exception_count * 8;
         }
@@ -157,7 +148,7 @@ bool alp_decode(const uint8_t * restrict data, size_t data_len,
         /* Precompute block-level scale factor: one multiply per value instead
          * of one multiply + one divide.  fac and exp are block constants so
          * this division happens once per block, not once per value.          */
-        double scale = FRAC_ARR[fac] / FACT_ARR[exp];
+        double scale = ALP_SCALE_FACTORS[fac] / ALP_SCALE_FACTORS[exp];
 
         /* How many values from this block will actually land in `out` */
         size_t to_decode = block_count;
@@ -198,8 +189,10 @@ bool alp_decode(const uint8_t * restrict data, size_t data_len,
         }
     }
 
+    free(scratch);
     return (out_idx == count);
 
 fail:
+    free(scratch);
     return false;
 }

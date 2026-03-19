@@ -43,7 +43,11 @@ bool integer_stream_encoder_add_value(IntegerStreamEncoder *encoder,
   if (!encoder)
     return false;
 
-  // First value: store absolutely.
+  // First value: store absolutely via Simple8B.
+  // KNOWN LIMITATION: Simple8B selector 15 stores 1 value in 60 bits.
+  // Values with bits 60-63 set will be silently truncated. This is acceptable
+  // for typical integer field values; timestamps use a separate Gorilla encoder.
+  // This codec is legacy — all new pages use ALP/FFOR encoding instead.
   if (!encoder->has_first) {
     encoder->first_value = value;
     encoder->has_first = true;

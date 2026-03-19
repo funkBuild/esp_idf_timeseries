@@ -5,20 +5,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "gorilla/gorilla_stream_types.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/**
- * @brief Callback signature for flushing compressed data.
- *
- * \param data     Pointer to compressed data to flush.
- * \param len      Length of data in bytes.
- * \param context  User-defined pointer passed at creation time.
- *
- * \return true on success, false on error.
- */
-typedef bool (*FlushCallback)(const uint8_t *data, size_t len, void *context);
 
 /**
  * @brief Opaque handle for the incremental string encoder.

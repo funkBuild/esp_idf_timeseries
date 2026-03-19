@@ -161,6 +161,9 @@ typedef struct {
 } timeseries_field_data_header_t;
 #pragma pack(pop)
 
+_Static_assert(sizeof(timeseries_page_header_t) == 20, "page header size changed");
+_Static_assert(sizeof(timeseries_entry_header_t) == 6, "entry header size changed");
+
 // -----------------------------------------------------------------------------
 // DB Context
 // -----------------------------------------------------------------------------
@@ -172,11 +175,17 @@ typedef struct {
   #define SERIES_ID_CACHE_SIZE 0
 #endif
 
+typedef enum {
+  TSDB_CACHE_EMPTY = 0,     // Slot has never been used (or was cleared)
+  TSDB_CACHE_VALID = 1,     // Slot holds a live entry
+  TSDB_CACHE_TOMBSTONE = 2, // Unused; kept for enum stability
+} tsdb_cache_slot_state_t;
+
 typedef struct {
   char key[128];                // measurement+tags+field string
   unsigned char series_id[16];  // Cached series ID
   uint32_t last_access;          // For LRU eviction (if CONFIG_TIMESERIES_CACHE_USE_LRU)
-  bool valid;                    // Is this entry valid?
+  uint8_t state;                 // tsdb_cache_slot_state_t
   uint8_t padding[3];           // Explicit padding to 4-byte boundary
 } series_id_cache_entry_t;
 
@@ -223,7 +232,7 @@ typedef struct {
 } meas_cache_entry_t;
 
 typedef struct {
-  bool initialized;
+  _Atomic bool initialized;
   uint32_t next_measurement_id;
   _Atomic uint32_t sequence_num;
   const esp_partition_t *partition; // pointer to the 'storage' partition
@@ -236,13 +245,15 @@ typedef struct {
   tsdb_page_cache_snapshot_t *active_batch;   // Points to compaction's batch snapshot while active; NULL otherwise
 
   // Compaction claim set (prevents inserts into pages being compacted)
+#define TSDB_COMPACTION_TASK_STACK_SIZE 6144
 #define TSDB_MAX_COMPACTION_CLAIMED_PAGES 32
   uint32_t compaction_claimed_pages[TSDB_MAX_COMPACTION_CLAIMED_PAGES];
   size_t compaction_claimed_count;
 
   // On-demand compaction
-  TaskHandle_t compaction_task_handle;
+  _Atomic TaskHandle_t compaction_task_handle;
   _Atomic bool compaction_in_progress;
+  SemaphoreHandle_t compaction_done_sem;   // Signalled by compaction task before vTaskDelete
   _Atomic uint32_t compaction_generation;  // Incremented after each compaction run
   _Atomic uint32_t l0_page_count;          // Tracked atomically to avoid per-insert scan
 

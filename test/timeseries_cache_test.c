@@ -304,7 +304,7 @@ TEST_CASE("cache insert updates existing entry", "[cache][insert][update]") {
     TEST_ASSERT_FALSE(series_id_equal(series_id1, retrieved_id));
 }
 
-TEST_CASE("cache insert truncates long keys", "[cache][insert][boundary]") {
+TEST_CASE("cache insert rejects long keys", "[cache][insert][boundary]") {
     TEST_ASSERT_TRUE(timeseries_init());
 
     timeseries_db_t *db = timeseries_get_db_handle();
@@ -318,12 +318,9 @@ TEST_CASE("cache insert truncates long keys", "[cache][insert][boundary]") {
     create_series_id("test", series_id);
     tsdb_cache_insert_series_id(db, long_key, series_id);
 
-    // Verify the entry exists
+    // Key too long — insert should be refused, not truncated
     series_id_cache_entry_t *entry = find_cache_entry(db, long_key);
-    TEST_ASSERT_NOT_NULL(entry);
-
-    // Key should be truncated to 127 chars + null terminator
-    TEST_ASSERT_EQUAL(127, strlen(entry->key));
+    TEST_ASSERT_NULL(entry);
 }
 
 // ============================================================================

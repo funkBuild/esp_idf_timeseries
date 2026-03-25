@@ -269,20 +269,21 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
   // Pre-compute the common prefix (measurement + tags) for MD5 optimization.
   // Size matches cache_key to avoid truncation for valid inputs.
   char prefix_buffer[256];
-  size_t prefix_len = snprintf(prefix_buffer, sizeof(prefix_buffer), "%s", data->measurement_name);
-  if (prefix_len >= sizeof(prefix_buffer)) {
+  int prefix_ret = snprintf(prefix_buffer, sizeof(prefix_buffer), "%s", data->measurement_name);
+  if (prefix_ret < 0 || (size_t)prefix_ret >= sizeof(prefix_buffer)) {
     ESP_LOGE(TAG, "Measurement name too long for prefix buffer");
     return false;
   }
+  size_t prefix_len = (size_t)prefix_ret;
   for (size_t t = 0; t < data->num_tags; t++) {
     size_t remaining = sizeof(prefix_buffer) - prefix_len;
-    size_t written = snprintf(prefix_buffer + prefix_len, remaining,
+    int written = snprintf(prefix_buffer + prefix_len, remaining,
                           ":%s:%s", data->tag_keys[t], data->tag_values[t]);
-    prefix_len += written;
-    if (prefix_len >= sizeof(prefix_buffer)) {
+    if (written < 0 || (size_t)written >= remaining) {
       ESP_LOGE(TAG, "Prefix buffer overflow");
       return false;
     }
+    prefix_len += (size_t)written;
   }
 
   // For each field i => build the series_id => store all points in one shot
@@ -290,12 +291,13 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
   for (size_t i = 0; i < data->num_fields; i++) {
     // Build the cache key string
     char cache_key[256];
-    size_t key_len = snprintf(cache_key, sizeof(cache_key), "%s:%s",
-                              prefix_buffer, data->field_names[i]);
-    if (key_len >= sizeof(cache_key)) {
+    int key_ret = snprintf(cache_key, sizeof(cache_key), "%s:%s",
+                           prefix_buffer, data->field_names[i]);
+    if (key_ret < 0 || (size_t)key_ret >= sizeof(cache_key)) {
       ESP_LOGE(TAG, "Cache key buffer overflow for field '%s'", data->field_names[i]);
       return false;
     }
+    size_t key_len = (size_t)key_ret;
 
     unsigned char series_id[16];
     bool found_in_cache = false;

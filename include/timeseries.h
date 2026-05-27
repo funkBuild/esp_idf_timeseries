@@ -236,6 +236,27 @@ bool timeseries_clear_all(void);
 void timeseries_set_chunk_size(size_t chunk_size);
 
 /**
+ * @brief Callback invoked before/after background compaction.
+ *
+ * The pre-compact hook fires before the compaction task begins work; the
+ * post-compact hook fires after it finishes. Lets the caller e.g. hold a
+ * deep-sleep lock for the duration of compaction without coupling the
+ * timeseries component to the sleep subsystem. Either may be NULL.
+ */
+typedef void (*timeseries_compaction_hook_t)(void);
+void timeseries_set_compaction_hooks(timeseries_compaction_hook_t pre_compact,
+                                     timeseries_compaction_hook_t post_compact);
+
+/**
+ * @brief Register a log hook to forward significant internal errors (e.g.
+ * series-ID type conflicts) to the application layer. Pass NULL to disable.
+ *
+ * @param level  ESP_LOG_* severity. @param message  Human-readable message.
+ */
+typedef void (*timeseries_log_hook_t)(int level, const char *message);
+void timeseries_set_log_hook(timeseries_log_hook_t hook);
+
+/**
  * @brief Deinitialize the timeseries database, stopping background tasks and
  *        freeing all resources.
  */

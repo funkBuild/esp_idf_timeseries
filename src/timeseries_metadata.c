@@ -393,6 +393,12 @@ bool tsdb_ensure_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
     // found existing
     if (existing_type != field_type) {
       ESP_LOGE(TAG, "SeriesID conflict: existing type=%d, new=%d", (int)existing_type, (int)field_type);
+      if (db->log_hook) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Timeseries type conflict: existing=%d, new=%d", (int)existing_type,
+                 (int)field_type);
+        db->log_hook(ESP_LOG_ERROR, msg);
+      }
       return false;
     }
     // else it matches => done

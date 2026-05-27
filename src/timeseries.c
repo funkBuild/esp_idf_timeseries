@@ -36,6 +36,16 @@ static timeseries_db_t s_tsdb = {
 };
 static _Atomic bool s_init_in_progress = false;
 
+void timeseries_set_compaction_hooks(timeseries_compaction_hook_t pre_compact,
+                                     timeseries_compaction_hook_t post_compact) {
+    s_tsdb.pre_compact_hook = pre_compact;
+    s_tsdb.post_compact_hook = post_compact;
+}
+
+void timeseries_set_log_hook(timeseries_log_hook_t hook) {
+    s_tsdb.log_hook = hook;
+}
+
 // Compaction task: loops while work remains, then self-deletes.
 // Using a loop instead of re-triggering via tsdb_launch_compaction avoids
 // creating a new task (4 KiB stack) before the current task's stack is freed
@@ -45,6 +55,12 @@ static _Atomic uint32_t s_compaction_consecutive_failures = 0;
 
 static void tsdb_compaction_oneshot_task(void *param) {
     timeseries_db_t *db = (timeseries_db_t *)param;
+
+    // Fire the pre-compact hook once, before any work (e.g. hold a sleep lock
+    // for the whole compaction, including any re-runs in the loop below).
+    if (db->pre_compact_hook) {
+        db->pre_compact_hook();
+    }
 
     for (;;) {
         ESP_LOGI(TAG, "Compaction task started");
@@ -74,6 +90,11 @@ static void tsdb_compaction_oneshot_task(void *param) {
     ESP_LOGI(TAG, "Compaction task stack high water mark: %u bytes free", (unsigned int)(hwm * sizeof(StackType_t)));
 
     atomic_store(&db->compaction_task_handle, (TaskHandle_t)NULL);
+    // Fire the post-compact hook once, after all compaction work is done
+    // (paired with pre_compact_hook above — e.g. release the sleep lock).
+    if (db->post_compact_hook) {
+        db->post_compact_hook();
+    }
     xSemaphoreGive(db->compaction_done_sem);
     atomic_store(&db->compaction_in_progress, false);
     vTaskDelete(NULL);

@@ -296,6 +296,13 @@ typedef struct {
   // Metadata mmap cache for fast read access
   metadata_mmap_entry_t metadata_mmap_cache[METADATA_MMAP_CACHE_SIZE];
   bool metadata_mmap_enabled;  // Set to true if mmap is supported
+
+  // Application hooks (registered via timeseries_set_compaction_hooks /
+  // timeseries_set_log_hook). Raw function-pointer types so this internal
+  // header needn't pull in the public timeseries.h typedefs.
+  void (*pre_compact_hook)(void);
+  void (*post_compact_hook)(void);
+  void (*log_hook)(int level, const char *message);
 } timeseries_db_t;
 
 typedef struct {

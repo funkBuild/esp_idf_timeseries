@@ -220,6 +220,11 @@ bool timeseries_init(void) {
     ESP_LOGW(TAG, "Failed to allocate type cache (will use direct metadata lookups)");
     s_tsdb.type_cache_size = 0;
   }
+  // Guards the type cache: read by query tasks, written by insert tasks.
+  s_tsdb.type_cache_mutex = xSemaphoreCreateMutex();
+  if (!s_tsdb.type_cache_mutex) {
+    ESP_LOGW(TAG, "Failed to create type cache mutex (continuing unlocked)");
+  }
 
   // Initialize on-demand compaction state
   atomic_store(&s_tsdb.compaction_in_progress, false);
@@ -252,6 +257,10 @@ init_fail:
     free(s_tsdb.type_cache);
     s_tsdb.type_cache = NULL;
     s_tsdb.type_cache_size = 0;
+  }
+  if (s_tsdb.type_cache_mutex) {
+    vSemaphoreDelete(s_tsdb.type_cache_mutex);
+    s_tsdb.type_cache_mutex = NULL;
   }
   tsdb_cache_free(&s_tsdb);
   if (s_tsdb.current_snapshot) {
@@ -606,6 +615,10 @@ void timeseries_deinit(void) {
     free(s_tsdb.type_cache);
     s_tsdb.type_cache = NULL;
     s_tsdb.type_cache_size = 0;
+  }
+  if (s_tsdb.type_cache_mutex) {
+    vSemaphoreDelete(s_tsdb.type_cache_mutex);
+    s_tsdb.type_cache_mutex = NULL;
   }
 
   tsdb_cache_free(&s_tsdb);

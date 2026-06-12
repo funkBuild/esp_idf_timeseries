@@ -54,6 +54,13 @@ static bool tsdb_upsert_seriesid_list_entry(timeseries_db_t* db, timeseries_keyt
 
 static inline size_t hash_series_id(const unsigned char series_id[16], size_t cache_size);
 
+// Type-cache helpers (defined near the type-cache code below). Both take
+// db->type_cache_mutex internally, so callers must NOT hold it.
+static bool tsdb_type_cache_get(timeseries_db_t* db, const unsigned char series_id[16],
+                                timeseries_field_type_e* out_type);
+static void tsdb_type_cache_store(timeseries_db_t* db, const unsigned char series_id[16],
+                                  timeseries_field_type_e type);
+
 static bool tsdb_upsert_tagindex_entry(timeseries_db_t* db, const uint32_t* meta_offsets, size_t meta_count,
                                        const char* key_str, const unsigned char series_id[16]);
 
@@ -473,19 +480,7 @@ bool tsdb_ensure_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
       }
 
       // Populate type cache so subsequent inserts skip flash lookup
-      if (db->type_cache && db->type_cache_size > 0) {
-        size_t idx = hash_series_id(series_id, db->type_cache_size);
-        for (size_t p = 0; p < TYPE_CACHE_MAX_PROBE; p++) {
-          size_t slot = (idx + p) % db->type_cache_size;
-          series_type_cache_entry_t* tc = &db->type_cache[slot];
-          if (!tc->valid || memcmp(tc->series_id, series_id, 16) == 0) {
-            memcpy(tc->series_id, series_id, 16);
-            tc->field_type = (uint8_t)field_type;
-            tc->valid = true;
-            break;
-          }
-        }
-      }
+      tsdb_type_cache_store(db, series_id, field_type);
 
       ESP_LOGV(TAG, "Created new fieldindex for series=%.2X%.2X%.2X%.2X..., type=%d", series_id[0], series_id[1],
                series_id[2], series_id[3], (int)field_type);
@@ -825,7 +820,9 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
   new_hdr.magic_number = TIMESERIES_MAGIC_NUM;
   new_hdr.page_type = TIMESERIES_PAGE_TYPE_METADATA;
   new_hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
-  new_hdr.sequence_num = ++db->sequence_num;
+  // Atomic increment to avoid duplicate sequence numbers across concurrent
+  // page allocations (the field is _Atomic but ++ is a non-atomic RMW).
+  new_hdr.sequence_num = atomic_fetch_add(&db->sequence_num, 1) + 1;
   new_hdr.field_data_level = 0;
   new_hdr.page_size = page_size;
 
@@ -917,7 +914,9 @@ static bool tsdb_create_empty_metadata_page(timeseries_db_t* db, uint32_t page_o
   new_hdr.magic_number = TIMESERIES_MAGIC_NUM;
   new_hdr.page_type = TIMESERIES_PAGE_TYPE_METADATA;
   new_hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
-  new_hdr.sequence_num = ++db->sequence_num;
+  // Atomic increment to avoid duplicate sequence numbers across concurrent
+  // page allocations (the field is _Atomic but ++ is a non-atomic RMW).
+  new_hdr.sequence_num = atomic_fetch_add(&db->sequence_num, 1) + 1;
   new_hdr.field_data_level = 0;  // not used for metadata
   new_hdr.page_size = TIMESERIES_METADATA_PAGE_SIZE;
 
@@ -1908,6 +1907,56 @@ static inline size_t hash_series_id(const unsigned char series_id[16], size_t ca
   return hash % cache_size;
 }
 
+// Probe the type cache for series_id. Takes type_cache_mutex internally.
+static bool tsdb_type_cache_get(timeseries_db_t* db, const unsigned char series_id[16],
+                                timeseries_field_type_e* out_type) {
+  if (!db->type_cache || db->type_cache_size == 0) {
+    return false;
+  }
+  bool hit = false;
+  if (db->type_cache_mutex) xSemaphoreTake(db->type_cache_mutex, portMAX_DELAY);
+  size_t idx = hash_series_id(series_id, db->type_cache_size);
+  for (size_t p = 0; p < TYPE_CACHE_MAX_PROBE; p++) {
+    size_t slot = (idx + p) % db->type_cache_size;
+    series_type_cache_entry_t* entry = &db->type_cache[slot];
+    if (!entry->valid) break;  // empty slot = not cached
+    if (memcmp(entry->series_id, series_id, 16) == 0) {
+      *out_type = (timeseries_field_type_e)entry->field_type;
+      hit = true;
+      break;
+    }
+  }
+  if (db->type_cache_mutex) xSemaphoreGive(db->type_cache_mutex);
+  return hit;
+}
+
+// Insert/update a (series_id -> type) mapping. Takes type_cache_mutex
+// internally. A series' type is immutable, so on a full probe window we simply
+// evict the last probe slot rather than silently dropping the entry (which
+// would force a full metadata scan on every future lookup of that series).
+static void tsdb_type_cache_store(timeseries_db_t* db, const unsigned char series_id[16],
+                                  timeseries_field_type_e type) {
+  if (!db->type_cache || db->type_cache_size == 0) {
+    return;
+  }
+  if (db->type_cache_mutex) xSemaphoreTake(db->type_cache_mutex, portMAX_DELAY);
+  size_t idx = hash_series_id(series_id, db->type_cache_size);
+  size_t target = (idx + TYPE_CACHE_MAX_PROBE - 1) % db->type_cache_size;  // eviction victim if window full
+  for (size_t p = 0; p < TYPE_CACHE_MAX_PROBE; p++) {
+    size_t slot = (idx + p) % db->type_cache_size;
+    series_type_cache_entry_t* entry = &db->type_cache[slot];
+    if (!entry->valid || memcmp(entry->series_id, series_id, 16) == 0) {
+      target = slot;
+      break;
+    }
+  }
+  series_type_cache_entry_t* entry = &db->type_cache[target];
+  memcpy(entry->series_id, series_id, 16);
+  entry->field_type = (uint8_t)type;
+  entry->valid = true;
+  if (db->type_cache_mutex) xSemaphoreGive(db->type_cache_mutex);
+}
+
 /**
  * @brief Look up series type in cache, with fallback to metadata scan
  * @note This replaces direct calls to tsdb_lookup_series_type_in_metadata
@@ -1918,38 +1967,17 @@ bool tsdb_lookup_series_type_cached(timeseries_db_t* db, const unsigned char ser
     return false;
   }
 
-  // Check cache first if available (linear probing)
-  if (db->type_cache && db->type_cache_size > 0) {
-    size_t idx = hash_series_id(series_id, db->type_cache_size);
-    for (size_t p = 0; p < TYPE_CACHE_MAX_PROBE; p++) {
-      size_t slot = (idx + p) % db->type_cache_size;
-      series_type_cache_entry_t* entry = &db->type_cache[slot];
-      if (!entry->valid) break;  // empty slot = not cached
-      if (memcmp(entry->series_id, series_id, 16) == 0) {
-        *out_type = (timeseries_field_type_e)entry->field_type;
-        return true;
-      }
-    }
+  // Check cache first (locked, short critical section)
+  if (tsdb_type_cache_get(db, series_id, out_type)) {
+    return true;
   }
 
-  // Cache miss - do the metadata scan
+  // Cache miss - do the metadata scan unlocked (it is slow and takes no cache
+  // lock), then publish the result.
   bool found = tsdb_lookup_series_type_in_metadata(db, series_id, out_type);
-
-  // If found, cache the result (linear probing for insertion)
-  if (found && db->type_cache && db->type_cache_size > 0) {
-    size_t idx = hash_series_id(series_id, db->type_cache_size);
-    for (size_t p = 0; p < TYPE_CACHE_MAX_PROBE; p++) {
-      size_t slot = (idx + p) % db->type_cache_size;
-      series_type_cache_entry_t* entry = &db->type_cache[slot];
-      if (!entry->valid || memcmp(entry->series_id, series_id, 16) == 0) {
-        memcpy(entry->series_id, series_id, 16);
-        entry->field_type = (uint8_t)*out_type;
-        entry->valid = true;
-        break;
-      }
-    }
+  if (found) {
+    tsdb_type_cache_store(db, series_id, *out_type);
   }
-
   return found;
 }
 
@@ -1958,7 +1986,9 @@ bool tsdb_lookup_series_type_cached(timeseries_db_t* db, const unsigned char ser
  */
 void tsdb_clear_type_cache(timeseries_db_t* db) {
   if (db && db->type_cache && db->type_cache_size > 0) {
+    if (db->type_cache_mutex) xSemaphoreTake(db->type_cache_mutex, portMAX_DELAY);
     memset(db->type_cache, 0, db->type_cache_size * sizeof(series_type_cache_entry_t));
+    if (db->type_cache_mutex) xSemaphoreGive(db->type_cache_mutex);
   }
 }
 

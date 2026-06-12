@@ -1,9 +1,18 @@
 #include "timeseries_cache.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <inttypes.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+
+// Guard the series-ID cache against concurrent access from multiple insert
+// tasks on the dual-core target. The critical sections are short (a probe of
+// SERIES_ID_CACHE_SIZE entries) and this is a leaf lock (it never calls back
+// into flash or other db locks), so it cannot deadlock.
+#define SERIES_CACHE_LOCK(db)   do { if ((db)->series_cache_mutex) xSemaphoreTake((db)->series_cache_mutex, portMAX_DELAY); } while (0)
+#define SERIES_CACHE_UNLOCK(db) do { if ((db)->series_cache_mutex) xSemaphoreGive((db)->series_cache_mutex); } while (0)
 
 #ifdef CONFIG_TIMESERIES_USE_SERIES_ID_CACHE
 
@@ -42,6 +51,15 @@ bool tsdb_cache_init(timeseries_db_t *db) {
 
   db->cache_access_counter = 0;
 
+  if (!db->series_cache_mutex) {
+    db->series_cache_mutex = xSemaphoreCreateMutex();
+    if (!db->series_cache_mutex) {
+      // Not fatal: the cache still works single-threaded; concurrent inserts
+      // just lose the torn-write protection.
+      ESP_LOGW(TAG, "Failed to create series cache mutex (continuing unlocked)");
+    }
+  }
+
 #ifdef CONFIG_TIMESERIES_ENABLE_CACHE_STATS
   memset(&db->cache_stats, 0, sizeof(db->cache_stats));
 #endif
@@ -59,6 +77,8 @@ bool tsdb_cache_lookup_series_id(timeseries_db_t *db, const char *key,
   // Calculate hash index
   uint32_t hash = hash_string(key);
   uint32_t start_index = hash % SERIES_ID_CACHE_SIZE;
+
+  SERIES_CACHE_LOCK(db);
 
   // Linear probe with wraparound (handle collisions)
   for (size_t i = 0; i < SERIES_ID_CACHE_SIZE; i++) {
@@ -78,6 +98,7 @@ bool tsdb_cache_lookup_series_id(timeseries_db_t *db, const char *key,
 #endif
 
       ESP_LOGV(TAG, "Cache HIT for key: %.32s... (index=%" PRIu32 ")", key, index);
+      SERIES_CACHE_UNLOCK(db);
       return true;
     }
 
@@ -91,16 +112,15 @@ bool tsdb_cache_lookup_series_id(timeseries_db_t *db, const char *key,
   db->cache_stats.misses++;
 #endif
 
+  SERIES_CACHE_UNLOCK(db);
   ESP_LOGV(TAG, "Cache MISS for key: %.32s...", key);
   return false;
 }
 
-void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
-                                 const unsigned char series_id[16]) {
-  if (!db || !db->series_cache || !key || !series_id) {
-    return;
-  }
-
+// Body of the insert; assumes series_cache_mutex is held (it has many early
+// returns, so the public entry point wraps it rather than guarding each exit).
+static void tsdb_cache_insert_series_id_locked(timeseries_db_t *db, const char *key,
+                                               const unsigned char series_id[16]) {
   // Reject keys that would be truncated — silent truncation causes incorrect
   // cache hits when two long keys share the same prefix up to the limit.
   if (strlen(key) >= sizeof(((series_id_cache_entry_t *)0)->key)) {
@@ -267,11 +287,22 @@ void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
   ESP_LOGE(TAG, "ERROR: Failed to find slot after eviction for key: %.32s...", key);
 }
 
+void tsdb_cache_insert_series_id(timeseries_db_t *db, const char *key,
+                                 const unsigned char series_id[16]) {
+  if (!db || !db->series_cache || !key || !series_id) {
+    return;
+  }
+  SERIES_CACHE_LOCK(db);
+  tsdb_cache_insert_series_id_locked(db, key, series_id);
+  SERIES_CACHE_UNLOCK(db);
+}
+
 void tsdb_cache_clear(timeseries_db_t *db) {
   if (!db || !db->series_cache) {
     return;
   }
 
+  SERIES_CACHE_LOCK(db);
   // Zero ALL entry data to prevent stale data from being used
   // Use single memset for efficiency
   memset(db->series_cache, 0, SERIES_ID_CACHE_SIZE * sizeof(series_id_cache_entry_t));
@@ -282,6 +313,7 @@ void tsdb_cache_clear(timeseries_db_t *db) {
   memset(&db->cache_stats, 0, sizeof(db->cache_stats));
 #endif
 
+  SERIES_CACHE_UNLOCK(db);
   ESP_LOGI(TAG, "Cleared series ID cache");
 }
 
@@ -298,6 +330,11 @@ void tsdb_cache_free(timeseries_db_t *db) {
   if (db->series_cache) {
     free(db->series_cache);
     db->series_cache = NULL;
+  }
+
+  if (db->series_cache_mutex) {
+    vSemaphoreDelete(db->series_cache_mutex);
+    db->series_cache_mutex = NULL;
   }
 
   ESP_LOGI(TAG, "Freed series ID cache resources");

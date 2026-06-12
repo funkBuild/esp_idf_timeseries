@@ -24,6 +24,34 @@ static int page_offset_compare(const void *a, const void *b) {
 }
 
 /**
+ * @brief Binary search for `offset` in the offset-sorted entries array.
+ *
+ * The entries array is maintained sorted by offset at all times (every
+ * mutation goes through batch_add/batch_remove, which preserve order). On a
+ * hit returns true and sets *idx to the matching index; on a miss returns
+ * false and sets *idx to the lower-bound insertion point.
+ */
+static bool pagecache_find_index(const tsdb_page_cache_snapshot_t *snap,
+                                 uint32_t offset, size_t *idx) {
+  size_t lo = 0, hi = snap->count;  // search the half-open range [lo, hi)
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    uint32_t mo = snap->entries[mid].offset;
+    if (mo == offset) {
+      *idx = mid;
+      return true;
+    }
+    if (mo < offset) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  *idx = lo;
+  return false;
+}
+
+/**
  * @brief Build the page cache for the given database.
  * Scans the entire partition and builds a snapshot of all recognized pages.
  */
@@ -273,13 +301,11 @@ uint32_t tsdb_pagecache_get_page_size(timeseries_db_t *db,
     return 0;
   }
 
+  // Entries are sorted by offset -- binary search instead of a linear scan.
   uint32_t result = 0;
-  for (size_t i = 0; i < snap->count; i++) {
-    const timeseries_cached_page_t *entry = &snap->entries[i];
-    if (entry->offset == page_offset) {
-      result = entry->header.page_size;
-      break;
-    }
+  size_t idx;
+  if (pagecache_find_index(snap, page_offset, &idx)) {
+    result = snap->entries[idx].header.page_size;
   }
 
   tsdb_snapshot_release(snap);
@@ -319,15 +345,16 @@ bool tsdb_pagecache_batch_add(tsdb_page_cache_snapshot_t *snap, uint32_t offset,
     return false;
   }
 
-  // Check if an entry at this offset already exists -- update it in place
-  for (size_t i = 0; i < snap->count; i++) {
-    if (snap->entries[i].offset == offset) {
-      memcpy(&snap->entries[i].header, hdr, sizeof(timeseries_page_header_t));
-      return true;  // Updated existing entry
-    }
+  // Entries are kept sorted by offset: binary-search for an existing entry
+  // (O(log n)) instead of a linear scan, and insert at the sorted position so
+  // the array never needs a full qsort afterwards.
+  size_t pos;
+  if (pagecache_find_index(snap, offset, &pos)) {
+    memcpy(&snap->entries[pos].header, hdr, sizeof(timeseries_page_header_t));
+    return true;  // Updated existing entry in place
   }
 
-  // No existing entry -- grow array if needed and append
+  // No existing entry -- grow array if needed
   if (snap->count == snap->capacity) {
     size_t newcap = (snap->capacity == 0) ? 8 : snap->capacity * 2;
     timeseries_cached_page_t *newarr =
@@ -340,9 +367,15 @@ bool tsdb_pagecache_batch_add(tsdb_page_cache_snapshot_t *snap, uint32_t offset,
     snap->capacity = newcap;
   }
 
-  timeseries_cached_page_t *entry = &snap->entries[snap->count++];
-  entry->offset = offset;
-  memcpy(&entry->header, hdr, sizeof(timeseries_page_header_t));
+  // Insert at the sorted position `pos`, shifting the tail one slot right.
+  size_t tail = snap->count - pos;
+  if (tail > 0) {
+    memmove(&snap->entries[pos + 1], &snap->entries[pos],
+            tail * sizeof(snap->entries[0]));
+  }
+  snap->entries[pos].offset = offset;
+  memcpy(&snap->entries[pos].header, hdr, sizeof(timeseries_page_header_t));
+  snap->count++;
   return true;
 }
 
@@ -386,6 +419,19 @@ bool tsdb_pagecache_batch_remove(tsdb_page_cache_snapshot_t *snap, uint32_t offs
 
 void tsdb_pagecache_batch_sort(tsdb_page_cache_snapshot_t *snap) {
   if (!snap || snap->count < 2) {
+    return;
+  }
+  // batch_add/batch_remove keep the array sorted by offset, so it is normally
+  // already sorted here. Verify in O(n) and skip the O(n log n) qsort in that
+  // (overwhelmingly common) case; the qsort remains as a safety net.
+  bool sorted = true;
+  for (size_t i = 1; i < snap->count; i++) {
+    if (snap->entries[i - 1].offset > snap->entries[i].offset) {
+      sorted = false;
+      break;
+    }
+  }
+  if (sorted) {
     return;
   }
   qsort(snap->entries, snap->count, sizeof(timeseries_cached_page_t),
@@ -459,6 +505,17 @@ void tsdb_pagecache_commit_batch(timeseries_db_t *db, tsdb_page_cache_snapshot_t
       for (size_t j = 0; j < batch->count; j++) {
         if (batch->entries[j].offset == live_offset) {
           already_in_batch = true;
+          // The batch inherited this offset when it was cloned. If the live
+          // snapshot has since received a newer header for the same offset (a
+          // concurrent in-place update, e.g. a metadata page header rewrite at
+          // metadata.c), adopt it so the update isn't dropped on commit. Page
+          // (re)allocations always bump sequence_num, and compaction only adds
+          // new offsets or removes via removed_offsets (never rewrites an
+          // existing offset in place), so a higher live seq unambiguously means
+          // the batch's copy is stale.
+          if (live->entries[i].header.sequence_num > batch->entries[j].header.sequence_num) {
+            batch->entries[j].header = live->entries[i].header;
+          }
           break;
         }
       }
@@ -519,6 +576,17 @@ void tsdb_pagecache_commit_batch(timeseries_db_t *db, tsdb_page_cache_snapshot_t
       for (size_t j = 0; j < batch->count; j++) {
         if (batch->entries[j].offset == live_offset) {
           already_in_batch = true;
+          // The batch inherited this offset when it was cloned. If the live
+          // snapshot has since received a newer header for the same offset (a
+          // concurrent in-place update, e.g. a metadata page header rewrite at
+          // metadata.c), adopt it so the update isn't dropped on commit. Page
+          // (re)allocations always bump sequence_num, and compaction only adds
+          // new offsets or removes via removed_offsets (never rewrites an
+          // existing offset in place), so a higher live seq unambiguously means
+          // the batch's copy is stale.
+          if (live->entries[i].header.sequence_num > batch->entries[j].header.sequence_num) {
+            batch->entries[j].header = live->entries[i].header;
+          }
           break;
         }
       }

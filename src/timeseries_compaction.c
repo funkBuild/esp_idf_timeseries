@@ -274,9 +274,11 @@ static bool collect_points_for_series(timeseries_db_t* db, const tsdb_level_page
         continue;
       }
 
-      // If we haven't yet looked up the field type, do so now
+      // If we haven't yet looked up the field type, do so now. Use the cached
+      // lookup: a series' type is immutable, so the cache is always valid and
+      // avoids a full metadata-page scan per record during compaction.
       if (!type_resolved) {
-        if (!tsdb_lookup_series_type_in_metadata(db, fd_hdr.series_id, out_type)) {
+        if (!tsdb_lookup_series_type_cached(db, fd_hdr.series_id, out_type)) {
           ESP_LOGW(TAG, "No known field type for series => skipping");
           continue;
         }
@@ -697,72 +699,78 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
           break;
         }
       } else {
-        /* --- Gorilla path (BOOL, STRING) --- */
-        if (!timeseries_page_stream_writer_begin_series(&sw, uniq_ids.list[i], ftype)) {
-          ESP_LOGE(TAG, "Failed to begin_series for i=%zu", i);
-          if (ftype == TIMESERIES_FIELD_TYPE_STRING) {
-            for (size_t j = 0; j < pts_used; j++) {
-              free(pts[j].field_val.data.string_val.str);
+        /* --- Gorilla path (BOOL, STRING) ---
+         * Chunked like the ALP path above: a field-data record's record_count
+         * is uint16_t, so a single series with more than 65535 points (possible
+         * when many L0 pages merge) must be split into multiple consecutive
+         * Gorilla records. We reuse the ALP chunk cap (lowered in test builds so
+         * this path is exercised). Strings are freed as each value is written;
+         * `freed_upto` marks the first not-yet-freed point so the error paths
+         * free exactly the unwritten strings with no double-free. */
+        bool gorilla_failed = false;
+        size_t chunk_start = 0;
+        size_t freed_upto = 0;  // strings in [0, freed_upto) are written/freed
+        while (chunk_start < pts_used && !gorilla_failed) {
+          size_t chunk = pts_used - chunk_start;
+          if (chunk > TSDB_ALP_CHUNK_MAX_POINTS) chunk = TSDB_ALP_CHUNK_MAX_POINTS;
+          size_t chunk_end = chunk_start + chunk;
+
+          if (!timeseries_page_stream_writer_begin_series(&sw, uniq_ids.list[i], ftype)) {
+            ESP_LOGE(TAG, "Failed to begin_series for i=%zu chunk @%zu", i, chunk_start);
+            gorilla_failed = true;
+            break;
+          }
+
+          // PASS #1: Write timestamps for this chunk
+          bool write_failed = false;
+          for (size_t j = chunk_start; j < chunk_end && !write_failed; j++) {
+            if (!timeseries_page_stream_writer_write_timestamp(&sw, pts[j].timestamp)) {
+              ESP_LOGE(TAG, "Failed writing timestamp for j=%zu", j);
+              write_failed = true;
             }
           }
-          free(pts);
-          series_loop_failed = true;
-          break;
-        }
-
-        // PASS #1: Write timestamps
-        bool write_failed = false;
-        for (size_t j = 0; j < pts_used && !write_failed; j++) {
-          uint64_t ts = pts[j].timestamp;
-          if (!timeseries_page_stream_writer_write_timestamp(&sw, ts)) {
-            ESP_LOGE(TAG, "Failed writing timestamp for j=%zu", j);
-            write_failed = true;
+          if (write_failed) {
+            gorilla_failed = true;
+            break;
           }
-        }
 
-        if (write_failed) {
-          ESP_LOGE(TAG, "Timestamp write failed for series %zu, aborting compaction", i);
-          if (ftype == TIMESERIES_FIELD_TYPE_STRING) {
-            for (size_t j = 0; j < pts_used; j++) {
-              free(pts[j].field_val.data.string_val.str);
+          // finalize timestamps
+          timeseries_page_stream_writer_finalize_timestamp(&sw);
+
+          // PASS #2: Write values for this chunk (free strings as written)
+          for (size_t j = chunk_start; j < chunk_end && !write_failed; j++) {
+            if (!timeseries_page_stream_writer_write_value(&sw, &pts[j].field_val)) {
+              ESP_LOGE(TAG, "Failed writing value for j=%zu", j);
+              write_failed = true;
             }
+            if (ftype == TIMESERIES_FIELD_TYPE_STRING) {
+              free(pts[j].field_val.data.string_val.str);
+              pts[j].field_val.data.string_val.str = NULL;
+            }
+            freed_upto = j + 1;  // this index is now written/freed
           }
-          free(pts);
-          series_loop_failed = true;
-          break;
+          if (write_failed) {
+            gorilla_failed = true;
+            break;
+          }
+
+          if (!timeseries_page_stream_writer_end_series(&sw)) {
+            ESP_LOGE(TAG, "Failed to end_series for i=%zu chunk @%zu (%zu points)", i, chunk_start, chunk);
+            gorilla_failed = true;
+            break;
+          }
+
+          chunk_start = chunk_end;
         }
 
-        // finalize timestamps
-        timeseries_page_stream_writer_finalize_timestamp(&sw);
-
-        // PASS #2: Write values
-        size_t values_written = 0;
-        for (size_t j = 0; j < pts_used && !write_failed; j++) {
-          if (!timeseries_page_stream_writer_write_value(&sw, &pts[j].field_val)) {
-            ESP_LOGE(TAG, "Failed writing value for j=%zu", j);
-            write_failed = true;
-          }
+        if (gorilla_failed) {
+          // Free strings not yet written/freed: current chunk's unwritten tail
+          // plus all remaining chunks ([freed_upto, pts_used)).
           if (ftype == TIMESERIES_FIELD_TYPE_STRING) {
-            free(pts[j].field_val.data.string_val.str);
-            pts[j].field_val.data.string_val.str = NULL;
-          }
-          values_written = j + 1;
-        }
-
-        if (write_failed) {
-          ESP_LOGE(TAG, "Value write failed for series %zu, aborting compaction", i);
-          if (ftype == TIMESERIES_FIELD_TYPE_STRING) {
-            for (size_t k = values_written; k < pts_used; k++) {
+            for (size_t k = freed_upto; k < pts_used; k++) {
               free(pts[k].field_val.data.string_val.str);
             }
           }
-          free(pts);
-          series_loop_failed = true;
-          break;
-        }
-
-        if (!timeseries_page_stream_writer_end_series(&sw)) {
-          ESP_LOGE(TAG, "Failed to end_series for i=%zu with %zu points", i, pts_used);
           free(pts);
           series_loop_failed = true;
           break;
@@ -927,6 +935,14 @@ static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t sour
   ESP_LOGI(TAG, "Marking %zu old level-%u pages as obsolete",
            page_count, source_level);
 
+  // Acquire flash_write_mutex once for the whole loop rather than per page:
+  // it is a short loop bounded by MAX_PAGES_PER_LEVEL and this avoids
+  // page_count lock acquire/release round-trips. The cache-removal calls in the
+  // loop never take flash_write_mutex, so holding it across them cannot deadlock.
+  if (db->flash_write_mutex) {
+    xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+  }
+
   for (size_t i = 0; i < page_count; i++) {
     uint32_t pofs = pages[i].offset;
     ESP_LOGI(TAG, "Marking level-%u page @0x%08" PRIx32 " as obsolete.", source_level, pofs);
@@ -945,14 +961,8 @@ static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t sour
       // 3) Mark obsolete
       hdr.page_state = TIMESERIES_PAGE_STATE_OBSOLETE;
 
-      // 4) Write updated header (protected by flash_write_mutex)
-      if (db->flash_write_mutex) {
-        xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
-      }
+      // 4) Write updated header (flash_write_mutex held across the whole loop)
       err = esp_partition_write(db->partition, pofs, &hdr, sizeof(hdr));
-      if (db->flash_write_mutex) {
-        xSemaphoreGive(db->flash_write_mutex);
-      }
       if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed marking page @0x%08" PRIx32 " obsolete (err=0x%x)", pofs, err);
         continue;
@@ -974,6 +984,10 @@ static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t sour
     } else {
       ESP_LOGW(TAG, "Skipping page @0x%08" PRIx32 " (not an active level-%u field-data page).", pofs, source_level);
     }
+  }
+
+  if (db->flash_write_mutex) {
+    xSemaphoreGive(db->flash_write_mutex);
   }
 
   return true;
@@ -1135,9 +1149,10 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
       desc.record_count = fd_hdr.record_count;
       desc.record_length = fd_hdr.record_length;
       desc.data_flags = fd_hdr.flags;
-      // Figure out field_type from metadata
+      // Figure out field_type from metadata. Cached lookup: the type is
+      // immutable, so this avoids a full metadata scan for every record.
       timeseries_field_type_e ftype;
-      if (!tsdb_lookup_series_type_in_metadata(db, fd_hdr.series_id, &ftype)) {
+      if (!tsdb_lookup_series_type_cached(db, fd_hdr.series_id, &ftype)) {
         // skip unknown series
         continue;
       }

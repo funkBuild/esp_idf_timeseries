@@ -61,6 +61,12 @@ bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
     placeholder_hdr.magic_number = TIMESERIES_MAGIC_NUM;
     placeholder_hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
     placeholder_hdr.page_size = reserve_size;
+    // Sequence 0 (real pages start at 1): a placeholder is always superseded by
+    // the real header written at finalize. The commit-batch merge resolves a
+    // shared offset by newest sequence_num, so the placeholder must compare as
+    // OLDEST — leaving it at the memset 0xFFFFFFFF would make it wrongly win and
+    // clobber the real header, hiding the finalized page from readers.
+    placeholder_hdr.sequence_num = 0;
 
     // Register in live snapshot (for insert path visibility)
     if (!batch_snapshot) {
@@ -405,6 +411,12 @@ static bool find_level0_page_with_space(timeseries_db_t *db,
 
   *out_any_l0_exists = false;
 
+  // Page to skip in the fallback scan: only set when step 1 found the cached
+  // page genuinely too full. It must stay UINT32_MAX otherwise — using the
+  // (possibly stale/zero) last_l0_page_offset would wrongly skip a valid L0
+  // page that happens to live at that offset (e.g. offset 0 on a cold cache).
+  uint32_t skip_page = UINT32_MAX;
+
   // ---------------------------------------
   // 1) Quick check against cached L0 page (no flash read needed)
   // ---------------------------------------
@@ -423,17 +435,16 @@ static bool find_level0_page_with_space(timeseries_db_t *db,
         *out_used_offset = db->last_l0_used_offset;
         return true;
       }
-      // Page too full — invalidate and scan for another
+      // Page too full — remember it so the scan skips its expensive
+      // field-data iteration, then invalidate and scan for another.
+      skip_page = db->last_l0_page_offset;
       db->last_l0_cache_valid = false;
     }
   }
 
   // ---------------------------------------
   // 2) Fallback: scan all pages in the cache
-  //    Skip the expensive field-data iteration for the page we just
-  //    determined is full (db->last_l0_page_offset before invalidation).
   // ---------------------------------------
-  uint32_t skip_page = db->last_l0_page_offset; // page we just checked
 
   timeseries_page_cache_iterator_t page_iter;
   if (!timeseries_page_cache_iterator_init(db, &page_iter)) {
@@ -541,7 +552,11 @@ static bool create_level0_field_page(timeseries_db_t *db,
   new_hdr.magic_number = TIMESERIES_MAGIC_NUM;
   new_hdr.page_type = TIMESERIES_PAGE_TYPE_FIELD_DATA;
   new_hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
-  new_hdr.sequence_num = ++db->sequence_num;
+  // Atomic increment: a plain ++ on the _Atomic field is a non-atomic
+  // read-modify-write that can race with a concurrent page allocation
+  // (insert vs. background compaction) and hand out duplicate sequence
+  // numbers, which silently breaks "newest wins" during merge/dedup.
+  new_hdr.sequence_num = atomic_fetch_add(&db->sequence_num, 1) + 1;
   new_hdr.field_data_level = 0;
   new_hdr.page_size = l0_size;
 

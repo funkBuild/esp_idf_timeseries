@@ -210,17 +210,6 @@ typedef struct {
   timeseries_page_header_t header;
 } timeseries_cached_page_t;
 
-// Metadata mmap entry for caching mapped metadata pages
-typedef struct {
-  uint32_t page_offset;           // Flash offset of the mapped page
-  const void *mapped_ptr;          // Pointer to mapped memory region
-  esp_partition_mmap_handle_t handle;  // Handle for unmapping
-  bool valid;                       // Is this entry valid/mapped?
-} metadata_mmap_entry_t;
-
-// Maximum number of metadata pages we can map simultaneously
-#define METADATA_MMAP_CACHE_SIZE 4
-
 // Forward declaration of snapshot type
 typedef struct tsdb_page_cache_snapshot tsdb_page_cache_snapshot_t;
 
@@ -242,6 +231,8 @@ typedef struct {
   SemaphoreHandle_t snapshot_mutex;
   SemaphoreHandle_t flash_write_mutex;
   SemaphoreHandle_t region_alloc_mutex;       // Serializes blank-region allocation
+  SemaphoreHandle_t series_cache_mutex;       // Guards the series-ID cache (lock-free reads on dual-core would tear the 128-byte key)
+  SemaphoreHandle_t type_cache_mutex;         // Guards the series type cache (read by queries, written by inserts)
   tsdb_page_cache_snapshot_t *active_batch;   // Points to compaction's batch snapshot while active; NULL otherwise
 
   // Compaction claim set (prevents inserts into pages being compacted)
@@ -292,10 +283,6 @@ typedef struct {
 #define MEAS_ID_CACHE_SIZE 16
   meas_cache_entry_t *meas_cache; // heap-allocated array of MEAS_ID_CACHE_SIZE
   uint8_t meas_cache_next;        // round-robin eviction index
-
-  // Metadata mmap cache for fast read access
-  metadata_mmap_entry_t metadata_mmap_cache[METADATA_MMAP_CACHE_SIZE];
-  bool metadata_mmap_enabled;  // Set to true if mmap is supported
 
   // Application hooks (registered via timeseries_set_compaction_hooks /
   // timeseries_set_log_hook). Raw function-pointer types so this internal

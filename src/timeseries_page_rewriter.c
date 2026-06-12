@@ -22,7 +22,9 @@ static bool write_initial_page_header(timeseries_page_rewriter_t *rewriter) {
   hdr.magic_number = TIMESERIES_MAGIC_NUM;
   hdr.page_type = TIMESERIES_PAGE_TYPE_FIELD_DATA;
   hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
-  hdr.sequence_num = ++(rewriter->db->sequence_num);
+  // Atomic increment to avoid duplicate sequence numbers across concurrent
+  // page allocations (the field is _Atomic but ++ is a non-atomic RMW).
+  hdr.sequence_num = atomic_fetch_add(&rewriter->db->sequence_num, 1) + 1;
   hdr.field_data_level = rewriter->level;
   hdr.page_size = rewriter->capacity;
   if (esp_partition_write(rewriter->db->partition, rewriter->base_offset, &hdr,

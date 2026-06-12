@@ -597,7 +597,16 @@ static bool merge_sorted_field_data(timeseries_query_result_t *result,
         }
         break;
       }
-      // Timestamp exists — place value immediately (combines count + placement)
+      // Timestamp exists — place value immediately (combines count + placement).
+      // If a previous series mapped to this same column (columns are keyed by
+      // field name) already placed an owned string at this (column,timestamp),
+      // free it before overwriting so we don't leak it.
+      {
+        timeseries_field_value_t *slot = &result->columns[col_index].values[oi];
+        if (slot->type == TIMESERIES_FIELD_TYPE_STRING && slot->data.string_val.str) {
+          free(slot->data.string_val.str);
+        }
+      }
       result->columns[col_index].values[oi] = new_vals[ni];
       oi++;
     }
@@ -628,13 +637,24 @@ static bool merge_sorted_field_data(timeseries_query_result_t *result,
     } else if (result->timestamps[oi] < new_ts[ni]) {
       take_old = false;
     } else {
-      // Equal timestamps — keep old row, set value for current column
+      // Equal timestamps — keep old row, set value for current column.
       if ((size_t)ki != (size_t)oi) {
         result->timestamps[ki] = result->timestamps[oi];
         for (size_t c = 0; c < result->num_columns; c++) {
           if (c != col_index) {
             result->columns[c].values[ki] = result->columns[c].values[oi];
           }
+        }
+      }
+      // The old value for this column at row `oi` is being superseded by the
+      // newer series' value (col_index is intentionally not copied above). Free
+      // it if it owns a string so we don't leak it. This slot is never read
+      // again (only overwritten as ki descends), so NULLing is just insurance.
+      {
+        timeseries_field_value_t *old_cv = &result->columns[col_index].values[oi];
+        if (old_cv->type == TIMESERIES_FIELD_TYPE_STRING && old_cv->data.string_val.str) {
+          free(old_cv->data.string_val.str);
+          old_cv->data.string_val.str = NULL;
         }
       }
       result->columns[col_index].values[ki] = new_vals[ni];

@@ -28,27 +28,24 @@ static bool copy_flash_block(const esp_partition_t* part, uint32_t src_offset, u
   if (!part) {
     return false;
   }
-  uint8_t* buf = (uint8_t*)malloc(1024);
-  if (!buf) {
-    ESP_LOGE(TAG, "OOM copying flash block");
-    return false;
-  }
+  // Small fixed stack buffer instead of a per-call malloc: relocation is on the
+  // compaction task (6 KB stack) and only copies during region growth, so a
+  // modest 512-byte bounce buffer is both stack-safe and avoids the heap churn
+  // (and the OOM failure path) on every relocation.
+  uint8_t buf[512];
 
   while (size > 0) {
-    uint32_t chunk = (size > 1024) ? 1024 : size;
+    uint32_t chunk = (size > sizeof(buf)) ? sizeof(buf) : size;
     if (esp_partition_read(part, src_offset, buf, chunk) != ESP_OK) {
-      free(buf);
       return false;
     }
     if (esp_partition_write(part, dst_offset, buf, chunk) != ESP_OK) {
-      free(buf);
       return false;
     }
     src_offset += chunk;
     dst_offset += chunk;
     size -= chunk;
   }
-  free(buf);
   return true;
 }
 
@@ -102,18 +99,22 @@ static bool relocate_region(timeseries_page_stream_writer_t* writer_ctx, uint32_
  * region. If needed, relocate & double capacity.
  */
 static bool ensure_capacity(timeseries_page_stream_writer_t* writer, size_t needed_bytes) {
-  uint32_t end_needed = writer->write_ptr + needed_bytes;
   uint32_t region_end = writer->base_offset + writer->capacity;
-  if (end_needed <= region_end) {
+  // Compute available space with subtraction (never write_ptr + needed_bytes):
+  // the addition can wrap uint32 for a corrupt/huge needed_bytes and falsely
+  // report "fits", leading to an out-of-region flash write.
+  uint32_t avail = (writer->write_ptr <= region_end) ? (region_end - writer->write_ptr) : 0;
+  if (needed_bytes <= avail) {
     return true;  // enough space already
   }
 
   // Need to relocate. Grow to exactly fit the request, rounded up to 4096.
-  // Invariant: needed_from_base > old_size (we only arrive here when
-  // end_needed > region_end), so new_size is always strictly > old_size.
+  // Invariant: needed_from_base > old_size (we only arrive here when the
+  // request does not fit), so new_size is always strictly > old_size.
   uint32_t old_offset = writer->base_offset;
   uint32_t old_size = writer->capacity;
-  uint32_t needed_from_base = end_needed - writer->base_offset;
+  uint32_t used_from_base = writer->write_ptr - writer->base_offset;
+  uint32_t needed_from_base = used_from_base + (uint32_t)needed_bytes;
   uint32_t new_size = (needed_from_base + 4095u) & ~4095u;
   uint32_t new_offset = 0;
 
@@ -182,10 +183,10 @@ static bool ensure_capacity(timeseries_page_stream_writer_t* writer, size_t need
   writer->base_offset = new_offset;
   writer->capacity = new_size;
 
-  // Check again
-  end_needed = writer->write_ptr + needed_bytes;
+  // Check again (subtraction-based to avoid uint32 wrap, as above)
   region_end = writer->base_offset + writer->capacity;
-  if (end_needed > region_end) {
+  uint32_t avail_after = (writer->write_ptr <= region_end) ? (region_end - writer->write_ptr) : 0;
+  if (needed_bytes > avail_after) {
     ESP_LOGE(TAG, "Relocation insufficient for needed=%zu bytes", needed_bytes);
     return false;
   }
@@ -257,7 +258,9 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
   hdr.magic_number = TIMESERIES_MAGIC_NUM;
   hdr.page_type = TIMESERIES_PAGE_TYPE_FIELD_DATA;
   hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
-  hdr.sequence_num = ++db->sequence_num;
+  // Atomic increment to avoid duplicate sequence numbers across concurrent
+  // page allocations (the field is _Atomic but ++ is a non-atomic RMW).
+  hdr.sequence_num = atomic_fetch_add(&db->sequence_num, 1) + 1;
   hdr.field_data_level = to_level;
   hdr.page_size = initial_size;
 
@@ -407,6 +410,7 @@ bool timeseries_page_stream_writer_finalize_timestamp(timeseries_page_stream_wri
   // Finalize the Gorilla TS stream (flush final bits to flash)
   if (!gorilla_stream_finish(&writer->ts_stream)) {
     ESP_LOGE(TAG, "Failed finishing gorilla ts_stream");
+    gorilla_stream_deinit(&writer->ts_stream);  // avoid leaking the encoder on failure
     return false;
   }
   // Capture the offset where TS data ends
@@ -507,6 +511,7 @@ bool timeseries_page_stream_writer_end_series(timeseries_page_stream_writer_t* w
   // 2) Finalize the Gorilla VAL stream (flush final bits to flash)
   if (!gorilla_stream_finish(&writer->val_stream)) {
     ESP_LOGE(TAG, "Failed finishing gorilla val_stream");
+    gorilla_stream_deinit(&writer->val_stream);  // avoid leaking the encoder on failure
     return false;
   }
   // Capture the end offset for values
@@ -710,6 +715,15 @@ void timeseries_page_stream_writer_abort(timeseries_page_stream_writer_t* writer
   ESP_LOGW(TAG, "Aborting stream writer for page @0x%08" PRIx32,
            writer->base_offset);
   writer->finalized = true;
+
+  // Release any in-progress Gorilla encoders.  If a series was begun but never
+  // ended (the common abort case) both streams hold heap-allocated encoders
+  // that end_series() would otherwise have freed.  gorilla_stream_deinit() is
+  // NULL-safe and idempotent: the writer is fully zeroed in init() and each
+  // deinit clears encoder_impl, so this is safe whether begin_series() ran or
+  // not, and whether the streams were already finished.
+  gorilla_stream_deinit(&writer->ts_stream);
+  gorilla_stream_deinit(&writer->val_stream);
 
   // Mark the partially-written page as OBSOLETE on flash so it won't be
   // re-scanned on reboot.  Clearing page_state bits (ACTIVE 0x01 ->

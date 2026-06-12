@@ -131,11 +131,16 @@ bool timeseries_points_iterator_init(
 
     memcpy(&col_hdr, record_buf, sizeof(col_hdr));
 
-    // Basic boundary check
-    uint32_t val_end = (uint32_t)sizeof(col_hdr) + col_hdr.ts_len + col_hdr.val_len;
-    if (val_end > record_length ||
-        record_data_offset + val_end > db->partition->size) {
-      ESP_LOGE(TAG, "Column data extends out of partition");
+    // Boundary check using subtraction only. ts_len/val_len are uint32 read
+    // from flash; computing sizeof(col_hdr) + ts_len + val_len could wrap uint32
+    // for a corrupt record and falsely pass a "<= record_length" test, letting
+    // val_data point past the record buffer and feed a bogus length to the
+    // decoders. The record_buf is exactly record_length bytes, so bound against
+    // it; a successful read already guarantees it lies within the partition.
+    if (record_length < sizeof(col_hdr) ||
+        col_hdr.ts_len > record_length - (uint32_t)sizeof(col_hdr) ||
+        col_hdr.val_len > record_length - (uint32_t)sizeof(col_hdr) - col_hdr.ts_len) {
+      ESP_LOGE(TAG, "Column data extends out of record buffer");
       free(record_buf);
       iter->valid = false;
       return false;

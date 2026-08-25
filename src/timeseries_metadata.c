@@ -198,6 +198,13 @@ bool tsdb_find_measurement_id(timeseries_db_t* db, const char* measurement_name,
         continue;
       }
 
+      if (e_hdr.value_len != sizeof(uint32_t)) {
+        ESP_LOGW(TAG,
+                 "Skipping measurement entry with bad value_len=%u (key_type=%u key_len=%u)",
+                 (unsigned)e_hdr.value_len, (unsigned)e_hdr.key_type, (unsigned)e_hdr.key_len);
+        continue;
+      }
+
       if (e_hdr.key_len == strlen(measurement_name)) {
         if (e_hdr.key_len < 256) {
           char *key_buf = (char *)malloc(256);
@@ -310,7 +317,7 @@ bool tsdb_find_max_measurement_id(timeseries_db_t *db, uint32_t *out_max) {
       // Read the measurement ID (stored as the value)
       char key_buf[64];
       uint32_t val = 0;
-      if (e_hdr.key_len < sizeof(key_buf) &&
+      if (e_hdr.value_len == sizeof(uint32_t) && e_hdr.key_len < sizeof(key_buf) &&
           timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key_buf, &val)) {
         if (val > *out_max) {
           *out_max = val;
@@ -585,6 +592,7 @@ bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, co
         if (e_hdr.value_len == 0) continue;
 
         char stored_key[128];
+        if (e_hdr.key_len >= sizeof(stored_key)) continue;
         size_t series_count = e_hdr.value_len / 16;
         unsigned char* all_series_ids = malloc(e_hdr.value_len);
         if (!all_series_ids) {
@@ -1644,7 +1652,7 @@ bool tsdb_list_all_measurements(timeseries_db_t* db, timeseries_string_list_t* o
 
       // The measurement name is e_hdr.key_len long
       // We'll read that plus the ID, but we only need the name for listing.
-      if (e_hdr.key_len > 0 && e_hdr.key_len < 256) {
+      if (e_hdr.value_len == sizeof(uint32_t) && e_hdr.key_len > 0 && e_hdr.key_len < 256) {
         char *name_buf = (char *)malloc(256);
         if (!name_buf) {
           ESP_LOGE(TAG, "OOM allocating name_buf in tsdb_list_all_measurements");
@@ -2042,7 +2050,7 @@ bool tsdb_remove_measurement_from_metadata(timeseries_db_t* db, const char* meas
 
       if (e_hdr.key_type == TIMESERIES_KEYTYPE_MEASUREMENT) {
         // Read the key and check if it matches measurement_name
-        if (e_hdr.key_len > 0 && e_hdr.key_len < 256) {
+        if (e_hdr.value_len == sizeof(uint32_t) && e_hdr.key_len > 0 && e_hdr.key_len < 256) {
           char *name_buf = (char *)malloc(256);
           if (!name_buf) {
             ESP_LOGE(TAG, "OOM allocating name_buf in tsdb_remove_measurement_from_metadata");

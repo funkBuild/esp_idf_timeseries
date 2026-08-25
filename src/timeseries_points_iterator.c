@@ -393,6 +393,17 @@ bool timeseries_points_iterator_init(
       return false;
     }
 
+    // Same subtraction-based bound as the compressed path: ts_len/val_len are
+    // uint32 read from flash, and additive forms can wrap for a corrupt record,
+    // letting val_offset point at unrelated flash.
+    if (record_length < sizeof(uc_hdr) ||
+        uc_hdr.ts_len > record_length - (uint32_t)sizeof(uc_hdr) ||
+        uc_hdr.val_len > record_length - (uint32_t)sizeof(uc_hdr) - uc_hdr.ts_len) {
+      ESP_LOGE(TAG, "Uncompressed column data extends out of record");
+      iter->valid = false;
+      return false;
+    }
+
     uint32_t ts_size = record_count * sizeof(uint64_t);
     uint32_t ts_offset = record_data_offset + sizeof(uc_hdr);
     uint32_t val_offset = ts_offset + uc_hdr.ts_len;

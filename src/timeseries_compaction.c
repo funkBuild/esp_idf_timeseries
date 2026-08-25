@@ -1651,9 +1651,21 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_
       if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
       return false;
     }
+    uint32_t dropped_records = 0;
     while (timeseries_fielddata_iterator_next(&f_iter, &fd_hdr)) {
       // Skip deleted records.
       if ((fd_hdr.flags & TSDB_FIELDDATA_FLAG_DELETED) == 0) {
+        continue;
+      }
+      // A corrupt record_length can exceed the capacity computed in pass one;
+      // aborting here would leave the old page ACTIVE forever (retried and
+      // re-failed every cycle), so drop the record and keep compacting.
+      uint32_t needed = sizeof(timeseries_field_data_header_t) + fd_hdr.record_length;
+      if ((rewriter.write_ptr + needed) > (rewriter.base_offset + rewriter.capacity)) {
+        ESP_LOGW(TAG, "Skipping oversized/corrupt record page=0x%08X offset=0x%08X len=%u",
+                 (unsigned int)old_page_ofs, (unsigned int)f_iter.current_record_offset,
+                 (unsigned int)fd_hdr.record_length);
+        dropped_records++;
         continue;
       }
       // Write the record into the new page.
@@ -1666,6 +1678,11 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_
       }
     }
     timeseries_fielddata_iterator_deinit(&f_iter);
+
+    if (dropped_records > 0) {
+      ESP_LOGW(TAG, "Compacted page 0x%08X with %u records dropped", (unsigned int)old_page_ofs,
+               (unsigned int)dropped_records);
+    }
 
     // 6) Finalize the new page.
     if (!timeseries_page_rewriter_finalize(&rewriter)) {

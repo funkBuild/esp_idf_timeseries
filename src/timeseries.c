@@ -36,6 +36,18 @@ static timeseries_db_t s_tsdb = {
 };
 static _Atomic bool s_init_in_progress = false;
 
+/* Set when timeseries_deinit() gave up waiting for a compaction task and
+ * returned without tearing anything down. That task still owns every mutex,
+ * the semaphore and the caches in s_tsdb, and there is no way to reclaim
+ * them. A subsequent timeseries_init() must NOT proceed: it would clear
+ * compaction_in_progress and overwrite the mutexes and semaphore under the
+ * still-running task, giving two concurrent compactions mutating the same
+ * flash with no mutual exclusion.
+ *
+ * Distinct from compaction_in_progress, which a *clean* deinit also leaves
+ * true — that case is fine to re-init from. */
+static _Atomic bool s_deinit_abandoned = false;
+
 void timeseries_set_compaction_hooks(timeseries_compaction_hook_t pre_compact,
                                      timeseries_compaction_hook_t post_compact) {
     s_tsdb.pre_compact_hook = pre_compact;
@@ -121,6 +133,14 @@ bool tsdb_launch_compaction(timeseries_db_t *db) {
 bool timeseries_init(void) {
   if (s_tsdb.initialized) {
     return true;
+  }
+
+  if (atomic_load(&s_deinit_abandoned)) {
+    ESP_LOGE(TAG,
+             "Refusing to init: a previous deinit abandoned teardown with a "
+             "compaction task still running, which still owns the TSDB "
+             "mutexes and caches");
+    return false;
   }
 
   // Guard against concurrent init calls
@@ -577,6 +597,8 @@ void timeseries_deinit(void) {
       ESP_LOGE(TAG,
                "Timed out waiting for compaction task; aborting deinit and "
                "leaking TSDB resources rather than freeing them under it");
+      /* Block any later re-init: the zombie still owns these globals. */
+      atomic_store(&s_deinit_abandoned, true);
       return;
     }
   }

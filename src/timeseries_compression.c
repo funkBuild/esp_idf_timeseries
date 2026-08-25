@@ -76,6 +76,14 @@ bool timeseries_compression_decompress(const uint8_t *in_data, size_t in_size,
     return false;
   }
 
+  /* Answer an empty input explicitly rather than handing avail_in == 0 to
+   * inflate and relying on its no-progress reporting to break the loop. */
+  if (in_size == 0) {
+    *out_data = NULL;
+    *out_size = 0;
+    return true;
+  }
+
   z_stream strm;
   memset(&strm, 0, sizeof(strm));
   strm.next_in = (Bytef *)in_data;
@@ -123,10 +131,28 @@ bool timeseries_compression_decompress(const uint8_t *in_data, size_t in_size,
     strm.next_out = buffer + total_output;
     strm.avail_out = (uInt)(buffer_capacity - total_output);
 
+    const uInt avail_in_before = strm.avail_in;
+    const uInt avail_out_before = strm.avail_out;
+
     inflate_ret = inflate(&strm, Z_NO_FLUSH);
 
     if (inflate_ret != Z_OK && inflate_ret != Z_STREAM_END) {
       ESP_LOGE(TAG, "inflate failed: %d", inflate_ret);
+      free(buffer);
+      inflateEnd(&strm);
+      return false;
+    }
+
+    /* Terminate on a stalled iteration instead of trusting inflate to report
+     * one. This loop only exits on Z_STREAM_END, so an iteration that
+     * consumes no input and produces no output while returning Z_OK would
+     * spin forever on a truncated or malformed record. zlib documents
+     * Z_BUF_ERROR for the no-progress case, which the branch above already
+     * catches, so this is belt-and-braces — but it makes termination a
+     * property of this loop rather than of zlib's exact return code. */
+    if (inflate_ret == Z_OK && strm.avail_in == avail_in_before &&
+        strm.avail_out == avail_out_before) {
+      ESP_LOGE(TAG, "inflate made no progress; treating as corrupt input");
       free(buffer);
       inflateEnd(&strm);
       return false;

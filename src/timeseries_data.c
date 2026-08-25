@@ -133,6 +133,19 @@ static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
  * @brief Returns the uncompressed size for a single field value (in a column).
  */
 
+/* Effective payload length of a string field.
+ *
+ * A NULL str with a non-zero length would make the writer memcpy from NULL.
+ * Both the sizing and writing paths below route through this so they cannot
+ * disagree about how many bytes the record holds — a mismatch there would
+ * either truncate the record or overrun the buffer the size call reserved. */
+static size_t field_value_string_len(const timeseries_field_value_t *val) {
+  if (val->data.string_val.str == NULL) {
+    return 0;
+  }
+  return val->data.string_val.length;
+}
+
 static size_t
 field_value_uncompressed_size(const timeseries_field_value_t *val) {
   switch (val->type) {
@@ -143,7 +156,7 @@ field_value_uncompressed_size(const timeseries_field_value_t *val) {
     return 1; // store as 0/1
   case TIMESERIES_FIELD_TYPE_STRING:
     // store a 4-byte length + the string data
-    return 4 + val->data.string_val.length;
+    return 4 + field_value_string_len(val);
   default:
     ESP_LOGE("TimeseriesData", "Unknown field type %d in uncompressed_size", val->type);
     return 0;
@@ -177,7 +190,9 @@ field_value_write_uncompressed(const timeseries_field_value_t *val,
     break;
   }
   case TIMESERIES_FIELD_TYPE_STRING: {
-    uint32_t len = (uint32_t)val->data.string_val.length;
+    /* Must match field_value_uncompressed_size exactly: the caller sized
+     * out_buf from that function, so any divergence here overruns it. */
+    uint32_t len = (uint32_t)field_value_string_len(val);
     memcpy(out_buf, &len, 4);
     written = 4;
     if (len > 0) {

@@ -564,7 +564,20 @@ void timeseries_deinit(void) {
   if (atomic_load(&s_tsdb.compaction_in_progress)) {
     ESP_LOGI(TAG, "Waiting for compaction task to finish...");
     if (xSemaphoreTake(s_tsdb.compaction_done_sem, pdMS_TO_TICKS(30000)) != pdTRUE) {
-      ESP_LOGW(TAG, "Timed out waiting for compaction task to finish");
+      /* Abort the teardown. Previously this only warned and then deleted
+       * compaction_done_sem, flash_write_mutex, region_alloc_mutex and
+       * snapshot_mutex, and freed the write buffer and caches — all of which
+       * the still-running compaction task is actively using. It would then
+       * xSemaphoreGive a deleted semaphore on exit.
+       *
+       * Leaking these is strictly better than destroying them under a live
+       * task. `initialized` stays false, so no new inserts or compactions
+       * start, and the running one completes against objects that are still
+       * valid. */
+      ESP_LOGE(TAG,
+               "Timed out waiting for compaction task; aborting deinit and "
+               "leaking TSDB resources rather than freeing them under it");
+      return;
     }
   }
   // Prevent any new compaction from being launched during cleanup

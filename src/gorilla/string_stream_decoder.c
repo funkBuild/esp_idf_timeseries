@@ -195,6 +195,13 @@ static bool refill_input_buffer(StringStreamDecoder *dec) {
     return false;
   }
 
+  /* Clamp to the space we offered. A callback reporting more than `space`
+   * would push in_buffer_size past STRING_DECODER_IN_CHUNK_SIZE, and the
+   * later memmove/inflate over in_buffer would run off the end of it. */
+  if (filled > space) {
+    filled = space;
+  }
+
   dec->in_buffer_size += filled;
   return true;
 }

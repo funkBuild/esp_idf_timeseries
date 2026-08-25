@@ -42,6 +42,11 @@ bool bitreader_refill(BitReader *br) {
     if (!br->fill_cb(br->fill_ctx, br->buffer + br->buf_size, to_read,
                      &filled))
       return filled > 0;
+    /* Clamp to the space we offered: a callback reporting more than to_read
+     * would push buf_size past the 64-byte buffer, and later reads (and the
+     * memmove above on the next call) would run off the end. */
+    if (filled > (size_t)to_read)
+      filled = (size_t)to_read;
     br->buf_size += (int)filled;
   }
   return br->buf_size > br->buf_byte;

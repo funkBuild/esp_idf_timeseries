@@ -481,10 +481,49 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
     // Gather the array of values for this field
     const timeseries_field_value_t* field_array = &data->field_values[i * data->num_points];
 
+    // A series' type is immutable, but the metadata check above only runs on
+    // a series-id cache miss and only inspects the first value. Re-validate on
+    // every insert and check every point, so a type change or a mixed-type
+    // batch can't write values that disagree with the metadata type (readers
+    // size each value from the metadata type, so a mismatched record is
+    // misparsed on read/compaction). Usually a RAM type-cache hit, but a cache
+    // eviction makes it a metadata scan.
+    //
+    // A mismatch fails the whole field rather than dropping the offending
+    // points: partial acceptance while still returning success would hide lost
+    // writes from the caller, and the cache-miss path above already hard-fails
+    // a type conflict.
+    timeseries_field_type_e expected_type;
+    if (tsdb_lookup_series_type_cached(&s_tsdb, series_id, &expected_type)) {
+      size_t mismatched = 0;
+      for (size_t p = 0; p < data->num_points; p++) {
+        if (field_array[p].type != expected_type) {
+          mismatched++;
+        }
+      }
+      if (mismatched > 0) {
+        // Tick count, not esp_timer_get_time(): inserts arrive from more than
+        // one task and 64-bit loads/stores are not atomic on Xtensa.
+        static uint32_t s_last_type_warn_tick = 0;
+        uint32_t now_tick = (uint32_t)xTaskGetTickCount();
+        if (now_tick - s_last_type_warn_tick > pdMS_TO_TICKS(10000)) {
+          s_last_type_warn_tick = now_tick;
+          ESP_LOGW(TAG,
+                   "Field '%s': %zu of %zu point(s) do not match series type=%d, "
+                   "skipping field (a series' type is immutable)",
+                   data->field_names[i], mismatched, data->num_points, (int)expected_type);
+        }
+        any_field_failed = true;
+        continue;
+      }
+    }
+
     // 2) Insert multi data points in one entry
     ESP_LOGD(TAG, "Inserting field %zu/%zu: '%s' (%zu points)",
              i + 1, data->num_fields, data->field_names[i], data->num_points);
-    if (!tsdb_append_multiple_points(&s_tsdb, series_id, data->timestamps_ms, field_array, data->num_points)) {
+    bool appended = tsdb_append_multiple_points(&s_tsdb, series_id, data->timestamps_ms,
+                                               field_array, data->num_points);
+    if (!appended) {
       ESP_LOGE(TAG, "Failed to insert multi points for field '%s'", data->field_names[i]);
       any_field_failed = true;
       continue;  // best-effort: try remaining fields to minimize inconsistency

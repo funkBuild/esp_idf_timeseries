@@ -17,6 +17,11 @@
 
 static const char *TAG = "PointsIterator";
 
+// Same sanity cap the compressed path applies (see
+// gorilla/string_stream_decoder.c): no stored string is ever this large, so
+// anything bigger is a corrupt length word.
+#define TSDB_STRING_MAX_LEN 65536
+
 /* --------------------------------------------------------------------------
  * Gorilla decoder fill callback
  * --------------------------------------------------------------------------*/
@@ -544,7 +549,11 @@ bool timeseries_points_iterator_init(
 
         // Allocate and copy the string data
         if (str_len > 0) {
-          if (offset + str_len > uc_hdr.val_len) {
+          // Subtraction form: offset <= val_len holds here (the length-word
+          // check above just passed), so this cannot wrap the way the
+          // additive form could for a corrupt str_len near UINT32_MAX.
+          if (str_len > uc_hdr.val_len - offset ||
+              str_len > TSDB_STRING_MAX_LEN) {
             ESP_LOGE(TAG, "Value buffer too small for string data at i=%zu", i);
             iter->valid = false;
             break;

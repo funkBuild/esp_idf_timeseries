@@ -29,6 +29,11 @@ typedef struct timeseries_page_stream_writer {
   uint32_t capacity;
   bool finalized;
 
+  // Optional borrowed revisions for the next record, supplied by compaction.
+  // Count 1 broadcasts a single revision to every point.
+  const uint64_t *point_revisions;
+  size_t point_revision_count;
+
   // Bookkeeping for the current series:
   timeseries_field_data_header_t fd_hdr;
   uint32_t fd_hdr_offset;

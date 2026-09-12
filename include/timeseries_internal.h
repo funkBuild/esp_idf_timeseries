@@ -121,6 +121,11 @@ typedef struct {
  * Bit 2 = 1 (erased default) → Gorilla (all pre-existing pages, backward compat)
  * Bit 2 = 0 (cleared)        → ALP (int64 timestamps + float64/int64 values) */
 #define TSDB_FIELDDATA_FLAG_ENCODING_ALP  0x04
+/* Cleared bits identify persisted write order; erased records use legacy page order. */
+#define TSDB_FIELDDATA_FLAG_REVISION 0x08
+#define TSDB_FIELDDATA_FLAG_REVISION_VECTOR 0x10
+/* Vector codec: erased = ALP, cleared = (uint16 run, uint64 revision) pairs. */
+#define TSDB_FIELDDATA_FLAG_REVISION_RLE 0x20
 
 /**
  * @brief Header stored at the start of each *field data* record
@@ -224,6 +229,7 @@ typedef struct {
   _Atomic bool initialized;
   uint32_t next_measurement_id;
   _Atomic uint32_t sequence_num;
+  uint64_t write_revision; // protected by flash_write_mutex; recovered from record trailers
   const esp_partition_t *partition; // pointer to the 'storage' partition
 
   // Page cache (snapshot-based, reference-counted)
@@ -233,7 +239,7 @@ typedef struct {
   SemaphoreHandle_t region_alloc_mutex;       // Serializes blank-region allocation
   SemaphoreHandle_t series_cache_mutex;       // Guards the series-ID cache (lock-free reads on dual-core would tear the 128-byte key)
   SemaphoreHandle_t type_cache_mutex;         // Guards the series type cache (read by queries, written by inserts)
-  tsdb_page_cache_snapshot_t *active_batch;   // Points to compaction's batch snapshot while active; NULL otherwise
+  tsdb_page_cache_snapshot_t *active_batch;   // Compactor-owned batch; other tasks must never mutate it
 
   // Compaction claim set (prevents inserts into pages being compacted)
 #define TSDB_COMPACTION_TASK_STACK_SIZE 6144
@@ -247,6 +253,14 @@ typedef struct {
   SemaphoreHandle_t compaction_done_sem;   // Signalled by compaction task before vTaskDelete
   _Atomic uint32_t compaction_generation;  // Incremented after each compaction run
   _Atomic uint32_t l0_page_count;          // Tracked atomically to avoid per-insert scan
+
+  // Bounded L0 occupancy/time-range cache, guarded by flash_write_mutex. Sequence numbers
+  // distinguish recycled offsets; collisions only cause another header scan.
+#define TSDB_L0_USAGE_CACHE_SIZE 64
+  struct {
+    uint32_t offset, sequence, used;
+    uint64_t min_time, max_time;
+  } l0_usage_cache[TSDB_L0_USAGE_CACHE_SIZE];
 
   // Last used L0 page/offset
   bool last_l0_cache_valid;

@@ -16,10 +16,13 @@ void tsdb_pagecache_clear(timeseries_db_t *db);
 
 // Batch API for compaction (operates on a private mutable snapshot)
 tsdb_page_cache_snapshot_t *tsdb_pagecache_begin_batch(timeseries_db_t *db);
+// Prepare storage without changing entries or removal history.
+bool tsdb_pagecache_batch_reserve(tsdb_page_cache_snapshot_t *snap, size_t additional);
 bool tsdb_pagecache_batch_add(tsdb_page_cache_snapshot_t *snap, uint32_t offset,
                               const timeseries_page_header_t *hdr);
 bool tsdb_pagecache_batch_remove(tsdb_page_cache_snapshot_t *snap, uint32_t offset);
 void tsdb_pagecache_batch_sort(tsdb_page_cache_snapshot_t *snap);
-void tsdb_pagecache_commit_batch(timeseries_db_t *db, tsdb_page_cache_snapshot_t *batch);
+// Consumes batch on success or merge failure; failure keeps the live snapshot.
+bool tsdb_pagecache_commit_batch(timeseries_db_t *db, tsdb_page_cache_snapshot_t *batch);
 
 #endif // TIMESERIES_PAGE_CACHE_H

@@ -594,6 +594,7 @@ TEST_CASE("iterator: blank iterator on empty database", "[iterator]") {
   ESP_LOGI(TAG, "Total blank regions found: %d", blank_count);
   // Empty database should have at least some free space
   TEST_ASSERT_TRUE(blank_count > 0);
+  timeseries_blank_iterator_deinit(&iter);
 }
 
 TEST_CASE("iterator: blank iterator after data insertion", "[iterator]") {
@@ -619,6 +620,7 @@ TEST_CASE("iterator: blank iterator after data insertion", "[iterator]") {
   }
 
   ESP_LOGI(TAG, "Blank regions after insertion: %d", blank_count);
+  timeseries_blank_iterator_deinit(&iter);
 }
 
 TEST_CASE("iterator: blank iterator with large min_size", "[iterator]") {
@@ -642,6 +644,7 @@ TEST_CASE("iterator: blank iterator with large min_size", "[iterator]") {
   }
 
   ESP_LOGI(TAG, "Large blank regions: %d", blank_count);
+  timeseries_blank_iterator_deinit(&iter);
 }
 
 TEST_CASE("iterator: blank iterator next with invalid iter", "[iterator]") {
@@ -1121,4 +1124,5 @@ TEST_CASE("iterator: blank iterator contiguity check", "[iterator][bug]") {
   }
 
   ESP_LOGI(TAG, "Total non-overlapping blank regions: %d", region_count);
+  timeseries_blank_iterator_deinit(&iter);
 }

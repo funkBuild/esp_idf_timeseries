@@ -18,6 +18,21 @@
 
 static const char *TAG = "timeseries_query";
 
+// Snapshots own headers, not flash bytes. Hold these locks only while this
+// query can still read flash; iterator next/deinit operate on owned RAM.
+// Lock order matches inserts: flash writes, then region allocation.
+typedef struct {
+  timeseries_db_t *db;
+  bool held;
+} query_read_guard_t;
+
+static void query_read_unlock(query_read_guard_t *guard) {
+  if (!guard->held) return;
+  guard->held = false;
+  if (guard->db->region_alloc_mutex) xSemaphoreGive(guard->db->region_alloc_mutex);
+  if (guard->db->flash_write_mutex) xSemaphoreGive(guard->db->flash_write_mutex);
+}
+
 /* Very small 32-bit FNV-1a hash for 16-byte IDs – good enough
    for < 2 k entries and has no multiplier overflow on 32-bit MCUs. */
 static inline uint32_t hash_series_id16(const uint8_t id[16]) {
@@ -104,7 +119,8 @@ static void series_lookup_free(series_lookup_t *tbl) {
 static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
                                 size_t num_fields,
                                 const timeseries_query_t *query,
-                                timeseries_query_result_t *result);
+                                timeseries_query_result_t *result, bool *out_ok,
+                                query_read_guard_t *guard);
 
 /**
  * @brief Combine two series ID lists by intersecting them, storing the result
@@ -132,6 +148,19 @@ bool timeseries_query_execute(timeseries_db_t *db,
   if (!db || !query || !result || !query->measurement_name) {
     return false;
   }
+  memset(result, 0, sizeof(*result));
+  if ((query->num_tags && (!query->tag_keys || !query->tag_values)) ||
+      (query->num_fields && !query->field_names)) return false;
+  for (size_t t = 0; t < query->num_tags; t++) {
+    if (!query->tag_keys[t] || !query->tag_values[t]) return false;
+  }
+  for (size_t f = 0; f < query->num_fields; f++) {
+    if (!query->field_names[f]) return false;
+  }
+
+  query_read_guard_t guard = {.db = db, .held = true};
+  if (db->flash_write_mutex) xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+  if (db->region_alloc_mutex) xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
 
   uint64_t start_time, end_time;
 
@@ -333,17 +362,17 @@ bool timeseries_query_execute(timeseries_db_t *db,
 
   start_time = esp_timer_get_time();
 
-  size_t points_fetched = fetch_series_data(db, fields_array, actual_fields_count, query, result);
+  size_t points_fetched = fetch_series_data(db, fields_array, actual_fields_count, query, result, &ok, &guard);
   if (points_fetched == 0 && result->num_points == 0) {
     ESP_LOGD(TAG, "fetch_series_data returned no points");
   }
 
-  ok = true; /* At this point the function succeeded – result is valid */
 
   end_time = esp_timer_get_time();
   ESP_LOGD(TAG, "Fetched data in %.3f ms", (end_time - start_time) / 1000.0);
 
 cleanup:
+  query_read_unlock(&guard);
   /* -------------------------------------------------------------------- */
   /*  6.  Release every allocation made above                             */
   /* -------------------------------------------------------------------- */
@@ -364,6 +393,7 @@ cleanup:
 
   tsdb_string_list_free(&fields_to_query);
   tsdb_series_id_list_free(&matched_series);
+  if (!ok) timeseries_query_free_result(result);
 
   return ok;
 }
@@ -445,15 +475,24 @@ static size_t find_or_create_column(timeseries_query_result_t *result,
 }
 
 /**
- * @brief Ensure the result has capacity for at least one more row.
+ * @brief Ensure the result has capacity for the requested number of rows.
  *        Grows by doubling to amortize allocation cost.
  */
 static bool ensure_result_capacity(timeseries_query_result_t *result,
-                                   size_t *capacity) {
-  if (result->num_points < *capacity) {
+                                   size_t *capacity, size_t required) {
+  if (required <= *capacity) {
     return true;
   }
-  size_t new_cap = *capacity ? *capacity * 2 : 64;
+  const size_t max_capacity = SIZE_MAX / sizeof(timeseries_field_value_t);
+  if (required > max_capacity) return false;
+  size_t new_cap = *capacity ? *capacity : 64;
+  while (new_cap < required) {
+    if (new_cap > max_capacity / 2) {
+      new_cap = required;
+      break;
+    }
+    new_cap *= 2;
+  }
   uint64_t *new_ts = realloc(result->timestamps, new_cap * sizeof(uint64_t));
   if (!new_ts) {
     ESP_LOGE(TAG, "OOM expanding timestamps capacity to %zu", new_cap);
@@ -509,7 +548,7 @@ static size_t find_or_create_row(timeseries_query_result_t *result,
 
   // Not found — insert at position h
   size_t insert_pos = h;
-  if (!ensure_result_capacity(result, capacity)) {
+  if (!ensure_result_capacity(result, capacity, result->num_points + 1)) {
     return SIZE_MAX;
   }
 
@@ -555,9 +594,7 @@ static bool merge_sorted_field_data(timeseries_query_result_t *result,
 
   // Fast path: no existing data — bulk copy
   if (old_count == 0) {
-    while (*capacity < new_count) {
-      if (!ensure_result_capacity(result, capacity)) return false;
-    }
+    if (!ensure_result_capacity(result, capacity, new_count)) return false;
     memcpy(result->timestamps, new_ts, new_count * sizeof(uint64_t));
     memcpy(result->columns[col_index].values, new_vals,
            new_count * sizeof(timeseries_field_value_t));
@@ -571,55 +608,21 @@ static bool merge_sorted_field_data(timeseries_query_result_t *result,
     return true;
   }
 
-  // Single-pass: try placing values assuming all timestamps exist.
-  // If we encounter a missing timestamp, count remaining inserts and fall through to merge.
+  // Count insertions before transferring any string ownership. The reverse
+  // merge below must be the only pass that replaces/frees existing values.
   size_t insert_count = 0;
-  {
-    size_t oi = 0;
-    size_t ni = 0;
-    for (; ni < new_count; ni++) {
-      while (oi < old_count && result->timestamps[oi] < new_ts[ni]) {
-        oi++;
-      }
-      if (oi >= old_count || result->timestamps[oi] != new_ts[ni]) {
-        // Found a new timestamp — count it and finish counting the rest
-        insert_count = 1;
-        oi = oi; // keep oi position for continued counting
-        for (size_t ni2 = ni + 1; ni2 < new_count; ni2++) {
-          while (oi < old_count && result->timestamps[oi] < new_ts[ni2]) {
-            oi++;
-          }
-          if (oi >= old_count || result->timestamps[oi] != new_ts[ni2]) {
-            insert_count++;
-          } else {
-            oi++;
-          }
-        }
-        break;
-      }
-      // Timestamp exists — place value immediately (combines count + placement).
-      // If a previous series mapped to this same column (columns are keyed by
-      // field name) already placed an owned string at this (column,timestamp),
-      // free it before overwriting so we don't leak it.
-      {
-        timeseries_field_value_t *slot = &result->columns[col_index].values[oi];
-        if (slot->type == TIMESERIES_FIELD_TYPE_STRING && slot->data.string_val.str) {
-          free(slot->data.string_val.str);
-        }
-      }
-      result->columns[col_index].values[oi] = new_vals[ni];
-      oi++;
-    }
-    if (insert_count == 0) {
-      return true;  // All timestamps existed, values already placed
-    }
+  size_t old_pos = 0;
+  for (size_t ni = 0; ni < new_count; ni++) {
+    while (old_pos < old_count && result->timestamps[old_pos] < new_ts[ni])
+      old_pos++;
+    if (old_pos == old_count || result->timestamps[old_pos] != new_ts[ni])
+      insert_count++;
+    else
+      old_pos++;
   }
-
-  // Ensure capacity for merged result
+  if (insert_count > SIZE_MAX - old_count) return false;
   size_t merged_count = old_count + insert_count;
-  while (*capacity < merged_count) {
-    if (!ensure_result_capacity(result, capacity)) return false;
-  }
+  if (!ensure_result_capacity(result, capacity, merged_count)) return false;
 
   // Reverse merge: fill from right to left so we never overwrite unread data
   ssize_t oi = (ssize_t)old_count - 1;
@@ -755,22 +758,14 @@ intersect_series_id_lists(timeseries_series_id_list_t *out,
   tsdb_series_id_list_free(&result);
 }
 
-static int cmp_record_by_start_time(const void *a, const void *b) {
-  const field_record_info_t *ra = (const field_record_info_t *)a;
-  const field_record_info_t *rb = (const field_record_info_t *)b;
-  if (ra->start_time < rb->start_time) return -1;
-  if (ra->start_time > rb->start_time) return 1;
-  return 0;
-}
-
 /**
  * @brief Append a record to the growable array (unsorted).
- *        Sorting is deferred to a single qsort after all records are collected.
+ *        Persisted revisions resolve duplicates without sorting this array.
  */
 static bool field_record_array_append(series_record_list_t *srl,
                                       const timeseries_field_data_header_t *fdh,
                                       uint32_t absolute_offset,
-                                      unsigned int limit) {
+                                      uint32_t page_sequence, const timeseries_fielddata_iterator_t *iterator) {
   if (srl->count >= srl->capacity) {
     size_t new_cap = srl->capacity ? srl->capacity * 2 : 8;
     field_record_info_t *new_arr =
@@ -784,43 +779,35 @@ static bool field_record_array_append(series_record_list_t *srl,
 
   field_record_info_t *rec = &srl->records[srl->count++];
   rec->record_offset = absolute_offset;
-  rec->start_time = fdh->start_time;
-  rec->end_time = fdh->end_time;
+  rec->revision = tsdb_legacy_revision(page_sequence, absolute_offset);
+  rec->cached_revision = false;
+  // Reuse bytes already in the header-scan window. A boundary-crossing or
+  // larger record falls back to the iterator's checked trailer read.
+  if ((fdh->flags & TSDB_FIELDDATA_FLAG_COMPRESSED) &&
+      !(fdh->flags & TSDB_FIELDDATA_FLAG_REVISION) &&
+      (fdh->flags & TSDB_FIELDDATA_FLAG_REVISION_VECTOR) && fdh->record_length >= sizeof(uint64_t)) {
+    uint32_t relative = iterator->current_record_offset + sizeof(*fdh) + fdh->record_length -
+                        sizeof(uint64_t) - sizeof(timeseries_page_header_t);
+    if (iterator->page_buf && relative >= iterator->window_start &&
+        relative - iterator->window_start <= iterator->page_buf_size &&
+        sizeof(uint64_t) <= iterator->page_buf_size - (relative - iterator->window_start)) {
+      memcpy(&rec->revision, iterator->page_buf + relative - iterator->window_start, sizeof(uint64_t));
+      rec->cached_revision = true;
+    }
+  }
   rec->record_count = fdh->record_count;
   rec->record_length = fdh->record_length;
   rec->data_flags = fdh->flags;
   return true;
 }
 
-/**
- * @brief Sort the record array by start_time, then prune to keep only
- *        enough records to cover `limit` data points.
- */
-static void field_record_array_sort_and_prune(series_record_list_t *srl,
-                                              unsigned int limit) {
-  if (!srl || srl->count == 0) return;
-
-  qsort(srl->records, srl->count, sizeof(field_record_info_t),
-        cmp_record_by_start_time);
-
-  if (limit == 0) return; /* no limit => keep everything */
-
-  uint64_t coverage = 0;
-  size_t keep = srl->count;
-  for (size_t i = 0; i < srl->count; i++) {
-    coverage += srl->records[i].record_count;
-    if (coverage >= limit) {
-      keep = i + 1;
-      break;
-    }
-  }
-  srl->count = keep;
-}
-
 static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
                                 size_t num_fields,
                                 const timeseries_query_t *query,
-                                timeseries_query_result_t *result) {
+                                timeseries_query_result_t *result, bool *out_ok,
+                                query_read_guard_t *guard) {
+  *out_ok = false;
+  bool complete = true;
   if (!db || !fields_array || num_fields == 0 || !query || !result) {
     ESP_LOGW(TAG, "Invalid input to fetch_series_data");
     return 0;
@@ -861,7 +848,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
   int field_data_pages = 0;
   int records_found = 0;
 
-  // Shared page buffer — avoids malloc/free per field-data page
+  // Bounded header window: large record payloads are read only if selected.
   uint8_t *shared_page_buf = NULL;
   uint32_t shared_page_buf_cap = 0;
 
@@ -878,6 +865,19 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     ESP_LOGD(TAG, "Scanning FIELD_DATA page @0x%08X size=%u level=%u state=%u",
              (unsigned int)page_offset, (unsigned int)page_size, hdr.field_data_level, hdr.page_state);
 
+    // A cached L0 used length also avoids reading the erased tail. The same
+    // sequence check as the insert path rejects occupancy from recycled pages.
+    size_t usage_slot = (page_offset / TIMESERIES_FIELD_DATA_PAGE_SIZE) % TSDB_L0_USAGE_CACHE_SIZE;
+    if (hdr.field_data_level == 0 && hdr.sequence_num != 0 &&
+        db->l0_usage_cache[usage_slot].offset == page_offset &&
+        db->l0_usage_cache[usage_slot].sequence == hdr.sequence_num &&
+        db->l0_usage_cache[usage_slot].used <= page_size) {
+      if ((query->start_ms > 0 && db->l0_usage_cache[usage_slot].max_time < query->start_ms) ||
+          (query->end_ms > 0 && db->l0_usage_cache[usage_slot].min_time > query->end_ms))
+        continue;
+      page_size = db->l0_usage_cache[usage_slot].used;
+    }
+
     // Grow shared buffer if this page is larger
     if (page_size <= sizeof(timeseries_page_header_t)) {
       ESP_LOGW(TAG, "Corrupt page @0x%08X: page_size=%u too small, skipping",
@@ -885,9 +885,11 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
       continue;
     }
     uint32_t data_size = page_size - sizeof(timeseries_page_header_t);
+    if (data_size > 4096) data_size = 4096;
     if (data_size > shared_page_buf_cap) {
       uint8_t *new_buf = realloc(shared_page_buf, data_size);
       if (!new_buf) {
+        complete = false;
         ESP_LOGW(TAG, "realloc(%u) failed for page @0x%08X, skipping",
                  (unsigned int)data_size, (unsigned int)page_offset);
         continue;
@@ -897,18 +899,24 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     }
 
     timeseries_fielddata_iterator_t fdata_iter;
-    if (!timeseries_fielddata_iterator_init_with_buffer(
+    if (!timeseries_fielddata_iterator_init_window(
             db, page_offset, page_size, shared_page_buf,
             shared_page_buf_cap, &fdata_iter)) {
       ESP_LOGW(TAG, "Failed to init fielddata_iterator on page @0x%08X",
                (unsigned int)page_offset);
+      complete = false;
       continue;
     }
 
     timeseries_field_data_header_t fdh;
+    uint32_t used = sizeof(timeseries_page_header_t);
+    uint64_t min_time = UINT64_MAX, max_time = 0;
     int page_records = 0;
     int page_records_matched = 0;
     while (timeseries_fielddata_iterator_next(&fdata_iter, &fdh)) {
+      used = fdata_iter.offset;
+      if (fdh.start_time < min_time) min_time = fdh.start_time;
+      if (fdh.end_time > max_time) max_time = fdh.end_time;
       page_records++;
       // Skip if flagged as deleted
       if ((fdh.flags & TSDB_FIELDDATA_FLAG_DELETED) == 0) {
@@ -934,8 +942,8 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
         ESP_LOGD(TAG, "MATCH: series %02X%02X%02X%02X... @0x%08X count=%u len=%u compressed=%d",
                  fdh.series_id[0], fdh.series_id[1], fdh.series_id[2], fdh.series_id[3],
                  (unsigned int)absolute_offset, fdh.record_count, fdh.record_length, is_compressed);
-        field_record_array_append(srl, &fdh, absolute_offset,
-                                  query->limit);
+        if (!field_record_array_append(srl, &fdh, absolute_offset,
+                                       hdr.sequence_num, &fdata_iter)) complete = false;
       } else {
         ESP_LOGD(TAG, "No match for series %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X (flags=0x%02X, records=%u)",
                  fdh.series_id[0], fdh.series_id[1], fdh.series_id[2], fdh.series_id[3],
@@ -945,6 +953,16 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
                  fdh.flags, fdh.record_count);
       }
     } // end while fielddata_iterator
+    if (fdata_iter.read_error) complete = false;
+    else if (hdr.field_data_level == 0 && hdr.sequence_num != 0) {
+      // Warm occupancy and time bounds even when the first access after boot
+      // is a query. All record headers, including other series, were scanned.
+      db->l0_usage_cache[usage_slot].offset = page_offset;
+      db->l0_usage_cache[usage_slot].sequence = hdr.sequence_num;
+      db->l0_usage_cache[usage_slot].used = used;
+      db->l0_usage_cache[usage_slot].min_time = min_time;
+      db->l0_usage_cache[usage_slot].max_time = max_time;
+    }
     timeseries_fielddata_iterator_deinit(&fdata_iter);
     ESP_LOGD(TAG, "Page @0x%08X: %d records scanned, %d matched",
              (unsigned int)page_offset, page_records, page_records_matched);
@@ -955,16 +973,6 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
   prof_end = esp_timer_get_time();
   ESP_LOGD(TAG, "[PROFILE] Page scanning: %.3f ms (%d pages, %d field_data pages, %d records)",
            (prof_end - prof_start) / 1000.0, pages_processed, field_data_pages, records_found);
-
-  // Optimization #1: Prune once per series after all records collected (instead of after each append)
-  prof_start = esp_timer_get_time();
-  for (size_t f = 0; f < num_fields; f++) {
-    for (size_t s = 0; s < fields_array[f].num_series; s++) {
-      field_record_array_sort_and_prune(&fields_array[f].series_lists[s], query->limit);
-    }
-  }
-  prof_end = esp_timer_get_time();
-  ESP_LOGD(TAG, "[PROFILE] Prune lists: %.3f ms", (prof_end - prof_start) / 1000.0);
 
   // Pre-estimate result capacity from collected record counts.
   // Take the max across fields (not the sum), because each field stores the
@@ -1011,6 +1019,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
       }
     }
     if (!any_records) {
+      *out_ok = complete;
       series_lookup_free(&srl_tbl);
       return 0;
     }
@@ -1095,6 +1104,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
                               result_capacity);
 
     if (col_index == SIZE_MAX) {
+      complete = false;
       /* Fatal for this field – skip it but keep processing others */
       continue;
     }
@@ -1123,9 +1133,9 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
             calloc(srl->count, sizeof(timeseries_points_iterator_t));
         timeseries_points_iterator_t **sub_iters =
             calloc(srl->count, sizeof(*sub_iters));
-        uint32_t *page_seqs = calloc(srl->count, sizeof(uint32_t));
-        if (!pit_batch || !sub_iters || !page_seqs) {
-          free(pit_batch); free(sub_iters); free(page_seqs);
+        if (!pit_batch || !sub_iters) {
+          free(pit_batch); free(sub_iters);
+          complete = false;
           ESP_LOGE(TAG, "OOM: series iter alloc for field='%s'", fld->field_name);
           continue;
         }
@@ -1134,19 +1144,25 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
         for (size_t ri = 0; ri < srl->count; ri++) {
           field_record_info_t *rec = &srl->records[ri];
           timeseries_points_iterator_t *pit = &pit_batch[ri];
-          bool ok = timeseries_points_iterator_init(
+          bool ok = timeseries_points_iterator_init_range_with_revision(
               db, rec->record_offset, rec->record_length,
-              rec->record_count, field_type, rec->data_flags, pit);
-          if (!ok) continue;
-          timeseries_points_iterator_set_time_range(pit, query->start_ms, query->end_ms);
+              rec->record_count, field_type, rec->data_flags, pit, query->start_ms, query->end_ms,
+              rec->cached_revision ? &rec->revision : NULL);
+          if (!ok) { complete = false; continue; }
+          if (!pit->has_revision) {
+            pit->has_revision = true;
+            pit->revisions.value = rec->revision;
+          }
           sub_iters[idx] = pit;
-          page_seqs[idx] = 0;
           idx++;
         }
 
+        if (f + 1 == num_fields && s + 1 == fld->num_series)
+          query_read_unlock(guard);
+
         if (idx > 0) {
           timeseries_multi_points_iterator_t mpit;
-          if (timeseries_multi_points_iterator_init(sub_iters, page_seqs, idx, &mpit)) {
+          if (timeseries_multi_points_iterator_init(sub_iters, NULL, idx, &mpit)) {
             // Pre-compute total record count to avoid repeated buffer doubling,
             // which causes OOM due to peak memory (old + new buffer during realloc).
             size_t total_records = 0;
@@ -1195,6 +1211,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
                   if (!nt || !nv) {
                     if (nt) buf_ts = nt;
                     if (nv) buf_vals = nv;
+                    complete = false;
                     ESP_LOGE(TAG, "OOM growing point buffer for field '%s'", fld->field_name);
                     if (val.type == TIMESERIES_FIELD_TYPE_STRING && val.data.string_val.str)
                       free(val.data.string_val.str);
@@ -1217,25 +1234,9 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
               if (buf_count > 0) {
                 if (!merge_sorted_field_data(result, col_index, buf_ts, buf_vals,
                                              buf_count, &result_capacity)) {
+                  complete = false;
                   ESP_LOGE(TAG, "OOM merging result for field '%s'", fld->field_name);
-                  // The forward pass in merge_sorted_field_data may have shallow-
-                  // copied some buf_vals entries into the result column.  NULL those
-                  // out so timeseries_query_free_result won't double-free them.
-                  for (size_t ri = 0; ri < result->num_points; ri++) {
-                    timeseries_field_value_t *rv =
-                        &result->columns[col_index].values[ri];
-                    if (rv->type == TIMESERIES_FIELD_TYPE_STRING &&
-                        rv->data.string_val.str) {
-                      for (size_t bi = 0; bi < buf_count; bi++) {
-                        if (buf_vals[bi].data.string_val.str ==
-                            rv->data.string_val.str) {
-                          rv->data.string_val.str = NULL;
-                          break;
-                        }
-                      }
-                    }
-                  }
-                  // Now safe to free all string values from the buffer
+                  // A failed merge has not transferred ownership to the result.
                   for (size_t bi = 0; bi < buf_count; bi++) {
                     if (buf_vals[bi].type == TIMESERIES_FIELD_TYPE_STRING &&
                         buf_vals[bi].data.string_val.str)
@@ -1244,6 +1245,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
                 }
               }
             } else {
+              complete = false;
               ESP_LOGE(TAG, "OOM allocating point buffer for field '%s'", fld->field_name);
             }
 
@@ -1257,6 +1259,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
             }
             timeseries_multi_points_iterator_deinit(&mpit);
           } else {
+            complete = false;
             for (size_t i2 = 0; i2 < idx; i2++) {
               if (sub_iters[i2])
                 timeseries_points_iterator_deinit(sub_iters[i2]);
@@ -1265,7 +1268,6 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
         }
 
         free(sub_iters);
-        free(page_seqs);
         free(pit_batch);
       } // end sequential series processing
 
@@ -1286,6 +1288,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
         free(series_multi_iters);
         free(mpit_batch);
         free(pit_batches);
+        complete = false;
         ESP_LOGE(TAG, "OOM: cannot allocate iterator arrays for field='%s'",
                  fld->field_name);
         continue;
@@ -1299,9 +1302,9 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
             calloc(srl->count, sizeof(timeseries_points_iterator_t));
         timeseries_points_iterator_t **sub_iters =
             calloc(srl->count, sizeof(*sub_iters));
-        uint32_t *page_seqs = calloc(srl->count, sizeof(uint32_t));
-        if (!pit_batch || !sub_iters || !page_seqs) {
-          free(pit_batch); free(sub_iters); free(page_seqs);
+        if (!pit_batch || !sub_iters) {
+          free(pit_batch); free(sub_iters);
+          complete = false;
           ESP_LOGE(TAG, "OOM building sub-iter structures for field='%s'",
                    fld->field_name);
           continue;
@@ -1312,21 +1315,28 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
         for (size_t ri = 0; ri < srl->count; ri++) {
           field_record_info_t *rec = &srl->records[ri];
           timeseries_points_iterator_t *pit = &pit_batch[ri];
-          bool ok = timeseries_points_iterator_init(
+          bool ok = timeseries_points_iterator_init_range_with_revision(
               db, rec->record_offset, rec->record_length,
-              rec->record_count, field_type, rec->data_flags, pit);
-          if (!ok) continue;
-          timeseries_points_iterator_set_time_range(pit, query->start_ms, query->end_ms);
+              rec->record_count, field_type, rec->data_flags, pit, query->start_ms, query->end_ms,
+              rec->cached_revision ? &rec->revision : NULL);
+          if (!ok) { complete = false; continue; }
+          if (!pit->has_revision) {
+            pit->has_revision = true;
+            pit->revisions.value = rec->revision;
+          }
           sub_iters[idx] = pit;
-          page_seqs[idx] = 0;
           idx++;
         }
 
+        if (f + 1 == num_fields && s + 1 == fld->num_series)
+          query_read_unlock(guard);
+
         if (idx > 0) {
           timeseries_multi_points_iterator_t *mpit = &mpit_batch[s];
-          if (timeseries_multi_points_iterator_init(sub_iters, page_seqs, idx, mpit)) {
+          if (timeseries_multi_points_iterator_init(sub_iters, NULL, idx, mpit)) {
             series_multi_iters[s] = mpit;
           } else {
+            complete = false;
             for (size_t i2 = 0; i2 < idx; i2++) {
               if (sub_iters[i2])
                 timeseries_points_iterator_deinit(sub_iters[i2]);
@@ -1335,7 +1345,6 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
         }
 
         free(sub_iters);
-        free(page_seqs);
       } // end for each series in field
 
       prof_iter_create += (esp_timer_get_time() - prof_temp);
@@ -1344,6 +1353,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
       if (!timeseries_multi_series_iterator_init(
               series_multi_iters, fld->num_series, query->rollup_interval,
               agg_method, &ms_iter)) {
+        complete = false;
         ESP_LOGW(TAG, "Failed multi-series aggregator for '%s'", fld->field_name);
       } else {
         prof_temp = esp_timer_get_time();
@@ -1372,6 +1382,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
 
           size_t row_index = find_or_create_row(result, rollup_ts, &result_capacity, &agg_hint);
           if (row_index == SIZE_MAX) {
+            complete = false;
             ESP_LOGE(TAG, "OOM inserting new result row – aborting field '%s'", fld->field_name);
             if (val_agg.type == TIMESERIES_FIELD_TYPE_STRING && val_agg.data.string_val.str)
               free(val_agg.data.string_val.str);
@@ -1418,6 +1429,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
 
   series_lookup_free(&srl_tbl);
 
+  *out_ok = complete;
   return total_points_aggregated;
 }
 

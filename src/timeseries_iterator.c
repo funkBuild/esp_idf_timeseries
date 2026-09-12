@@ -236,12 +236,16 @@ bool timeseries_entity_iterator_read_data(timeseries_entity_iterator_t* ent_iter
 
 bool timeseries_fielddata_iterator_init(timeseries_db_t* db, uint32_t page_offset, uint32_t page_size,
                                         timeseries_fielddata_iterator_t* f_iter) {
-  if (!db || !f_iter) {
+  if (!db || !db->partition || !f_iter) {
     return false;
   }
-  if (page_offset + page_size > db->partition->size) {
+  if (page_size < sizeof(timeseries_page_header_t) ||
+      page_offset > db->partition->size || page_size > db->partition->size - page_offset) {
     return false;
   }
+  f_iter->window_start = 0;
+  f_iter->window_capacity = 0;
+  f_iter->read_error = false;
   f_iter->db = db;
   f_iter->page_offset = page_offset;
   f_iter->page_size = page_size;
@@ -276,12 +280,16 @@ bool timeseries_fielddata_iterator_init_with_buffer(timeseries_db_t* db, uint32_
                                                      uint32_t page_size, uint8_t* buf,
                                                      uint32_t buf_capacity,
                                                      timeseries_fielddata_iterator_t* f_iter) {
-  if (!db || !f_iter) {
+  if (!db || !db->partition || !f_iter) {
     return false;
   }
-  if (page_offset + page_size > db->partition->size) {
+  if (page_size < sizeof(timeseries_page_header_t) ||
+      page_offset > db->partition->size || page_size > db->partition->size - page_offset) {
     return false;
   }
+  f_iter->window_start = 0;
+  f_iter->window_capacity = 0;
+  f_iter->read_error = false;
   f_iter->db = db;
   f_iter->page_offset = page_offset;
   f_iter->page_size = page_size;
@@ -309,6 +317,17 @@ bool timeseries_fielddata_iterator_init_with_buffer(timeseries_db_t* db, uint32_
   return true;
 }
 
+bool timeseries_fielddata_iterator_init_window(timeseries_db_t *db,
+    uint32_t page_offset, uint32_t page_size, uint8_t *buf, uint32_t capacity,
+    timeseries_fielddata_iterator_t *iter) {
+  if (!buf || capacity < sizeof(timeseries_field_data_header_t) ||
+      !timeseries_fielddata_iterator_init_with_buffer(db, page_offset, page_size,
+                                                       NULL, 0, iter)) return false;
+  iter->page_buf = buf;
+  iter->window_capacity = capacity;
+  return true;
+}
+
 void timeseries_fielddata_iterator_deinit(timeseries_fielddata_iterator_t* f_iter) {
   if (f_iter && f_iter->page_buf && f_iter->owns_page_buf) {
     free(f_iter->page_buf);
@@ -317,6 +336,38 @@ void timeseries_fielddata_iterator_deinit(timeseries_fielddata_iterator_t* f_ite
     f_iter->page_buf = NULL;
     f_iter->page_buf_size = 0;
   }
+}
+
+bool timeseries_fielddata_iterator_read_at(timeseries_fielddata_iterator_t *iter,
+                                          uint32_t offset, void *out, size_t length) {
+  if (!iter || !iter->valid) return false;
+  if (!iter->db || !iter->db->partition || (!out && length) ||
+      offset < sizeof(timeseries_page_header_t) || offset > iter->page_size ||
+      length > iter->page_size - offset || iter->page_offset > iter->db->partition->size ||
+      iter->page_size > iter->db->partition->size - iter->page_offset) goto fail;
+  if (!length) return true;
+  uint32_t relative = offset - sizeof(timeseries_page_header_t);
+  if (iter->page_buf && relative >= iter->window_start &&
+      relative - iter->window_start <= iter->page_buf_size &&
+      length <= iter->page_buf_size - (relative - iter->window_start)) {
+    memcpy(out, iter->page_buf + relative - iter->window_start, length);
+    return true;
+  }
+  if (iter->page_buf && iter->window_capacity && length <= iter->window_capacity) {
+    uint32_t bytes = iter->page_size - offset;
+    if (bytes > iter->window_capacity) bytes = iter->window_capacity;
+    if (esp_partition_read(iter->db->partition, iter->page_offset + offset, iter->page_buf, bytes) != ESP_OK)
+      goto fail;
+    iter->window_start = relative;
+    iter->page_buf_size = bytes;
+    memcpy(out, iter->page_buf, length);
+    return true;
+  }
+  if (esp_partition_read(iter->db->partition, iter->page_offset + offset, out, length) == ESP_OK) return true;
+fail:
+  iter->read_error = true;
+  iter->valid = false;
+  return false;
 }
 
 bool timeseries_fielddata_iterator_next(timeseries_fielddata_iterator_t* f_iter,
@@ -340,12 +391,30 @@ bool timeseries_fielddata_iterator_next(timeseries_fielddata_iterator_t* f_iter,
 
   // read the header — from buffer if available, else from flash
   timeseries_field_data_header_t local_hdr;
-  if (f_iter->page_buf && rel_data_offset + sizeof(local_hdr) <= f_iter->page_buf_size) {
-    memcpy(&local_hdr, f_iter->page_buf + rel_data_offset, sizeof(local_hdr));
+  if (f_iter->window_capacity &&
+      (rel_data_offset < f_iter->window_start ||
+       rel_data_offset - f_iter->window_start + sizeof(local_hdr) > f_iter->page_buf_size)) {
+    uint32_t remaining = f_iter->page_size - f_iter->offset;
+    uint32_t length = remaining < f_iter->window_capacity ? remaining : f_iter->window_capacity;
+    if (esp_partition_read(f_iter->db->partition, f_iter->page_offset + f_iter->offset,
+                           f_iter->page_buf, length) != ESP_OK) {
+      f_iter->read_error = true;
+      f_iter->valid = false;
+      return false;
+    }
+    f_iter->window_start = rel_data_offset;
+    f_iter->page_buf_size = length;
+  }
+  uint32_t buffered_offset = rel_data_offset - f_iter->window_start;
+  if (f_iter->page_buf && rel_data_offset >= f_iter->window_start &&
+      buffered_offset <= f_iter->page_buf_size &&
+      sizeof(local_hdr) <= f_iter->page_buf_size - buffered_offset) {
+    memcpy(&local_hdr, f_iter->page_buf + buffered_offset, sizeof(local_hdr));
   } else {
     uint32_t curr_offset = f_iter->page_offset + f_iter->offset;
     esp_err_t err = esp_partition_read(f_iter->db->partition, curr_offset, &local_hdr, sizeof(local_hdr));
     if (err != ESP_OK) {
+      f_iter->read_error = true;
       f_iter->valid = false;
       return false;
     }
@@ -379,7 +448,9 @@ bool timeseries_fielddata_iterator_next(timeseries_fielddata_iterator_t* f_iter,
   // skip the entire record => header + data
   uint32_t record_size = sizeof(timeseries_field_data_header_t) + local_hdr.record_length;
   if (f_iter->offset + record_size > f_iter->page_size) {
-    // out of boundary
+    // A malformed record is an error, not clean EOF. Compaction must retain
+    // this source page instead of treating it as empty and retiring it.
+    f_iter->read_error = true;
     f_iter->valid = false;
     return false;
   }
@@ -409,8 +480,10 @@ bool timeseries_fielddata_iterator_read_data(timeseries_fielddata_iterator_t* f_
 
   // Read from buffer if available, else from flash
   uint32_t buf_offset = data_rel - sizeof(timeseries_page_header_t);
-  if (f_iter->page_buf && buf_offset + buf_len <= f_iter->page_buf_size) {
-    memcpy(out_buf, f_iter->page_buf + buf_offset, buf_len);
+  if (f_iter->page_buf && buf_offset >= f_iter->window_start &&
+      buf_offset - f_iter->window_start <= f_iter->page_buf_size &&
+      buf_len <= f_iter->page_buf_size - (buf_offset - f_iter->window_start)) {
+    memcpy(out_buf, f_iter->page_buf + buf_offset - f_iter->window_start, buf_len);
   } else {
     uint32_t abs_offset = f_iter->page_offset + data_rel;
     esp_err_t err = esp_partition_read(f_iter->db->partition, abs_offset, out_buf, buf_len);

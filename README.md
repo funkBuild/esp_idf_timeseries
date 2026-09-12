@@ -143,6 +143,13 @@ typedef enum {
 } timeseries_aggregation_method_e;
 ```
 
+Integer SUM accumulates exactly and returns an integer if the final sum fits
+`int64_t`; larger sums return FLOAT with double precision. Intermediate overflow
+followed by cancellation still produces an exact integer when the final sum fits.
+Integer AVG stays integer and rounds to nearest, with half ties away from zero
+(for example, `AVG(-1, -2) = -2`). Each returned value carries its own type;
+the column type continues to describe the stored field.
+
 #### `timeseries_query_t`
 
 ```c
@@ -507,6 +514,15 @@ bash run_tests.sh
 cd test_app
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
+
+## Write order and stored records
+
+New records store write revisions so compaction and page rewrites preserve the
+latest value at each timestamp, including across reopen. A uniform record adds
+an eight-byte revision trailer; mixed revisions in compacted records use an
+encoded column. Legacy records remain readable using their original page and
+record-offset ordering. Revisions cannot reconstruct values already discarded
+by an earlier compaction.
 
 ## License
 

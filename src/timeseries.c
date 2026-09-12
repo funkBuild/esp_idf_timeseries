@@ -1,4 +1,5 @@
 #include "timeseries.h"
+#include "timeseries_revision.h"
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "timeseries_cache.h"
@@ -34,19 +35,33 @@ static timeseries_db_t s_tsdb = {
     .next_measurement_id = 1,
     .partition = NULL,
 };
-static _Atomic bool s_init_in_progress = false;
+static _Atomic bool s_lifecycle_busy = false;
 
-/* Set when timeseries_deinit() gave up waiting for a compaction task and
- * returned without tearing anything down. That task still owns every mutex,
- * the semaphore and the caches in s_tsdb, and there is no way to reclaim
- * them. A subsequent timeseries_init() must NOT proceed: it would clear
- * compaction_in_progress and overwrite the mutexes and semaphore under the
- * still-running task, giving two concurrent compactions mutating the same
- * flash with no mutual exclusion.
- *
- * Distinct from compaction_in_progress, which a *clean* deinit also leaves
- * true — that case is fine to re-init from. */
-static _Atomic bool s_deinit_abandoned = false;
+// Admission and active-operation count share one atomic word, so teardown
+// cannot miss an operation between checking readiness and acquiring a reference.
+#define TSDB_CLOSED (UINT32_C(1) << 31)
+static _Atomic uint32_t s_operations = TSDB_CLOSED;
+// Protected by s_lifecycle_busy. A timed-out close can be retried, but init
+// cannot replace resources that still belong to an admitted operation.
+static bool s_cleanup_pending;
+
+static bool tsdb_operation_acquire(void) {
+    uint32_t state = atomic_load(&s_operations);
+    do {
+        if ((state & TSDB_CLOSED) || state == TSDB_CLOSED - 1) return false;
+    } while (!atomic_compare_exchange_weak(&s_operations, &state, state + 1));
+    return true;
+}
+
+static void tsdb_operation_release(bool *held) {
+    if (*held) atomic_fetch_sub(&s_operations, 1);
+}
+
+// ESP-IDF's C compiler runs cleanup on every return, including error paths.
+// This reference protects resource lifetime; it does not serialize operations.
+#define TSDB_OPERATION_GUARD(failure) \
+    bool operation_held __attribute__((cleanup(tsdb_operation_release))) = tsdb_operation_acquire(); \
+    if (!operation_held) return failure
 
 void timeseries_set_compaction_hooks(timeseries_compaction_hook_t pre_compact,
                                      timeseries_compaction_hook_t post_compact) {
@@ -67,6 +82,9 @@ static _Atomic uint32_t s_compaction_consecutive_failures = 0;
 
 static void tsdb_compaction_oneshot_task(void *param) {
     timeseries_db_t *db = (timeseries_db_t *)param;
+
+    // The launcher publishes the handle before allowing this task to finish.
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
     // Fire the pre-compact hook once, before any work (e.g. hold a sleep lock
     // for the whole compaction, including any re-runs in the loop below).
@@ -92,7 +110,7 @@ static void tsdb_compaction_oneshot_task(void *param) {
 
         // Re-check L0 count — inserts during compaction may have accumulated new pages
         uint32_t l0_count = atomic_load(&db->l0_page_count);
-        if (l0_count < MIN_PAGES_FOR_COMPACTION) {
+        if (!atomic_load(&db->initialized) || l0_count < MIN_PAGES_FOR_COMPACTION) {
             break;
         }
         ESP_LOGI(TAG, "Re-running compaction: %" PRIu32 " L0 pages accumulated", l0_count);
@@ -109,50 +127,53 @@ static void tsdb_compaction_oneshot_task(void *param) {
     }
     xSemaphoreGive(db->compaction_done_sem);
     atomic_store(&db->compaction_in_progress, false);
+    // Last access to database resources, including the post hook and semaphore.
+    bool held = true;
+    tsdb_operation_release(&held);
     vTaskDelete(NULL);
 }
 
 bool tsdb_launch_compaction(timeseries_db_t *db) {
+    if (db != &s_tsdb) return false; // the public database is a singleton
+    TSDB_OPERATION_GUARD(false);
     bool expected = false;
     if (!atomic_compare_exchange_strong(&db->compaction_in_progress, &expected, true)) {
         return false;  // already running
+    }
+    // Transfer a separate lifetime reference to the worker before creation.
+    bool worker_held = tsdb_operation_acquire();
+    if (!worker_held) {
+        atomic_store(&db->compaction_in_progress, false);
+        return false;
     }
     TaskHandle_t handle = NULL;
     BaseType_t ret = xTaskCreate(tsdb_compaction_oneshot_task, "tsdb_compact",
                                   TSDB_COMPACTION_TASK_STACK_SIZE, db, tskIDLE_PRIORITY + 1,
                                   &handle);
     if (ret != pdPASS) {
+        tsdb_operation_release(&worker_held);
         ESP_LOGW(TAG, "Failed to create compaction task");
         atomic_store(&db->compaction_in_progress, false);
         return false;
     }
     atomic_store(&db->compaction_task_handle, handle);
+    xTaskNotifyGive(handle);
     return true;
 }
 
 bool timeseries_init(void) {
-  if (s_tsdb.initialized) {
-    return true;
-  }
-
-  if (atomic_load(&s_deinit_abandoned)) {
-    ESP_LOGE(TAG,
-             "Refusing to init: a previous deinit abandoned teardown with a "
-             "compaction task still running, which still owns the TSDB "
-             "mutexes and caches");
-    return false;
-  }
-
-  // Guard against concurrent init calls
+  // Init and teardown share this guard, including teardown's wait interval.
   bool expected = false;
-  if (!atomic_compare_exchange_strong(&s_init_in_progress, &expected, true)) {
-    ESP_LOGW(TAG, "timeseries_init already in progress from another task");
+  if (!atomic_compare_exchange_strong(&s_lifecycle_busy, &expected, true)) return false;
+  if (s_cleanup_pending) {
+    ESP_LOGW(TAG, "Teardown is pending; call timeseries_deinit again after active work finishes");
+    atomic_store(&s_lifecycle_busy, false);
     return false;
   }
 
   // Double-check after acquiring the guard
   if (s_tsdb.initialized) {
-    atomic_store(&s_init_in_progress, false);
+    atomic_store(&s_lifecycle_busy, false);
     return true;
   }
 
@@ -161,7 +182,7 @@ bool timeseries_init(void) {
   const esp_partition_t* part = esp_partition_find_first(0x40, ESP_PARTITION_SUBTYPE_ANY, "timeseries");
   if (!part) {
     ESP_LOGE(TAG, "Failed to find 'timeseries' partition in partition table.");
-    atomic_store(&s_init_in_progress, false);
+    atomic_store(&s_lifecycle_busy, false);
     return false;
   }
   s_tsdb.partition = part;
@@ -189,6 +210,9 @@ bool timeseries_init(void) {
     goto init_fail;
   }
 
+  if (!tsdb_revision_recover(&s_tsdb)) goto init_fail;
+
+  memset(s_tsdb.l0_usage_cache, 0, sizeof(s_tsdb.l0_usage_cache));
   s_tsdb.last_l0_cache_valid = false;
   s_tsdb.last_l0_page_offset = 0;
   s_tsdb.last_l0_used_offset = 0;
@@ -257,7 +281,8 @@ bool timeseries_init(void) {
   }
 
   atomic_store(&s_tsdb.initialized, true);
-  atomic_store(&s_init_in_progress, false);
+  atomic_store(&s_operations, 0);
+  atomic_store(&s_lifecycle_busy, false);
 
   ESP_LOGI(TAG, "Timeseries DB initialized successfully.");
   return true;
@@ -304,15 +329,14 @@ init_fail:
     s_tsdb.snapshot_mutex = NULL;
   }
   s_tsdb.partition = NULL;
-  atomic_store(&s_init_in_progress, false);
+  atomic_store(&s_lifecycle_busy, false);
   return false;
 }
 
+static bool insert_ordered(const timeseries_insert_data_t *data, const tsdb_point_order_t *order);
+
 bool timeseries_insert(const timeseries_insert_data_t* data) {
-  if (!s_tsdb.initialized) {
-    ESP_LOGE(TAG, "Timeseries DB not initialized yet.");
-    return false;
-  }
+  TSDB_OPERATION_GUARD(false);
   if (!data) {
     ESP_LOGE(TAG, "timeseries_insert data is NULL.");
     return false;
@@ -324,6 +348,51 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
   if (data->num_points == 0) {
     ESP_LOGW(TAG, "No data points provided, nothing to store.");
     return true;
+  }
+
+  if (data->num_fields > SIZE_MAX / data->num_points ||
+      data->num_points > SIZE_MAX / sizeof(*data->timestamps_ms) ||
+      (data->num_tags && (!data->tag_keys || !data->tag_values))) return false;
+  for (size_t t = 0; t < data->num_tags; t++) {
+    if (!data->tag_keys[t] || !data->tag_values[t]) return false;
+  }
+  for (size_t f = 0; f < data->num_fields; f++) {
+    if (!data->field_names[f]) return false;
+  }
+  if (!tsdb_validate_point_values(data->field_values,
+                                  data->num_fields * data->num_points)) return false;
+
+  tsdb_point_order_t order;
+  if (!tsdb_point_order_init(data->timestamps_ms, data->num_points, &order)) return false;
+  bool ok = insert_ordered(data, &order);
+  tsdb_point_order_deinit(&order);
+  return ok;
+}
+
+static bool insert_ordered(const timeseries_insert_data_t *data, const tsdb_point_order_t *order) {
+  // Pre-compute the common prefix (measurement + tags) using memcpy.
+  char prefix_buffer[256];
+  size_t meas_len = strlen(data->measurement_name);
+  if (meas_len >= sizeof(prefix_buffer)) {
+    ESP_LOGE(TAG, "Measurement name too long for prefix buffer");
+    return false;
+  }
+  memcpy(prefix_buffer, data->measurement_name, meas_len);
+  size_t prefix_len = meas_len;
+  for (size_t t = 0; t < data->num_tags; t++) {
+    size_t tk_len = strlen(data->tag_keys[t]);
+    size_t tv_len = strlen(data->tag_values[t]);
+    size_t need = 1 + tk_len + 1 + tv_len; // ":key:val"
+    if (prefix_len + need >= sizeof(prefix_buffer)) {
+      ESP_LOGE(TAG, "Prefix buffer overflow");
+      return false;
+    }
+    prefix_buffer[prefix_len++] = ':';
+    memcpy(prefix_buffer + prefix_len, data->tag_keys[t], tk_len);
+    prefix_len += tk_len;
+    prefix_buffer[prefix_len++] = ':';
+    memcpy(prefix_buffer + prefix_len, data->tag_values[t], tv_len);
+    prefix_len += tv_len;
   }
 
   uint64_t start_time = esp_timer_get_time();
@@ -361,7 +430,8 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
       }
     }
     // Cache the result (round-robin eviction)
-    if (s_tsdb.meas_cache) {
+    if (s_tsdb.meas_cache &&
+        strlen(data->measurement_name) < sizeof(s_tsdb.meas_cache[0].name)) {
       uint8_t slot = s_tsdb.meas_cache_next;
       strncpy(s_tsdb.meas_cache[slot].name, data->measurement_name,
               sizeof(s_tsdb.meas_cache[slot].name) - 1);
@@ -380,31 +450,6 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
   if (data->num_points > 500) {
     ESP_LOGI(TAG, "Starting large insert: %zu points x %zu fields = %zu total values",
              data->num_points, data->num_fields, data->num_points * data->num_fields);
-  }
-
-  // Pre-compute the common prefix (measurement + tags) using memcpy.
-  char prefix_buffer[256];
-  size_t meas_len = strlen(data->measurement_name);
-  if (meas_len >= sizeof(prefix_buffer)) {
-    ESP_LOGE(TAG, "Measurement name too long for prefix buffer");
-    return false;
-  }
-  memcpy(prefix_buffer, data->measurement_name, meas_len);
-  size_t prefix_len = meas_len;
-  for (size_t t = 0; t < data->num_tags; t++) {
-    size_t tk_len = strlen(data->tag_keys[t]);
-    size_t tv_len = strlen(data->tag_values[t]);
-    size_t need = 1 + tk_len + 1 + tv_len; // ":key:val"
-    if (prefix_len + need >= sizeof(prefix_buffer)) {
-      ESP_LOGE(TAG, "Prefix buffer overflow");
-      return false;
-    }
-    prefix_buffer[prefix_len++] = ':';
-    memcpy(prefix_buffer + prefix_len, data->tag_keys[t], tk_len);
-    prefix_len += tk_len;
-    prefix_buffer[prefix_len++] = ':';
-    memcpy(prefix_buffer + prefix_len, data->tag_values[t], tv_len);
-    prefix_len += tv_len;
   }
 
   // For each field i => build the series_id => store all points in one shot
@@ -521,8 +566,8 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
     // 2) Insert multi data points in one entry
     ESP_LOGD(TAG, "Inserting field %zu/%zu: '%s' (%zu points)",
              i + 1, data->num_fields, data->field_names[i], data->num_points);
-    bool appended = tsdb_append_multiple_points(&s_tsdb, series_id, data->timestamps_ms,
-                                               field_array, data->num_points);
+    bool appended = tsdb_append_ordered_points(&s_tsdb, series_id, data->timestamps_ms,
+                                               field_array, order);
     if (!appended) {
       ESP_LOGE(TAG, "Failed to insert multi points for field '%s'", data->field_names[i]);
       any_field_failed = true;
@@ -549,17 +594,13 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
 }
 
 bool timeseries_compact(void) {
-  if (!s_tsdb.initialized) {
-    return false;
-  }
+  TSDB_OPERATION_GUARD(false);
   tsdb_launch_compaction(&s_tsdb);
   return true;
 }
 
 bool timeseries_compact_sync(void) {
-  if (!s_tsdb.initialized) {
-    return false;
-  }
+  TSDB_OPERATION_GUARD(false);
   // Wait for any in-progress compaction to finish
   int timeout_ms = 60000;
   while (atomic_load(&s_tsdb.compaction_in_progress) && timeout_ms > 0) {
@@ -586,9 +627,7 @@ bool timeseries_compact_sync(void) {
 }
 
 bool timeseries_compact_force_sync(void) {
-  if (!s_tsdb.initialized) {
-    return false;
-  }
+  TSDB_OPERATION_GUARD(false);
   int timeout_ms = 60000;
   while (atomic_load(&s_tsdb.compaction_in_progress) && timeout_ms > 0) {
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -612,37 +651,31 @@ bool timeseries_compact_force_sync(void) {
 }
 
 void timeseries_deinit(void) {
-  if (!s_tsdb.initialized) {
+  bool expected = false;
+  if (!atomic_compare_exchange_strong(&s_lifecycle_busy, &expected, true)) return;
+  if (!atomic_load(&s_tsdb.initialized) && !s_cleanup_pending) {
+    atomic_store(&s_lifecycle_busy, false);
     return;
   }
 
-  // Mark as not initialized FIRST to prevent new inserts and compaction launches
+  atomic_fetch_or(&s_operations, TSDB_CLOSED);
   atomic_store(&s_tsdb.initialized, false);
-
-  // Wait for any in-progress compaction task to fully exit
-  if (atomic_load(&s_tsdb.compaction_in_progress)) {
-    ESP_LOGI(TAG, "Waiting for compaction task to finish...");
-    if (xSemaphoreTake(s_tsdb.compaction_done_sem, pdMS_TO_TICKS(30000)) != pdTRUE) {
-      /* Abort the teardown. Previously this only warned and then deleted
-       * compaction_done_sem, flash_write_mutex, region_alloc_mutex and
-       * snapshot_mutex, and freed the write buffer and caches — all of which
-       * the still-running compaction task is actively using. It would then
-       * xSemaphoreGive a deleted semaphore on exit.
-       *
-       * Leaking these is strictly better than destroying them under a live
-       * task. `initialized` stays false, so no new inserts or compactions
-       * start, and the running one completes against objects that are still
-       * valid. */
-      ESP_LOGE(TAG,
-               "Timed out waiting for compaction task; aborting deinit and "
-               "leaking TSDB resources rather than freeing them under it");
-      /* Block any later re-init: the zombie still owns these globals. */
-      atomic_store(&s_deinit_abandoned, true);
+  s_cleanup_pending = true;
+  // Completion semaphores may contain a token from an older worker and do not
+  // cover synchronous operations. Only the admission count proves quiescence.
+  TickType_t poll_ticks = pdMS_TO_TICKS(10);
+  if (!poll_ticks) poll_ticks = 1;
+  TickType_t remaining = pdMS_TO_TICKS(30000);
+  while (atomic_load(&s_operations) != TSDB_CLOSED) {
+    if (!remaining) {
+      ESP_LOGW(TAG, "Timed out waiting for active operations; teardown remains pending");
+      atomic_store(&s_lifecycle_busy, false);
       return;
     }
+    TickType_t pause = remaining < poll_ticks ? remaining : poll_ticks;
+    vTaskDelay(pause);
+    remaining -= pause;
   }
-  // Prevent any new compaction from being launched during cleanup
-  atomic_store(&s_tsdb.compaction_in_progress, true);
 
   // Delete compaction semaphore
   if (s_tsdb.compaction_done_sem) {
@@ -699,14 +732,14 @@ void timeseries_deinit(void) {
 
   atomic_store(&s_compaction_consecutive_failures, 0);
   atomic_store(&s_tsdb.compaction_in_progress, false);
+  s_tsdb.partition = NULL;
+  s_cleanup_pending = false;
+  atomic_store(&s_lifecycle_busy, false);
   ESP_LOGI(TAG, "Timeseries DB deinitialized.");
 }
 
 bool timeseries_expire(void) {
-  if (!s_tsdb.initialized) {
-    ESP_LOGE(TAG, "Timeseries DB not initialized yet.");
-    return false;
-  }
+  TSDB_OPERATION_GUARD(false);
 
   ESP_LOGV(TAG, "Starting expiration...");
 
@@ -720,9 +753,7 @@ bool timeseries_expire(void) {
 }
 
 bool timeseries_query(const timeseries_query_t* query, timeseries_query_result_t* result) {
-  if (!s_tsdb.initialized) {
-    return false;
-  }
+  TSDB_OPERATION_GUARD(false);
   return timeseries_query_execute(&s_tsdb, query, result);
 }
 
@@ -775,22 +806,20 @@ void timeseries_query_free_result(timeseries_query_result_t* result) {
 }
 
 bool timeseries_clear_all(void) {
-  if (!s_tsdb.initialized) {
-    ESP_LOGE(TAG, "Timeseries DB not initialized yet.");
-    return false;
-  }
+  TSDB_OPERATION_GUARD(false);
 
-  // Wait for any in-progress compaction to finish before erasing
-  if (atomic_load(&s_tsdb.compaction_in_progress)) {
-    ESP_LOGI(TAG, "Waiting for in-progress compaction before clear_all...");
-    int timeout_ms = 60000;
-    while (atomic_load(&s_tsdb.compaction_in_progress) && timeout_ms > 0) {
-      vTaskDelay(pdMS_TO_TICKS(10));
-      timeout_ms -= 10;
-    }
+  // Claim the slot before erase so compaction/expiration cannot start between
+  // the wait and the flash lock. Never erase under an owner that timed out.
+  int timeout_ms = 60000;
+  for (;;) {
+    bool expected = false;
+    if (atomic_compare_exchange_strong(&s_tsdb.compaction_in_progress, &expected, true)) break;
     if (timeout_ms <= 0) {
-      ESP_LOGW(TAG, "Timed out waiting for compaction to finish; proceeding with clear_all");
+      ESP_LOGW(TAG, "Timed out waiting for compaction before clear_all");
+      return false;
     }
+    vTaskDelay(pdMS_TO_TICKS(10));
+    timeout_ms -= 10;
   }
 
   // Hold flash_write_mutex to prevent concurrent inserts during erase
@@ -806,13 +835,19 @@ bool timeseries_clear_all(void) {
     if (s_tsdb.flash_write_mutex) {
       xSemaphoreGive(s_tsdb.flash_write_mutex);
     }
+    atomic_store(&s_tsdb.compaction_in_progress, false);
     return false;
   }
+
+  // The erased database has no revisions to order against.
+  s_tsdb.write_revision = 0;
 
   // Clear out any cached data
   tsdb_pagecache_clear(&s_tsdb);
   tsdb_cache_clear(&s_tsdb);      // Clear series ID cache
   tsdb_clear_type_cache(&s_tsdb); // Clear series type cache
+
+  memset(s_tsdb.l0_usage_cache, 0, sizeof(s_tsdb.l0_usage_cache));
 
   // Reset the last L0 cache
   s_tsdb.last_l0_cache_valid = false;
@@ -838,15 +873,12 @@ bool timeseries_clear_all(void) {
   if (s_tsdb.flash_write_mutex) {
     xSemaphoreGive(s_tsdb.flash_write_mutex);
   }
-
+  atomic_store(&s_tsdb.compaction_in_progress, false);
   return true;
 }
 
 void timeseries_set_chunk_size(size_t chunk_size) {
-  if (!s_tsdb.initialized) {
-    ESP_LOGW(TAG, "Cannot set chunk size before initialization");
-    return;
-  }
+  TSDB_OPERATION_GUARD();
   if (chunk_size == 0) {
     ESP_LOGW(TAG, "Invalid chunk size (0), keeping current value");
     return;
@@ -871,7 +903,8 @@ timeseries_db_t* timeseries_get_db_handle(void) {
 // =============================================================================
 
 bool timeseries_get_measurements(char*** measurements, size_t* num_measurements) {
-  if (!s_tsdb.initialized || !measurements || !num_measurements) {
+  TSDB_OPERATION_GUARD(false);
+  if (!measurements || !num_measurements) {
     return false;
   }
   *measurements = NULL;
@@ -893,7 +926,8 @@ bool timeseries_get_measurements(char*** measurements, size_t* num_measurements)
 }
 
 bool timeseries_get_fields_for_measurement(const char* measurement_name, char*** fields, size_t* num_fields) {
-  if (!s_tsdb.initialized || !measurement_name || !fields || !num_fields) {
+  TSDB_OPERATION_GUARD(false);
+  if (!measurement_name || !fields || !num_fields) {
     return false;
   }
   *fields = NULL;
@@ -919,7 +953,8 @@ bool timeseries_get_fields_for_measurement(const char* measurement_name, char***
 }
 
 bool timeseries_get_tags_for_measurement(const char* measurement_name, tsdb_tag_pair_t** tags, size_t* num_tags) {
-  if (!s_tsdb.initialized || !measurement_name || !tags || !num_tags) {
+  TSDB_OPERATION_GUARD(false);
+  if (!measurement_name || !tags || !num_tags) {
     return false;
   }
   *tags = NULL;
@@ -939,7 +974,8 @@ bool timeseries_get_tags_for_measurement(const char* measurement_name, tsdb_tag_
 // =============================================================================
 
 bool timeseries_get_usage_summary(tsdb_usage_summary_t* summary) {
-  if (!s_tsdb.initialized || !summary) {
+  TSDB_OPERATION_GUARD(false);
+  if (!summary) {
     return false;
   }
   memset(summary, 0, sizeof(*summary));
@@ -982,7 +1018,8 @@ bool timeseries_get_usage_summary(tsdb_usage_summary_t* summary) {
 // =============================================================================
 
 bool timeseries_delete_measurement(const char* measurement_name) {
-  if (!s_tsdb.initialized || !measurement_name) {
+  TSDB_OPERATION_GUARD(false);
+  if (!measurement_name) {
     return false;
   }
   // Hold flash_write_mutex for the entire delete operation to prevent
@@ -1014,7 +1051,8 @@ bool timeseries_delete_measurement(const char* measurement_name) {
 }
 
 bool timeseries_delete_measurement_and_field(const char* measurement_name, const char* field_name) {
-  if (!s_tsdb.initialized || !measurement_name || !field_name) {
+  TSDB_OPERATION_GUARD(false);
+  if (!measurement_name || !field_name) {
     return false;
   }
   // Hold flash_write_mutex for the entire delete operation to prevent
@@ -1049,9 +1087,7 @@ bool timeseries_get_timestamp_range(const char *measurement_name,
                                     uint64_t *out_min_ms,
                                     uint64_t *out_max_ms,
                                     uint32_t *out_point_count) {
-  if (!s_tsdb.initialized) {
-    return false;
-  }
+  TSDB_OPERATION_GUARD(false);
   return timeseries_query_get_timestamp_range(&s_tsdb, measurement_name,
                                               out_min_ms, out_max_ms,
                                               out_point_count);

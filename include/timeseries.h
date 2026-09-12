@@ -35,6 +35,8 @@ typedef struct {
  * For each field, the data is stored in row-major form:
  *   field_values[i * num_points + p]
  * Timestamps are timestamps_ms[p].
+ * Timestamps may arrive in any order. For repeated timestamps in one batch,
+ * the last supplied value for each field wins. The input arrays are not modified.
  */
 typedef struct {
   const char* measurement_name;
@@ -56,6 +58,11 @@ typedef struct {
 
 /**
  * @brief Supported aggregation methods for rollups
+ *
+ * Integer SUM accumulates exactly, returning INT when the result fits int64_t
+ * and FLOAT otherwise (with normal double precision). Integer AVG returns INT,
+ * rounding to nearest with half ties away from zero. Check each result value's
+ * type; a column's type describes the stored field, not its aggregate results.
  */
 typedef enum {
   TSDB_AGGREGATION_NONE = 0,
@@ -129,7 +136,8 @@ typedef struct timeseries_query_result_column_t {
   char* name;
 
   /**
-   * The field type (e.g., float, int, bool, string).
+   * The stored field type (e.g., float, int, bool, string).
+   * Aggregated values can have different types; inspect each value.type.
    */
   timeseries_field_type_e type;
 
@@ -259,6 +267,14 @@ void timeseries_set_log_hook(timeseries_log_hook_t hook);
 /**
  * @brief Deinitialize the timeseries database, stopping background tasks and
  *        freeing all resources.
+ *
+ * Rejects new database operations and waits up to 30 seconds for admitted
+ * operations, including background compaction hooks, to finish. If that wait
+ * expires, resources remain owned and initialization is rejected; call deinit
+ * again after the outstanding work finishes to complete cleanup. While another
+ * init/deinit call is active, init returns false and deinit returns without
+ * starting another lifecycle transition.
+ * Call from outside database callbacks to avoid waiting on the calling operation.
  */
 void timeseries_deinit(void);
 

@@ -1,6 +1,7 @@
 // timeseries_page_stream_writer.c
 
 #include "timeseries_page_stream_writer.h"
+#include "timeseries_revision.h"
 #include "timeseries_flash_utils.h"
 
 #include "esp_log.h"
@@ -226,6 +227,22 @@ static bool gorilla_flush_to_flash(void* context, const uint8_t* data, size_t le
 //  Implementation of the streaming writer interface
 // ----------------------------------------------------------------------
 
+static bool prepare_revisions(timeseries_page_stream_writer_t *writer, size_t count,
+                              uint8_t **encoded, size_t *length, uint8_t *flags) {
+  uint64_t revision = 0;
+  if (writer->point_revisions) {
+    if (writer->point_revision_count != count && writer->point_revision_count != 1) return false;
+  } else {
+    if (writer->db->flash_write_mutex) xSemaphoreTake(writer->db->flash_write_mutex, portMAX_DELAY);
+    bool ok = tsdb_revision_next_locked(writer->db, &revision);
+    if (writer->db->flash_write_mutex) xSemaphoreGive(writer->db->flash_write_mutex);
+    if (!ok) return false;
+  }
+  if (writer->point_revisions && writer->point_revision_count == 1)
+    return tsdb_revision_encode(NULL, 0, writer->point_revisions[0], encoded, length, flags);
+  return tsdb_revision_encode(writer->point_revisions, count, revision, encoded, length, flags);
+}
+
 bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_stream_writer_t* writer, uint8_t to_level,
                                         uint32_t prev_data_size) {
   if (!db || !writer) {
@@ -258,8 +275,7 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
   hdr.magic_number = TIMESERIES_MAGIC_NUM;
   hdr.page_type = TIMESERIES_PAGE_TYPE_FIELD_DATA;
   hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
-  // Atomic increment to avoid duplicate sequence numbers across concurrent
-  // page allocations (the field is _Atomic but ++ is a non-atomic RMW).
+  // Reserve a unique physical page sequence across concurrent allocations.
   hdr.sequence_num = atomic_fetch_add(&db->sequence_num, 1) + 1;
   hdr.field_data_level = to_level;
   hdr.page_size = initial_size;
@@ -551,7 +567,17 @@ bool timeseries_page_stream_writer_end_series(timeseries_page_stream_writer_t* w
              (unsigned int)total_col_bytes, (unsigned int)ts_len, (unsigned int)val_len);
     return false;
   }
-  writer->fd_hdr.record_length = (uint16_t)total_col_bytes;
+  uint8_t *revisions = NULL;
+  size_t revisions_len = 0;
+  if (!prepare_revisions(writer, writer->fd_hdr.record_count, &revisions, &revisions_len, &writer->fd_hdr.flags))
+    return false;
+  bool revisions_ok = revisions_len <= UINT16_MAX - total_col_bytes &&
+      ensure_capacity(writer, revisions_len) &&
+      esp_partition_write(writer->db->partition, writer->write_ptr, revisions, revisions_len) == ESP_OK;
+  free(revisions);
+  if (!revisions_ok) return false;
+  writer->write_ptr += revisions_len;
+  writer->fd_hdr.record_length = (uint16_t)(total_col_bytes + revisions_len);
 
   ESP_LOGI(TAG, "Series %02X%02X%02X%02X: record_count=%u, record_length=%u bytes (ts=%u, val=%u), times=[%" PRIu64 "-%" PRIu64 "]",
            writer->fd_hdr.series_id[0], writer->fd_hdr.series_id[1],
@@ -572,27 +598,28 @@ bool timeseries_page_stream_writer_end_series(timeseries_page_stream_writer_t* w
   return true;
 }
 
-bool timeseries_page_stream_writer_write_alp_series(
+static bool write_alp_with_revisions(
     timeseries_page_stream_writer_t *sw,
     const uint8_t series_id[16],
     const uint8_t *ts_buf,  size_t ts_len,
     const uint8_t *val_buf, size_t val_len,
     uint16_t record_count,
     uint64_t start_time,
-    uint64_t end_time) {
+    uint64_t end_time, const uint8_t *revisions, size_t revisions_len, uint8_t revision_flags) {
   if (!sw || sw->finalized) {
     return false;
   }
 
   // Validate record_length fits in uint16_t before touching flash.
-  uint32_t total_col = (uint32_t)(sizeof(timeseries_col_data_header_t) + ts_len + val_len);
-  if (total_col > 0xFFFF) {
+  if (ts_len > UINT16_MAX || val_len > UINT16_MAX || revisions_len > UINT16_MAX) return false;
+  size_t total_col = sizeof(timeseries_col_data_header_t) + ts_len + val_len + revisions_len;
+  if (total_col > UINT16_MAX) {
     ESP_LOGE(TAG, "ALP series record_length %u exceeds 16-bit limit", (unsigned)total_col);
     return false;
   }
 
   size_t total = sizeof(timeseries_field_data_header_t) +
-                 sizeof(timeseries_col_data_header_t) + ts_len + val_len;
+                 sizeof(timeseries_col_data_header_t) + ts_len + val_len + revisions_len;
 
   if (!ensure_capacity(sw, total)) {
     ESP_LOGE(TAG, "ensure_capacity failed for ALP series (need %zu bytes)", total);
@@ -608,7 +635,7 @@ bool timeseries_page_stream_writer_write_alp_series(
   fd_hdr.end_time      = end_time;
   fd_hdr.record_length = (uint16_t)total_col;
   // Clear COMPRESSED bit (0 = compressed) and ENCODING_ALP bit (0 = ALP)
-  fd_hdr.flags &= ~(TSDB_FIELDDATA_FLAG_COMPRESSED | TSDB_FIELDDATA_FLAG_ENCODING_ALP);
+  fd_hdr.flags = revision_flags & ~(TSDB_FIELDDATA_FLAG_COMPRESSED | TSDB_FIELDDATA_FLAG_ENCODING_ALP);
 
   // Write fd_hdr
   uint32_t fd_offset = sw->write_ptr;
@@ -646,11 +673,28 @@ bool timeseries_page_stream_writer_write_alp_series(
     sw->write_ptr += val_len;
   }
 
+  if (esp_partition_write(sw->db->partition, sw->write_ptr, revisions, revisions_len) != ESP_OK) return false;
+  sw->write_ptr += revisions_len;
+
   ESP_LOGD(TAG, "ALP series %02X%02X%02X%02X: count=%u, ts_len=%zu, val_len=%zu, times=[%" PRIu64 "-%" PRIu64 "]",
            series_id[0], series_id[1], series_id[2], series_id[3],
            record_count, ts_len, val_len, start_time, end_time);
 
   return true;
+}
+
+bool timeseries_page_stream_writer_write_alp_series(
+    timeseries_page_stream_writer_t *writer, const uint8_t series_id[16],
+    const uint8_t *ts_buf, size_t ts_len, const uint8_t *val_buf, size_t val_len,
+    uint16_t count, uint64_t first, uint64_t last) {
+  if (!writer || !writer->db || writer->finalized) return false;
+  uint8_t *revisions = NULL, flags = 0xff;
+  size_t revisions_len = 0;
+  if (!prepare_revisions(writer, count, &revisions, &revisions_len, &flags)) return false;
+  bool ok = write_alp_with_revisions(writer, series_id, ts_buf, ts_len, val_buf, val_len,
+                                     count, first, last, revisions, revisions_len, flags);
+  free(revisions);
+  return ok;
 }
 
 bool timeseries_page_stream_writer_finalize(timeseries_page_stream_writer_t* writer) {

@@ -64,9 +64,9 @@ static bool decode_next_float_block(alp_stream_decoder_t *dec) {
     alp_ffor_unpack(packed_data, block_count, for_base, bw, decoded_ints);
 
     /* Delta decode with running carry */
-    decoded_ints[0] += dec->running;
+    decoded_ints[0] = alp_i64_add(decoded_ints[0], (uint64_t)dec->running);
     for (size_t i = 1; i < block_count; i++)
-        decoded_ints[i] += decoded_ints[i - 1];
+        decoded_ints[i] = alp_i64_add(decoded_ints[i], (uint64_t)decoded_ints[i - 1]);
     dec->running = decoded_ints[block_count - 1];
 
     /* Exception data */
@@ -159,9 +159,9 @@ static bool decode_next_int_block(alp_stream_decoder_t *dec) {
     p += packed_words * 8;
 
     /* Delta decode with running carry (prefix-sum) */
-    out_i64[0] += dec->running;
+    out_i64[0] = alp_i64_add(out_i64[0], (uint64_t)dec->running);
     for (size_t i = 1; i < block_count; i++)
-        out_i64[i] += out_i64[i - 1];
+        out_i64[i] = alp_i64_add(out_i64[i], (uint64_t)out_i64[i - 1]);
     dec->running = out_i64[block_count - 1];
 
     dec->block_count = block_count;
@@ -178,10 +178,9 @@ static bool decode_next_int_block(alp_stream_decoder_t *dec) {
 bool alp_stream_decoder_init(alp_stream_decoder_t *dec,
                               const uint8_t *data, size_t len,
                               bool is_float) {
-    if (!dec || !data || len == 0)
-        return false;
-
+    if (!dec) return false;
     memset(dec, 0, sizeof(*dec));
+    if (!data || len == 0) return false;
     dec->is_float = is_float;
     dec->end = data + len;
 
@@ -296,14 +295,17 @@ bool alp_stream_decoder_next_int(alp_stream_decoder_t *dec, int64_t *out) {
 bool alp_stream_decoder_skip(alp_stream_decoder_t *dec, size_t count) {
     if (!dec) return false;
 
-    for (size_t i = 0; i < count; i++) {
+    while (count > 0) {
         /* Decode next block if current one is exhausted */
         if (dec->block_offset >= dec->block_count) {
             bool ok = dec->is_float ? decode_next_float_block(dec)
                                     : decode_next_int_block(dec);
             if (!ok) return false;
         }
-        dec->block_offset++;
+        size_t available = dec->block_count - dec->block_offset;
+        size_t step = count < available ? count : available;
+        dec->block_offset += step;
+        count -= step;
     }
     return true;
 }

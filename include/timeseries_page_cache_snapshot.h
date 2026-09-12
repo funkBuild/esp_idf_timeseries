@@ -26,6 +26,10 @@ typedef struct tsdb_page_cache_snapshot {
     size_t removed_capacity;
 } tsdb_page_cache_snapshot_t;
 
+// Reader references pin immutable contents. With only the database reference,
+// cache mutators may reuse the live array while holding snapshot_mutex. Acquire
+// current snapshots through tsdb_snapshot_acquire_current(), not a raw DB pointer.
+
 /**
  * @brief Create a new empty snapshot with the given initial capacity.
  * @param initial_capacity Initial capacity for the entries array.
@@ -39,6 +43,9 @@ tsdb_page_cache_snapshot_t *tsdb_snapshot_create(size_t initial_capacity);
  * @return New snapshot, or NULL on failure.
  */
 tsdb_page_cache_snapshot_t *tsdb_snapshot_clone(const tsdb_page_cache_snapshot_t *src);
+// Clone with room for additional entries, avoiding an immediate realloc on add.
+tsdb_page_cache_snapshot_t *tsdb_snapshot_clone_with_room(const tsdb_page_cache_snapshot_t *src,
+                                                        size_t additional);
 
 /**
  * @brief Atomically increment the refcount and return the snapshot.

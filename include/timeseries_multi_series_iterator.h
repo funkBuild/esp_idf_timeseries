@@ -29,7 +29,7 @@ typedef struct {
 
   // Bookkeeping for the current rollup window:
   uint64_t current_window_start;
-  uint64_t current_window_end;
+  uint64_t current_window_end; // Saturates at UINT64_MAX; membership uses start/interval.
 
   // For each sub-iterator, we keep the "next" point we haven't consumed yet
   // But in practice, we may simply rely on sub_iters themselves.
@@ -57,16 +57,16 @@ bool timeseries_multi_series_iterator_init(
     timeseries_multi_series_iterator_t *out_iter);
 
 /**
- * @brief Advance to the next rollup window.
- *        Accumulate all points from *all sub-iterators* whose timestamps
- *        lie in [current_window_start, current_window_end).
- *        Returns the aggregated timestamp (which may be the window_start
- *        or the average of all timestamps, depending on your needs).
- *        \p out_vals can store one aggregated value per sub-iterator (field).
+ * @brief Advance to the next occupied rollup window, skipping empty intervals.
+ *        Windows are anchored at the earliest input timestamp. A point belongs
+ *        when timestamp >= start and timestamp - start < rollup_interval,
+ *        including UINT64_MAX when the final window extends past it.
+ *        LAST selects the greatest timestamp; later sub-iterators win ties.
  *
- * @param iter    The multi-series rollup iterator
- * @param out_ts  The timestamp for this rollup window
- * @param out_vals An array of values, one for each sub-iterator
+ * @param iter     The multi-series rollup iterator
+ * @param out_ts   Optional output for the window start timestamp
+ * @param out_vals Optional output for the aggregate across all sub-iterators;
+ *                 caller owns any returned string.
  * @return true if a new aggregated window is produced, false if done
  */
 bool timeseries_multi_series_iterator_next(

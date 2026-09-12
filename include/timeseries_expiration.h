@@ -15,7 +15,9 @@ extern "C" {
  * @param db                Pointer to your timeseries database handle.
  * @param usage_threshold   Fraction of total partition size at which to
  *                          trigger expiration (e.g. 0.90 = 90%).
- * @return true on success, false if any error occurred.
+ * @return true on success or when usage is below threshold; false on error or
+ *         when compaction/another maintenance operation owns the slot. A busy
+ *         result leaves records unchanged and can be retried.
  */
 bool timeseries_expiration_run(timeseries_db_t *db, float usage_threshold,
                                float reduction_threshold);

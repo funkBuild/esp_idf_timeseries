@@ -81,6 +81,9 @@ static bool multi_iter_advance_sub(timeseries_multi_points_iterator_t* multi, si
   /* Save old value for later free */
   timeseries_field_value_t old = sub->current_val;
 
+  sub->current_revision = sub->sub_iter->has_revision
+      ? tsdb_revision_at(&sub->sub_iter->revisions, sub->sub_iter->revision_first + sub->sub_iter->current_idx - 1)
+      : sub->page_seq;
   sub->current_ts = ts;
   sub->current_val = val; /* new value now installed */
 
@@ -132,7 +135,7 @@ bool timeseries_multi_points_iterator_init(timeseries_points_iterator_t** sub_it
   for (size_t i = 0; i < sub_count; i++) {
     multi_points_sub_iter_t* sub = &out_iter->subs[i];
     sub->sub_iter = sub_iters[i];
-    sub->page_seq = page_seqs[i];
+    sub->page_seq = page_seqs ? page_seqs[i] : 0;
     sub->valid = true;
 
     // Attempt to read the first point
@@ -175,9 +178,30 @@ bool timeseries_multi_points_iterator_next(timeseries_multi_points_iterator_t* m
   size_t top_index = multi_iter->heap[0];
   uint64_t smallest_ts = multi_iter->subs[top_index].current_ts;
 
+  // If neither child ties the root, no descendant can tie it either.
+  // Advance the unique winner in place: one sift instead of pop + push.
+  if ((multi_iter->heap_size < 2 ||
+       multi_iter->subs[multi_iter->heap[1]].current_ts != smallest_ts) &&
+      (multi_iter->heap_size < 3 ||
+       multi_iter->subs[multi_iter->heap[2]].current_ts != smallest_ts)) {
+    multi_points_sub_iter_t *sub = &multi_iter->subs[top_index];
+    if (out_ts) *out_ts = smallest_ts;
+    if (out_val) *out_val = sub->current_val;
+    if (sub->current_val.type == TIMESERIES_FIELD_TYPE_STRING) {
+      if (!out_val) free(sub->current_val.data.string_val.str);
+      sub->current_val.data.string_val.str = NULL;
+      sub->current_val.data.string_val.length = 0;
+    }
+    if (!multi_iter_advance_sub(multi_iter, top_index)) {
+      multi_iter->heap[0] = multi_iter->heap[--multi_iter->heap_size];
+    }
+    if (multi_iter->heap_size > 1) heap_sift_down(multi_iter, 0);
+    return true;
+  }
+
   // We'll gather all sub-iterators that have this same timestamp
   // so we can pick the newest (max page_seq)
-  uint32_t best_seq = multi_iter->subs[top_index].page_seq;
+  uint64_t best_seq = multi_iter->subs[top_index].current_revision;
   size_t best_sub = top_index;
 
   // We'll pop from the heap each sub-iterator that has the same timestamp
@@ -186,27 +210,33 @@ bool timeseries_multi_points_iterator_next(timeseries_multi_points_iterator_t* m
   // Use pre-allocated deduplication buffer (Fix #1.4)
   size_t* popped = multi_iter->dedup_buffer;
 
-  // Repeatedly pop while the top has same_ts
-  while (multi_iter->heap_size > 0) {
-    size_t idx = multi_iter->heap[0];
-    uint64_t ts_cur = multi_iter->subs[idx].current_ts;
-    if (ts_cur != smallest_ts) {
-      // We are done collecting same-timestamp items
+  // Fully overlapping records commonly have every head at the same time.
+  // Consume that whole group without repeatedly repairing an emptying heap.
+  bool all_same = true;
+  for (size_t i = 1; i < multi_iter->heap_size; i++) {
+    if (multi_iter->subs[multi_iter->heap[i]].current_ts != smallest_ts) {
+      all_same = false;
       break;
     }
-
-    // pop from heap
-    multi_iter->heap[0] = multi_iter->heap[multi_iter->heap_size - 1];
-    multi_iter->heap_size--;
-    if (multi_iter->heap_size > 0) {
-      heap_sift_down(multi_iter, 0);
+  }
+  if (all_same) {
+    same_ts_pop_count = multi_iter->heap_size;
+    memcpy(popped, multi_iter->heap, same_ts_pop_count * sizeof(*popped));
+    multi_iter->heap_size = 0;
+  } else {
+    while (multi_iter->heap_size > 0) {
+      size_t idx = multi_iter->heap[0];
+      if (multi_iter->subs[idx].current_ts != smallest_ts) break;
+      multi_iter->heap[0] = multi_iter->heap[--multi_iter->heap_size];
+      if (multi_iter->heap_size > 0) heap_sift_down(multi_iter, 0);
+      popped[same_ts_pop_count++] = idx;
     }
-
-    popped[same_ts_pop_count++] = idx;
-
-    // check if it has higher page_seq
-    if (multi_iter->subs[idx].page_seq > best_seq) {
-      best_seq = multi_iter->subs[idx].page_seq;
+  }
+  for (size_t i = 0; i < same_ts_pop_count; i++) {
+    size_t idx = popped[i];
+    uint64_t seq = multi_iter->subs[idx].current_revision;
+    if (seq >= best_seq && (seq > best_seq || idx > best_sub)) {
+      best_seq = seq;
       best_sub = idx;
     }
   }
@@ -255,9 +285,13 @@ bool timeseries_multi_points_iterator_next(timeseries_multi_points_iterator_t* m
       // If we successfully read the next point, push it back into heap
       if (multi_iter->subs[sid].valid) {
         multi_iter->heap[multi_iter->heap_size++] = sid;
-        heap_sift_up(multi_iter, multi_iter->heap_size - 1);
+        if (!all_same) heap_sift_up(multi_iter, multi_iter->heap_size - 1);
       }
     }
+  }
+  if (all_same) {
+    for (size_t i = multi_iter->heap_size / 2; i > 0; i--)
+      heap_sift_down(multi_iter, i - 1);
   }
   // No free needed - using pre-allocated buffer (Fix #1.4)
 
@@ -293,6 +327,19 @@ void timeseries_multi_points_iterator_deinit(timeseries_multi_points_iterator_t*
   memset(multi_iter, 0, sizeof(*multi_iter));
 }
 
+// Equal timestamps can appear only below equal-timestamp parents. Visit just
+// that subtree when peek needs the same winner as next; depth is O(log n).
+static size_t peek_winner(const timeseries_multi_points_iterator_t *multi,
+                          size_t pos, uint64_t timestamp, size_t best) {
+  if (pos >= multi->heap_size) return best;
+  size_t index = multi->heap[pos];
+  if (multi->subs[index].current_ts != timestamp) return best;
+  if (multi->subs[index].current_revision > multi->subs[best].current_revision ||
+      (multi->subs[index].current_revision == multi->subs[best].current_revision && index > best)) best = index;
+  best = peek_winner(multi, 2 * pos + 1, timestamp, best);
+  return peek_winner(multi, 2 * pos + 2, timestamp, best);
+}
+
 bool timeseries_multi_points_iterator_peek(timeseries_multi_points_iterator_t* multi_iter, uint64_t* out_ts,
                                            timeseries_field_value_t* out_val) {
   if (!multi_iter || !multi_iter->valid || multi_iter->heap_size == 0) {
@@ -304,6 +351,7 @@ bool timeseries_multi_points_iterator_peek(timeseries_multi_points_iterator_t* m
 
   // The top of the heap is the sub-iterator with the smallest current_ts
   size_t top_index = multi_iter->heap[0];
+  top_index = peek_winner(multi_iter, 0, multi_iter->subs[top_index].current_ts, top_index);
   multi_points_sub_iter_t* sub = &multi_iter->subs[top_index];
 
   if (!sub->valid) {

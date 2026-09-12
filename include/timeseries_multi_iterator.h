@@ -14,6 +14,7 @@ typedef struct multi_points_sub_iter_t {
   timeseries_points_iterator_t *sub_iter;
   uint64_t current_ts;
   timeseries_field_value_t current_val;
+  uint64_t current_revision;
   uint32_t page_seq;
   bool valid;
 } multi_points_sub_iter_t;
@@ -33,7 +34,9 @@ typedef struct timeseries_multi_points_iterator_t {
 
 /**
  * @brief Initialize a multi-points iterator that merges multiple
- *        timeseries_points_iterator_t sub-iterators.
+ *        timeseries_points_iterator_t sub-iterators. Persisted revisions take
+ *        precedence over page_seqs. The page_seqs array may be NULL, in which
+ *        case unversioned ties use input order.
  */
 bool timeseries_multi_points_iterator_init(
     timeseries_points_iterator_t **sub_iters, const uint32_t *page_seqs,
@@ -42,7 +45,8 @@ bool timeseries_multi_points_iterator_init(
 /**
  * @brief Return the next (timestamp,value) from this multi-iterator in
  *        ascending timestamp order. If multiple sub-iterators share the
- *        same timestamp, a tie-break is used (e.g. page_seq).
+ *        same timestamp, the highest revision (or legacy page_seq) wins; equal priorities choose
+ *        the later input iterator. Peek uses the same rule.
  */
 bool timeseries_multi_points_iterator_next(
     timeseries_multi_points_iterator_t *multi_iter, uint64_t *out_ts,

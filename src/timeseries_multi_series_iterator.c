@@ -1,6 +1,7 @@
 #include "timeseries_multi_series_iterator.h"
 
 #include <inttypes.h> // for PRIu64, etc.
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,34 +46,120 @@
  *-------------------------------------------------------------------------------------*/
 typedef struct {
   int64_t  i_sum;
+  int64_t  i_sum_carry; // Exact total = i_sum + carry * 2^64.
   int64_t  i_min;
   int64_t  i_max;
   double   f_sum;
   double   f_min;
   double   f_max;
-  uint32_t count;
+  uint64_t count;
+  uint64_t last_timestamp;
   bool     is_int;       // true if all samples so far are INT
   timeseries_field_value_t last_val;
 } aggregator_state_t;
 
 static inline void aggregator_init(aggregator_state_t *agg) {
   agg->i_sum = 0;
+  agg->i_sum_carry = 0;
   agg->i_min = INT64_MAX;
   agg->i_max = INT64_MIN;
   agg->f_sum = 0.0;
-  agg->f_min = +1.0e38;
-  agg->f_max = -1.0e38;
+  agg->f_min = INFINITY;
+  agg->f_max = -INFINITY;
   agg->count = 0;
+  agg->last_timestamp = 0;
   agg->is_int = true;    // assume int until we see a non-int value
   memset(&agg->last_val, 0, sizeof(agg->last_val));
+}
+
+/* Keep the common case in int64_t, extending only on signed overflow. GCC's
+ * overflow builtin defines the wrapped low word without undefined arithmetic.
+ * Two words hold the exact sum of up to UINT64_MAX int64_t samples. */
+static inline void integer_sum_add(aggregator_state_t *agg, int64_t value) {
+  if (__builtin_add_overflow(agg->i_sum, value, &agg->i_sum)) {
+    agg->i_sum_carry += value < 0 ? -1 : 1;
+  }
+}
+
+static bool integer_sum_magnitude(const aggregator_state_t *agg,
+                                  uint64_t *high, uint64_t *low) {
+  bool negative = agg->i_sum_carry < 0 ||
+                  (agg->i_sum_carry == 0 && agg->i_sum < 0);
+  *low = (uint64_t)agg->i_sum;
+  *high = (uint64_t)agg->i_sum_carry - (agg->i_sum < 0);
+  if (negative) {
+    *high = ~*high + (*low == 0);
+    *low = 0 - *low;
+  }
+  return negative;
+}
+
+static double integer_sum_as_double(const aggregator_state_t *agg) {
+  if (agg->i_sum_carry == 0) return (double)agg->i_sum;
+  uint64_t high, low;
+  bool negative = integer_sum_magnitude(agg, &high, &low);
+  double magnitude = (double)high * 0x1p64 + (double)low;
+  return negative ? -magnitude : magnitude;
+}
+
+static int64_t integer_average(const aggregator_state_t *agg) {
+  if (agg->i_min == agg->i_max) return agg->i_min;
+  uint64_t high, low;
+  bool negative = integer_sum_magnitude(agg, &high, &low);
+  uint64_t quotient, remainder;
+  if ((agg->count & (agg->count - 1)) == 0) {
+    // Count == 1 was handled by the identical-values fast path above.
+    unsigned shift = (unsigned)__builtin_ctzll(agg->count);
+    quotient = (low >> shift) | (high << (64 - shift));
+    remainder = low & (agg->count - 1);
+  } else if (high == 0) {
+    quotient = low / agg->count;
+    remainder = low - quotient * agg->count;
+  } else {
+    // The quotient is at most 2^63 (an average stays inside the input range),
+    // so high < count. Long division is needed only for large accumulated sums.
+    quotient = 0;
+    remainder = high;
+    for (int bit = 63; bit >= 0; bit--) {
+      bool carry = (remainder >> 63) != 0;
+      remainder = (remainder << 1) | ((low >> bit) & 1);
+      if (carry || remainder >= agg->count) {
+        remainder -= agg->count;
+        quotient |= UINT64_C(1) << bit;
+      }
+    }
+  }
+  // Round nearest, ties away from zero, without doubling the sum/remainder.
+  if (remainder >= agg->count / 2 + agg->count % 2) quotient++;
+  if (!negative) return (int64_t)quotient;
+  // This form also represents INT64_MIN without negating it or casting 2^63.
+  return quotient == 0 ? 0 : -(int64_t)(quotient - 1) - 1;
 }
 
 /*-------------------------------------------------------------------------------------
  *  HELPER: Update aggregator with one sample
  *-------------------------------------------------------------------------------------*/
 static void update_aggregator(const timeseries_field_value_t *val,
+                              uint64_t timestamp,
+                              timeseries_aggregation_method_e method,
                               aggregator_state_t *agg) {
   if (!val) {
+    return;
+  }
+
+  if (method == TSDB_AGGREGATION_COUNT) {
+    agg->count++;
+    if (val->type == TIMESERIES_FIELD_TYPE_STRING) {
+      free(val->data.string_val.str);
+    }
+    return;
+  }
+  // LAST follows timestamp order across series, with later series winning ties.
+  if (method == TSDB_AGGREGATION_LAST && agg->count != 0 &&
+      timestamp < agg->last_timestamp) {
+    if (val->type == TIMESERIES_FIELD_TYPE_STRING) {
+      free(val->data.string_val.str);
+    }
     return;
   }
 
@@ -86,19 +173,26 @@ static void update_aggregator(const timeseries_field_value_t *val,
   }
   agg->last_val = *val;
   agg->count++;
+  agg->last_timestamp = timestamp;
+  if (method == TSDB_AGGREGATION_LAST) {
+    agg->count = 1; // Only presence matters for LAST.
+    return;
+  }
 
+  const bool needs_sum = method != TSDB_AGGREGATION_MIN &&
+                         method != TSDB_AGGREGATION_MAX;
   if (val->type == TIMESERIES_FIELD_TYPE_STRING) {
     return;
   }
 
   if (val->type == TIMESERIES_FIELD_TYPE_INT) {
     int64_t v = val->data.int_val;
-    agg->i_sum += v;
+    if (needs_sum && agg->is_int) integer_sum_add(agg, v);
     if (v < agg->i_min) agg->i_min = v;
     if (v > agg->i_max) agg->i_max = v;
     // Also maintain float accumulators in case we see mixed types later
     if (!agg->is_int) {
-      agg->f_sum += (double)v;
+      if (needs_sum) agg->f_sum += (double)v;
       if ((double)v < agg->f_min) agg->f_min = (double)v;
       if ((double)v > agg->f_max) agg->f_max = (double)v;
     }
@@ -111,15 +205,15 @@ static void update_aggregator(const timeseries_field_value_t *val,
       numeric = val->data.bool_val ? 1.0 : 0.0;
     }
 
-    if (agg->is_int && agg->count > 0) {
+    if (agg->is_int && agg->count > 1) {
       // Switching from int to float: backfill float accumulators
-      agg->f_sum = (double)agg->i_sum;
+      if (needs_sum) agg->f_sum = integer_sum_as_double(agg);
       agg->f_min = (double)agg->i_min;
       agg->f_max = (double)agg->i_max;
     }
     agg->is_int = false;
 
-    agg->f_sum += numeric;
+    if (needs_sum) agg->f_sum += numeric;
     if (numeric < agg->f_min) agg->f_min = numeric;
     if (numeric > agg->f_max) agg->f_max = numeric;
   }
@@ -145,6 +239,16 @@ finalize_aggregator(timeseries_aggregation_method_e method,
     return result;
   }
 
+  if (method == TSDB_AGGREGATION_COUNT) {
+    if (agg->count <= INT64_MAX) {
+      result.type = TIMESERIES_FIELD_TYPE_INT;
+      result.data.int_val = (int64_t)agg->count;
+    } else {
+      result.data.float_val = (double)agg->count;
+    }
+    return result;
+  }
+
   // Integer fast path: avoid all double conversions
   if (agg->is_int && agg->last_val.type == TIMESERIES_FIELD_TYPE_INT) {
     result.type = TIMESERIES_FIELD_TYPE_INT;
@@ -156,18 +260,20 @@ finalize_aggregator(timeseries_aggregation_method_e method,
       result.data.int_val = agg->i_max;
       return result;
     case TSDB_AGGREGATION_AVG:
-      // Match double-path rounding: (int64_t)(avg + 0.5), i.e. truncation toward zero
-      result.data.int_val = (2 * agg->i_sum + (int64_t)agg->count) / (2 * (int64_t)agg->count);
+      result.data.int_val = integer_average(agg);
       return result;
     case TSDB_AGGREGATION_COUNT:
       result.data.int_val = (int64_t)agg->count;
       return result;
     case TSDB_AGGREGATION_SUM:
     case TSDB_AGGREGATION_NONE:
-      result.data.int_val = agg->i_sum;
-      return result;
     default:
-      result.data.int_val = agg->i_sum;
+      if (agg->i_sum_carry == 0) {
+        result.data.int_val = agg->i_sum;
+      } else {
+        result.type = TIMESERIES_FIELD_TYPE_FLOAT;
+        result.data.float_val = integer_sum_as_double(agg);
+      }
       return result;
     }
   }
@@ -256,23 +362,24 @@ bool timeseries_multi_series_iterator_init(
 
   // Otherwise, find earliest start time
   uint64_t earliest_ts = UINT64_MAX;
+  bool found = false;
   for (size_t i = 0; i < sub_count; i++) {
     uint64_t ts;
     timeseries_field_value_t dummy;
     if (timeseries_multi_points_iterator_peek(sub_iters[i], &ts, &dummy)) {
-      if (ts < earliest_ts) {
-        earliest_ts = ts;
-      }
+      if (!found || ts < earliest_ts) earliest_ts = ts;
+      found = true;
     }
   }
-  if (earliest_ts == UINT64_MAX) {
+  if (!found) {
     // means all iterators are empty
     out_iter->valid = false;
     return true; // no data
   }
 
   out_iter->current_window_start = earliest_ts;
-  out_iter->current_window_end = earliest_ts + rollup_interval;
+  out_iter->current_window_end = rollup_interval > UINT64_MAX - earliest_ts
+      ? UINT64_MAX : earliest_ts + rollup_interval;
   return true;
 }
 
@@ -316,22 +423,22 @@ bool timeseries_multi_series_iterator_next(
 
     // Multi-series pass-through: find earliest across all sub-iterators
     uint64_t earliest_ts = UINT64_MAX;
-    int earliest_idx = -1;
+    size_t earliest_idx = SIZE_MAX;
 
     for (size_t s = 0; s < iter->sub_count; s++) {
       uint64_t ts_cur;
       timeseries_field_value_t dummy;
       if (timeseries_multi_points_iterator_peek(iter->sub_iters[s], &ts_cur,
                                                 &dummy)) {
-        if (ts_cur < earliest_ts) {
+        if (earliest_idx == SIZE_MAX || ts_cur < earliest_ts) {
           earliest_ts = ts_cur;
-          earliest_idx = (int)s;
+          earliest_idx = s;
         }
       }
     }
 
     // If none has data => done
-    if (earliest_idx < 0 || earliest_ts == UINT64_MAX) {
+    if (earliest_idx == SIZE_MAX) {
       iter->valid = false;
       return false;
     }
@@ -369,10 +476,11 @@ bool timeseries_multi_series_iterator_next(
    *-----------------------------------------------------------------------------*/
   while (true) {
     uint64_t window_start = iter->current_window_start;
-    uint64_t window_end = iter->current_window_end;
 
     aggregator_state_t agg;
     aggregator_init(&agg);
+    bool has_more_data = false;
+    uint64_t next_ts = UINT64_MAX;
 
     // Gather points from each sub-iterator in [window_start, window_end)
     for (size_t s = 0; s < iter->sub_count; s++) {
@@ -394,7 +502,10 @@ bool timeseries_multi_series_iterator_next(
           }
           continue;
         }
-        if (ts_cur >= window_end) {
+        // Subtraction also handles the final window extending beyond UINT64_MAX.
+        if (ts_cur - window_start >= iter->rollup_interval) {
+          if (!has_more_data || ts_cur < next_ts) next_ts = ts_cur;
+          has_more_data = true;
           break;
         }
 
@@ -403,24 +514,22 @@ bool timeseries_multi_series_iterator_next(
         (void)timeseries_multi_points_iterator_next(iter->sub_iters[s], &ts_cur,
                                                     &val_cur);
 
-        update_aggregator(&val_cur, &agg);
+        update_aggregator(&val_cur, ts_cur, iter->aggregator, &agg);
       }
     }
 
-    // Advance the window for the next call
-    iter->current_window_start += iter->rollup_interval;
-    iter->current_window_end += iter->rollup_interval;
-
-    // Check if there's more data beyond this window
-    bool has_more_data = false;
-    for (size_t s = 0; s < iter->sub_count; s++) {
-      uint64_t ts_cur;
-      timeseries_field_value_t dummy;
-      if (timeseries_multi_points_iterator_peek(iter->sub_iters[s], &ts_cur,
-                                                &dummy)) {
-        has_more_data = true;
-        break;
-      }
+    // Find the next occupied window directly, preserving the original grid.
+    // Work depends on series/point counts, not the number of empty intervals.
+    if (has_more_data) {
+      uint64_t delta = next_ts - window_start;
+      // Adjacent occupied windows are common; avoid a 64-bit division there.
+      uint64_t advance = delta - iter->rollup_interval < iter->rollup_interval
+          ? iter->rollup_interval
+          : (delta / iter->rollup_interval) * iter->rollup_interval;
+      uint64_t next_start = window_start + advance;
+      iter->current_window_start = next_start;
+      iter->current_window_end = iter->rollup_interval > UINT64_MAX - next_start
+          ? UINT64_MAX : next_start + iter->rollup_interval;
     }
 
     // If this window had no samples, skip it

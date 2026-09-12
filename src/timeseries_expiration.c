@@ -43,9 +43,8 @@ typedef struct {
  * @brief Simple list to store unique page offsets that we modified.
  */
 typedef struct {
-  uint32_t *pages;
+  uint32_t pages[25];
   size_t used;
-  size_t capacity;
 } tsdb_modified_pages_list_t;
 
 // -----------------------------------------------------------------------------
@@ -56,17 +55,15 @@ static bool get_usage_ratio(timeseries_db_t *db, float *out_ratio);
 static bool gather_25_oldest_fielddata(timeseries_db_t *db,
                                        tsdb_oldest_fd_entry_t *heap_25,
                                        size_t *out_count);
-static void mark_entries_deleted(timeseries_db_t *db,
+static bool mark_entries_deleted(timeseries_db_t *db,
                                  const tsdb_oldest_fd_entry_t *entries,
                                  size_t count, uint32_t bytes_to_free,
                                  tsdb_modified_pages_list_t *modified_out);
 static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs,
                                 const tsdb_oldest_fd_entry_t *expected);
 
-static void modified_pages_list_init(tsdb_modified_pages_list_t *list);
 static void modified_pages_list_add(tsdb_modified_pages_list_t *list,
                                     uint32_t page_offset);
-static void modified_pages_list_free(tsdb_modified_pages_list_t *list);
 
 // -----------------------------------------------------------------------------
 // Static Comparator Function
@@ -100,107 +97,45 @@ static int compare_fd_entries(const void *a, const void *b) {
  * @return true if the expiration step succeeded or was not needed, false
  * otherwise.
  */
+static bool expire_oldest(timeseries_db_t *db, uint32_t bytes_to_free) {
+  tsdb_oldest_fd_entry_t *top25 = calloc(25, sizeof(*top25));
+  if (!top25) return false;
+  size_t count = 0;
+  bool ok = gather_25_oldest_fielddata(db, top25, &count);
+  tsdb_modified_pages_list_t modified = {0};
+  if (ok && count) {
+    // Sort the candidate heap in place, before taking the insert lock.
+    qsort(top25, count, sizeof(*top25), compare_fd_entries);
+    if (db->flash_write_mutex) xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+    ok = mark_entries_deleted(db, top25, count, bytes_to_free, &modified);
+    if (db->flash_write_mutex) xSemaphoreGive(db->flash_write_mutex);
+    // Even a partially failed mark pass should reclaim successfully deleted records.
+    if (modified.used && !timeseries_compact_page_list(db, modified.pages, modified.used)) ok = false;
+  }
+  free(top25);
+  return ok;
+}
+
 bool timeseries_expiration_run(timeseries_db_t *db, float usage_threshold,
                                float reduction_threshold) {
-  // Validate arguments
-  if (!db || usage_threshold <= 0.0f || usage_threshold >= 1.0f ||
-      reduction_threshold <= 0.0f || reduction_threshold >= 1.0f) {
-    ESP_LOGE(TAG, "Invalid arguments to expiration_run");
-    return false;
-  }
-
-  // 1) Check if usage is above threshold
+  // Positive comparisons also reject NaN, before the float-to-integer conversion.
+  if (!db || !db->partition || !db->partition->size ||
+      !(usage_threshold > 0.0f && usage_threshold < 1.0f) ||
+      !(reduction_threshold > 0.0f && reduction_threshold < 1.0f)) return false;
   float used_ratio;
-  if (!get_usage_ratio(db, &used_ratio)) {
-    ESP_LOGE(TAG, "Failed to get usage ratio");
-    return false;
-  }
-  ESP_LOGI(TAG, "Current usage=%.2f%%, threshold=%.2f%%", used_ratio * 100.0f,
-           usage_threshold * 100.0f);
+  if (!get_usage_ratio(db, &used_ratio)) return false;
+  if (used_ratio < usage_threshold) return true;
 
-  if (used_ratio < usage_threshold) {
-    // Nothing to do
-    ESP_LOGI(TAG, "Usage < threshold => no expiration needed");
-    return true;
-  }
-
-  // 2) Calculate how many bytes we want to free in this expiration pass
-  //    e.g. if partition is 1 MB and reduction_threshold is 0.05,
-  //    we aim to free 0.05 * 1MB = 50 KB.
-  uint32_t partition_size = db->partition->size;
-  uint32_t bytes_to_free =
-      (uint32_t)((float)partition_size * reduction_threshold);
-  if (bytes_to_free == 0) {
-    // If rounding caused it to be 0, just exit early or pick a minimum
-    bytes_to_free = 1;
-  }
-  ESP_LOGI(TAG,
-           "Target: freeing at least %u bytes (reduction_threshold=%.2f%%).",
-           (unsigned int)bytes_to_free, reduction_threshold * 100.0f);
-
-  // 3) Gather the 25 oldest (non-deleted) field-data entries by `start_time`.
-  //    This only reads flash and iterates over a ref-counted page cache
-  //    snapshot, so no mutex is needed — inserts are not blocked.
-  tsdb_oldest_fd_entry_t *top25 = calloc(25, sizeof(tsdb_oldest_fd_entry_t));
-  if (!top25) {
-    ESP_LOGE(TAG, "OOM allocating expiration candidates");
-    return false;
-  }
-  size_t found_count = 0;
-
-  if (!gather_25_oldest_fielddata(db, top25, &found_count)) {
-    ESP_LOGE(TAG, "Failed scanning DB to find oldest field-data entries.");
-    free(top25);
-    return false;
-  }
-  if (found_count == 0) {
-    ESP_LOGI(TAG, "No active field-data records => nothing to expire.");
-    free(top25);
-    return true;
-  }
-
-  ESP_LOGI(TAG, "Found %zu oldest field-data record(s).", found_count);
-
-  // 4) Mark them as deleted, oldest-first, until we've freed enough space.
-  //    Acquire flash_write_mutex only for the mark phase (flash writes).
-  tsdb_modified_pages_list_t modified;
-  modified_pages_list_init(&modified);
-
-  if (db->flash_write_mutex) {
-    xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
-  }
-  mark_entries_deleted(db, top25, found_count, bytes_to_free, &modified);
-  if (db->flash_write_mutex) {
-    xSemaphoreGive(db->flash_write_mutex);
-  }
-
-  // 5) If any pages got modified, run a page-list compaction.
-  //    Use CAS to atomically claim the compaction slot, preventing races
-  //    with background compaction starting between the check and the call.
-  if (modified.used > 0) {
-    bool expected = false;
-    if (!atomic_compare_exchange_strong(&db->compaction_in_progress, &expected, true)) {
-      ESP_LOGW(TAG, "Compaction already in progress, skipping compact_page_list for %zu modified pages",
-               modified.used);
-    } else {
-      ESP_LOGI(TAG, "Compacting %zu modified pages...", modified.used);
-      bool compact_ok = timeseries_compact_page_list(db, modified.pages, modified.used);
-      atomic_store(&db->compaction_in_progress, false);
-      if (!compact_ok) {
-        ESP_LOGE(TAG, "timeseries_compact_page_list failed");
-        modified_pages_list_free(&modified);
-        free(top25);
-        return false;
-      }
-      ESP_LOGI(TAG, "Compaction of modified pages complete.");
-    }
-  } else {
-    ESP_LOGI(TAG, "No pages were modified => no compaction needed.");
-  }
-
-  modified_pages_list_free(&modified);
-  free(top25);
-  return true;
+  // Own the slot throughout discovery, deletion and rewriting. A streaming
+  // compactor may already have decoded a source record; deleting that source
+  // while it runs would let its output resurrect the expired data.
+  bool expected = false;
+  if (!atomic_compare_exchange_strong(&db->compaction_in_progress, &expected, true)) return false;
+  uint32_t bytes_to_free = (uint32_t)((float)db->partition->size * reduction_threshold);
+  if (!bytes_to_free) bytes_to_free = 1;
+  bool ok = expire_oldest(db, bytes_to_free);
+  atomic_store(&db->compaction_in_progress, false);
+  return ok;
 }
 
 // -----------------------------------------------------------------------------
@@ -337,6 +272,8 @@ static bool gather_25_oldest_fielddata(timeseries_db_t *db,
     return false;
   }
 
+  uint8_t *window = NULL;
+  bool ok = true;
   timeseries_page_header_t hdr;
   uint32_t page_offset = 0, page_size = 0;
 
@@ -348,10 +285,13 @@ static bool gather_25_oldest_fielddata(timeseries_db_t *db,
     if (hdr.magic_number == TIMESERIES_MAGIC_NUM &&
         hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
         hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE) {
+      if (!window) {
+        window = malloc(4096);
+        if (!window) { ok = false; break; }
+      }
       timeseries_fielddata_iterator_t f_iter;
-      if (!timeseries_fielddata_iterator_init(db, page_offset, page_size,
-                                              &f_iter)) {
-        continue; // skip
+      if (!timeseries_fielddata_iterator_init_window(db, page_offset, page_size, window, 4096, &f_iter)) {
+        ok = false; break;
       }
 
       timeseries_field_data_header_t fd_hdr;
@@ -372,48 +312,35 @@ static bool gather_25_oldest_fielddata(timeseries_db_t *db,
         // Insert into the max-heap
         heap_insert_max25(heap_25, out_count, &candidate);
       }
+      ok = !f_iter.read_error;
       timeseries_fielddata_iterator_deinit(&f_iter);
+      if (!ok) break;
     }
   }
   timeseries_page_cache_iterator_deinit(&page_iter);
 
-  return true;
+  free(window);
+  return ok;
 }
 
 /**
  * @brief Mark each entry as deleted (in ascending start_time order), stopping
  *        once we've freed at least @p bytes_to_free or run out of entries.
  *
- * Since the array is currently in max-heap form (largest at the root), we
- * must sort it by ascending start_time, then iterate from the truly oldest
- * to the newest in that top-25.
+ * The caller sorts the candidate heap before acquiring the flash-write lock.
  *
  * @param db              DB handle
- * @param entries         Up to 25 entries (in max-heap order)
+ * @param entries         Up to 25 entries in ascending start_time order
  * @param count           Number of entries in `entries`
  * @param bytes_to_free   Target number of bytes to remove from use
  * @param modified_out    Collects the set of pages we changed
  */
-static void mark_entries_deleted(timeseries_db_t *db,
+static bool mark_entries_deleted(timeseries_db_t *db,
                                  const tsdb_oldest_fd_entry_t *entries,
                                  size_t count, uint32_t bytes_to_free,
                                  tsdb_modified_pages_list_t *modified_out) {
-  if (count == 0) {
-    return;
-  }
-
-  // 1) Copy to a small array we can sort by ascending start_time
-  tsdb_oldest_fd_entry_t *sorted = calloc(count, sizeof(*sorted));
-  if (!sorted) {
-    ESP_LOGE(TAG, "OOM copying top-25 entries");
-    return; // fallback => do nothing
-  }
-  memcpy(sorted, entries, count * sizeof(*sorted));
-
-  // 2) Sort ascending by start_time
-  qsort(sorted, count, sizeof(tsdb_oldest_fd_entry_t), compare_fd_entries);
-
-  // 3) Go oldest to newest, marking each as deleted, until we've freed enough
+  bool ok = true;
+  // Go oldest to newest, marking each as deleted, until we've freed enough.
   uint32_t sum_freed = 0;
   for (size_t i = 0; i < count; i++) {
     if (sum_freed >= bytes_to_free) {
@@ -421,16 +348,17 @@ static void mark_entries_deleted(timeseries_db_t *db,
                (unsigned int)sum_freed, (unsigned int)bytes_to_free);
       break;
     }
-    uint32_t record_hdr_abs = sorted[i].page_offset + sorted[i].record_offset;
-    if (!mark_record_deleted(db, record_hdr_abs, &sorted[i])) {
+    uint32_t record_hdr_abs = entries[i].page_offset + entries[i].record_offset;
+    if (!mark_record_deleted(db, record_hdr_abs, &entries[i])) {
       ESP_LOGW(TAG, "Failed marking record as deleted @0x%08" PRIx32,
                record_hdr_abs);
+      ok = false;
       continue;
     }
 
     // If success, add to sum (include header size) and track that page
-    sum_freed += sizeof(timeseries_field_data_header_t) + sorted[i].record_length;
-    modified_pages_list_add(modified_out, sorted[i].page_offset);
+    sum_freed += sizeof(timeseries_field_data_header_t) + entries[i].record_length;
+    modified_pages_list_add(modified_out, entries[i].page_offset);
   }
 
   if (sum_freed < bytes_to_free) {
@@ -440,7 +368,7 @@ static void mark_entries_deleted(timeseries_db_t *db,
              (unsigned int)sum_freed, (unsigned int)bytes_to_free);
   }
 
-  free(sorted);
+  return ok;
 }
 
 /**
@@ -464,11 +392,12 @@ static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs,
   }
 
   // TOCTOU validation: verify the record still matches what was gathered
-  // (the gather phase ran without flash_write_mutex, so the record could
-  // have been modified by a concurrent insert or compaction).
+  // The gather phase permits inserts; compaction and recycling are excluded
+  // by the maintenance slot owned by the caller.
   if (expected) {
     if (memcmp(fd_hdr.series_id, expected->series_id, 16) != 0 ||
-        fd_hdr.start_time != expected->start_time) {
+        fd_hdr.start_time != expected->start_time ||
+        fd_hdr.record_length != expected->record_length) {
       ESP_LOGW(TAG,
                "TOCTOU: record @0x%08" PRIx32
                " changed since gather phase (series_id or start_time mismatch), skipping",
@@ -505,43 +434,8 @@ static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs,
 // Modified Pages List
 // -----------------------------------------------------------------------------
 
-static void modified_pages_list_init(tsdb_modified_pages_list_t *list) {
-  list->pages = NULL;
-  list->used = 0;
-  list->capacity = 0;
-}
-
-static void modified_pages_list_free(tsdb_modified_pages_list_t *list) {
-  if (!list) {
-    return;
-  }
-  free(list->pages);
-  list->pages = NULL;
-  list->used = 0;
-  list->capacity = 0;
-}
-
-/**
- * @brief Ensure uniqueness of page_offset in the list, then append if not
- *        found.
- */
-static void modified_pages_list_add(tsdb_modified_pages_list_t *list,
-                                    uint32_t page_offset) {
-  for (size_t i = 0; i < list->used; i++) {
-    if (list->pages[i] == page_offset) {
-      return;
-    }
-  }
-  if (list->used == list->capacity) {
-    size_t newcap = (list->capacity == 0) ? 8 : list->capacity * 2;
-    uint32_t *grow =
-        (uint32_t *)realloc(list->pages, newcap * sizeof(uint32_t));
-    if (!grow) {
-      ESP_LOGE(TAG, "OOM growing modified_pages_list");
-      return;
-    }
-    list->pages = grow;
-    list->capacity = newcap;
-  }
+/* At most 25 candidates can modify at most 25 distinct pages. */
+static void modified_pages_list_add(tsdb_modified_pages_list_t *list, uint32_t page_offset) {
+  for (size_t i = 0; i < list->used; i++) if (list->pages[i] == page_offset) return;
   list->pages[list->used++] = page_offset;
 }

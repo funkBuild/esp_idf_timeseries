@@ -5,6 +5,7 @@
 #include "gorilla/gorilla_stream_decoder.h"
 #include "alp/alp_stream_decoder.h"
 #include "timeseries_data.h"
+#include "timeseries_revision.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -28,6 +29,7 @@ typedef struct {
   timeseries_field_type_e series_type;
   bool is_compressed;
   bool is_column_format;
+  bool has_revision;
 
   // Gorilla decoder streams
   gorilla_decoder_stream_t ts_decoder;
@@ -41,6 +43,8 @@ typedef struct {
 
   // Index/counter
   uint16_t current_idx;
+  uint16_t revision_first; // raw range trimming rebases timestamp/value arrays
+  tsdb_revision_t revisions;
 
   // Uncompressed arrays
   uint64_t *ts_array;
@@ -86,6 +90,23 @@ bool timeseries_points_iterator_init(
     uint16_t record_count, timeseries_field_type_e series_type,
     uint8_t data_flags,       // raw fd_hdr.flags byte (replaces bool compressed)
     timeseries_points_iterator_t *iter);
+
+/** Initialize with an inclusive time range (zero means unbounded).
+ * Raw fixed-width values outside the range are not read or allocated.
+ * Compressed and string records retain their existing decoding path.
+ */
+bool timeseries_points_iterator_init_range(
+    timeseries_db_t *db, uint32_t record_data_offset, uint32_t record_length,
+    uint16_t record_count, timeseries_field_type_e series_type,
+    uint8_t data_flags, timeseries_points_iterator_t *iter,
+    uint64_t start_ms, uint64_t end_ms);
+
+/* Internal query path: cached_revision is a scalar trailer already read under
+ * the query's storage guard. Column/trailer lengths are still validated. */
+bool timeseries_points_iterator_init_range_with_revision(
+    timeseries_db_t *db, uint32_t offset, uint32_t length, uint16_t count,
+    timeseries_field_type_e type, uint8_t flags, timeseries_points_iterator_t *iter,
+    uint64_t start_ms, uint64_t end_ms, const uint64_t *cached_revision);
 
 /**
  * @brief Get the next timestamp from the iterator.

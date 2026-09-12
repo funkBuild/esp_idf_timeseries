@@ -759,12 +759,16 @@ bool timeseries_clear_all(void) {
   }
 
   // Add back the metadata page
-  timeseries_metadata_create_page(&s_tsdb);
+  bool metadata_ok = timeseries_metadata_create_page(&s_tsdb);
 
   if (s_tsdb.flash_write_mutex) {
     xSemaphoreGive(s_tsdb.flash_write_mutex);
   }
 
+  if (!metadata_ok) {
+    ESP_LOGE(TAG, "Partition cleared but metadata page recreation failed");
+    return false;
+  }
   return true;
 }
 

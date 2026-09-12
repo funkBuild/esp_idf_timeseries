@@ -7,6 +7,7 @@
 #include "timeseries_iterator.h"
 #include "timeseries_page_cache.h"
 #include "timeseries_page_cache_snapshot.h"
+#include "timeseries_flash_utils.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -18,12 +19,33 @@
 
 static const char *TAG = "TimeseriesData";
 
+// Remove an entry that was just added as a reservation without recording a
+// batch tombstone. A tombstone would incorrectly delete a later live page at
+// the same offset when the batch commits.
+static void snapshot_unreserve(tsdb_page_cache_snapshot_t *snap, uint32_t offset) {
+    if (!snap) return;
+    for (size_t i = 0; i < snap->count; i++) {
+        if (snap->entries[i].offset == offset) {
+            if (i + 1 < snap->count) {
+                memmove(&snap->entries[i], &snap->entries[i + 1],
+                        (snap->count - i - 1) * sizeof(snap->entries[0]));
+            }
+            snap->count--;
+            return;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Centralized blank-region allocation (serialized by region_alloc_mutex)
 // ---------------------------------------------------------------------------
 bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
                                 tsdb_page_cache_snapshot_t *batch_snapshot,
                                 uint32_t *out_offset, uint32_t *out_size) {
+    if (!db || !out_offset || !out_size || min_size == 0 ||
+        min_size > UINT32_MAX - 4095U) {
+        return false;
+    }
     xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
 
     // Find blank region using appropriate snapshot
@@ -42,19 +64,22 @@ bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
     }
     timeseries_blank_iterator_deinit(&blank_iter);
 
-    // Only reserve the requested size, not the full gap (round up to 4K for erase alignment)
-    uint32_t reserve_size = ((min_size + 4095) / 4096) * 4096;
-    if (reserve_size > region_size) {
-        reserve_size = region_size;
-    }
-
-    // Erase only the reserved portion
-    if (esp_partition_erase_range(db->partition, region_ofs, reserve_size) != ESP_OK) {
+    // Only reserve the requested size, not the full gap (round up to 4K for
+    // erase alignment). The blank iterator promises a run at least min_size
+    // bytes long; never silently weaken that contract because callers size
+    // their write bounds from the requested allocation.
+    uint32_t reserve_size = ((min_size + 4095U) / 4096U) * 4096U;
+    if (region_size < reserve_size) {
+        ESP_LOGE(TAG,
+                 "Blank iterator returned undersized region: requested=%" PRIu32
+                 " available=%" PRIu32 " @0x%08" PRIx32,
+                 reserve_size, region_size, region_ofs);
         xSemaphoreGive(db->region_alloc_mutex);
         return false;
     }
 
-    // Register in both snapshots so neither path can double-allocate
+    // Register the reservation before erasing. If allocation of a cache entry
+    // fails, flash is untouched and the region remains available.
     // Create a placeholder header for registration
     timeseries_page_header_t placeholder_hdr;
     memset(&placeholder_hdr, 0xFF, sizeof(placeholder_hdr));
@@ -68,49 +93,80 @@ bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
     // clobber the real header, hiding the finalized page from readers.
     placeholder_hdr.sequence_num = 0;
 
-    // Register in live snapshot (for insert path visibility)
-    if (!batch_snapshot) {
-        // Caller is the insert path - add to live snapshot
-        if (!tsdb_pagecache_add_entry(db, region_ofs, &placeholder_hdr)) {
-            ESP_LOGE(TAG, "OOM registering region in live snapshot");
-            xSemaphoreGive(db->region_alloc_mutex);
-            return false;
-        }
-    }
-
-    // Register in batch snapshot (for compaction path visibility)
+    bool batch_added = false;
+    bool active_added = false;
     if (batch_snapshot) {
         if (!tsdb_pagecache_batch_add(batch_snapshot, region_ofs, &placeholder_hdr)) {
             ESP_LOGE(TAG, "OOM registering region in batch snapshot");
             xSemaphoreGive(db->region_alloc_mutex);
             return false;
         }
-        tsdb_pagecache_batch_sort(batch_snapshot);
+        batch_added = true;
     }
 
-    // Also register in the OTHER active snapshot if it exists
     if (db->active_batch && db->active_batch != batch_snapshot) {
         if (!tsdb_pagecache_batch_add(db->active_batch, region_ofs, &placeholder_hdr)) {
             ESP_LOGE(TAG, "OOM registering region in active_batch");
+            if (batch_added) snapshot_unreserve(batch_snapshot, region_ofs);
             xSemaphoreGive(db->region_alloc_mutex);
             return false;
         }
-        tsdb_pagecache_batch_sort(db->active_batch);
+        active_added = true;
     }
-    if (batch_snapshot) {
-        // Compaction is allocating - also register in live so insert's blank
-        // iterator sees the allocation and won't double-allocate the same region
-        if (!tsdb_pagecache_add_entry(db, region_ofs, &placeholder_hdr)) {
-            ESP_LOGE(TAG, "OOM registering compaction region in live snapshot");
-            xSemaphoreGive(db->region_alloc_mutex);
-            return false;
-        }
+
+    if (!tsdb_pagecache_add_entry(db, region_ofs, &placeholder_hdr)) {
+        ESP_LOGE(TAG, "OOM registering region in live snapshot");
+        if (batch_added) snapshot_unreserve(batch_snapshot, region_ofs);
+        if (active_added) snapshot_unreserve(db->active_batch, region_ofs);
+        xSemaphoreGive(db->region_alloc_mutex);
+        return false;
+    }
+
+    // Only now is it safe to mutate flash: all allocators can see the claim.
+    if (esp_partition_erase_range(db->partition, region_ofs, reserve_size) != ESP_OK) {
+        (void)tsdb_pagecache_remove_entry(db, region_ofs);
+        if (batch_added) snapshot_unreserve(batch_snapshot, region_ofs);
+        if (active_added) snapshot_unreserve(db->active_batch, region_ofs);
+        xSemaphoreGive(db->region_alloc_mutex);
+        return false;
     }
 
     *out_offset = region_ofs;
     *out_size = reserve_size;
     xSemaphoreGive(db->region_alloc_mutex);
     return true;
+}
+
+bool tsdb_finalize_reserved_region(timeseries_db_t *db, uint32_t offset,
+                                   const timeseries_page_header_t *hdr,
+                                   tsdb_page_cache_snapshot_t *batch_snapshot) {
+    if (!db || !hdr) return false;
+    xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
+    bool ok = tsdb_pagecache_add_entry(db, offset, hdr);
+    if (batch_snapshot) ok = tsdb_pagecache_batch_add(batch_snapshot, offset, hdr) && ok;
+    if (db->active_batch && db->active_batch != batch_snapshot) {
+        ok = tsdb_pagecache_batch_add(db->active_batch, offset, hdr) && ok;
+    }
+    xSemaphoreGive(db->region_alloc_mutex);
+    return ok;
+}
+
+void tsdb_release_reserved_region(timeseries_db_t *db, uint32_t offset,
+                                  tsdb_page_cache_snapshot_t *batch_snapshot) {
+    if (!db) return;
+    xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
+    /* A relocation may already have copied an ACTIVE header over the
+     * placeholder. Make the abandoned reservation non-live on flash before
+     * removing it from RAM caches so reboot scanning cannot resurrect it. */
+    (void)tsdb_flash_write_byte(
+        db->partition, offset + offsetof(timeseries_page_header_t, page_state),
+        TIMESERIES_PAGE_STATE_OBSOLETE);
+    (void)tsdb_pagecache_remove_entry(db, offset);
+    snapshot_unreserve(batch_snapshot, offset);
+    if (db->active_batch && db->active_batch != batch_snapshot) {
+        snapshot_unreserve(db->active_batch, offset);
+    }
+    xSemaphoreGive(db->region_alloc_mutex);
 }
 
 // Forward declarations
@@ -541,8 +597,10 @@ static bool create_level0_field_page(timeseries_db_t *db,
     return false;
   }
 
-  if (blank_offset + l0_size > db->partition->size) {
+  if (blank_offset > db->partition->size ||
+      l0_size > db->partition->size - blank_offset) {
     ESP_LOGW(TAG, "Blank region extends beyond partition boundary!");
+    tsdb_release_reserved_region(db, blank_offset, NULL);
     return false;
   }
 
@@ -564,32 +622,15 @@ static bool create_level0_field_page(timeseries_db_t *db,
                             sizeof(new_hdr));
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to write L0 header (err=0x%x)", err);
+    tsdb_release_reserved_region(db, blank_offset, NULL);
     return false;
   }
 
-  // 3) Update the live snapshot cache entry with the real header
-  // (replaces the placeholder registered by tsdb_reserve_blank_region)
-  if (!tsdb_pagecache_add_entry(db, blank_offset, &new_hdr)) {
-    ESP_LOGE(TAG, "OOM updating page cache with L0 header @0x%08" PRIx32, blank_offset);
+  // 3) Atomically replace every reservation placeholder with the real header.
+  if (!tsdb_finalize_reserved_region(db, blank_offset, &new_hdr, NULL)) {
+    ESP_LOGE(TAG, "OOM finalizing L0 reservation @0x%08" PRIx32, blank_offset);
+    tsdb_release_reserved_region(db, blank_offset, NULL);
     return false;
-  }
-
-  // Also update the compaction batch if active, so the real header
-  // survives batch commit (tsdb_reserve_blank_region only wrote a placeholder)
-  if (db->region_alloc_mutex) {
-    xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
-  }
-  if (db->active_batch) {
-    if (!tsdb_pagecache_batch_add(db->active_batch, blank_offset, &new_hdr)) {
-      ESP_LOGE(TAG, "OOM updating active_batch with L0 header");
-      if (db->region_alloc_mutex) {
-        xSemaphoreGive(db->region_alloc_mutex);
-      }
-      return false;
-    }
-  }
-  if (db->region_alloc_mutex) {
-    xSemaphoreGive(db->region_alloc_mutex);
   }
 
   *out_offset = blank_offset;

@@ -180,6 +180,14 @@ bool tsdb_find_all_series_ids_for_measurement(
 bool tsdb_soft_delete_entry(timeseries_db_t *db, uint32_t page_offset,
                             uint32_t current_entry_offset);
 
+bool tsdb_replace_seriesid_list_entry(timeseries_db_t *db,
+                                      uint32_t old_page_offset,
+                                      uint32_t old_entry_offset,
+                                      timeseries_keytype_t key_type,
+                                      const char *key,
+                                      const unsigned char *series_ids,
+                                      size_t series_id_count);
+
 /**
  * @brief Remove all metadata entries (MEASUREMENT, TAGINDEX, FIELDLISTINDEX)
  *        belonging to the named measurement.

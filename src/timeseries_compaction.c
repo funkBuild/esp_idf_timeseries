@@ -439,20 +439,24 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
     return true;
   }
 
-  // Begin a batch snapshot for all cache mutations during compaction
+  // Clone the live cache and publish the clone as active_batch while holding
+  // the allocation mutex. Otherwise an insert can allocate a new L0 page in
+  // the gap between those operations; that page is absent from the batch and
+  // compaction can reserve and erase the same flash region.
+  if (db->region_alloc_mutex) {
+    xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
+  }
   tsdb_page_cache_snapshot_t* batch = tsdb_pagecache_begin_batch(db);
+  if (batch) {
+    db->active_batch = batch;
+  }
+  if (db->region_alloc_mutex) {
+    xSemaphoreGive(db->region_alloc_mutex);
+  }
   if (!batch) {
     ESP_LOGE(TAG, "Failed to begin batch for compaction");
     free(pages);
     return false;
-  }
-  // Set active_batch under region_alloc_mutex to synchronize with insert path
-  if (db->region_alloc_mutex) {
-    xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
-  }
-  db->active_batch = batch;
-  if (db->region_alloc_mutex) {
-    xSemaphoreGive(db->region_alloc_mutex);
   }
 
   // Claim pages so inserts won't write to them during compaction.
@@ -505,8 +509,8 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
       if (db->region_alloc_mutex) { xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY); }
       db->active_batch = NULL;
-      if (db->region_alloc_mutex) { xSemaphoreGive(db->region_alloc_mutex); }
       tsdb_snapshot_release(batch);
+      if (db->region_alloc_mutex) { xSemaphoreGive(db->region_alloc_mutex); }
       free(pages);
       return false;
     }
@@ -515,15 +519,15 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       // No data => just mark pages obsolete
       ESP_LOGV(TAG, "No valid series in L0 => marking pages obsolete.");
       tsdb_mark_old_level_pages_obsolete(db, from_level, pages, page_count, batch);
+      if (db->region_alloc_mutex) { xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY); }
+      db->active_batch = NULL;
+      tsdb_pagecache_batch_sort(batch);
+      tsdb_pagecache_commit_batch(db, batch);
+      if (db->region_alloc_mutex) { xSemaphoreGive(db->region_alloc_mutex); }
       if (db->flash_write_mutex) { xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY); }
       db->compaction_claimed_count = 0;
       db->last_l0_cache_valid = false;
       if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
-      if (db->region_alloc_mutex) { xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY); }
-      db->active_batch = NULL;
-      if (db->region_alloc_mutex) { xSemaphoreGive(db->region_alloc_mutex); }
-      tsdb_pagecache_batch_sort(batch);
-      tsdb_pagecache_commit_batch(db, batch);
       free(pages);
       return true;
     }
@@ -552,8 +556,8 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
       if (db->region_alloc_mutex) { xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY); }
       db->active_batch = NULL;
-      if (db->region_alloc_mutex) { xSemaphoreGive(db->region_alloc_mutex); }
       tsdb_snapshot_release(batch);
+      if (db->region_alloc_mutex) { xSemaphoreGive(db->region_alloc_mutex); }
       free(uniq_ids.list);
       free(pages);
       return false;
@@ -734,8 +738,13 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
             break;
           }
 
-          // finalize timestamps
-          timeseries_page_stream_writer_finalize_timestamp(&sw);
+          // Finalizing can fail after a flash or encoder error. Do not write a
+          // value stream against an incomplete timestamp stream.
+          if (!timeseries_page_stream_writer_finalize_timestamp(&sw)) {
+            ESP_LOGE(TAG, "Failed finalizing timestamps for i=%zu chunk @%zu", i, chunk_start);
+            gorilla_failed = true;
+            break;
+          }
 
           // PASS #2: Write values for this chunk (free strings as written)
           for (size_t j = chunk_start; j < chunk_end && !write_failed; j++) {
@@ -801,8 +810,8 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
       if (db->flash_write_mutex) { xSemaphoreGive(db->flash_write_mutex); }
       if (db->region_alloc_mutex) { xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY); }
       db->active_batch = NULL;
-      if (db->region_alloc_mutex) { xSemaphoreGive(db->region_alloc_mutex); }
       tsdb_snapshot_release(batch);
+      if (db->region_alloc_mutex) { xSemaphoreGive(db->region_alloc_mutex); }
       free(pages);
       return false;
     } else {
@@ -824,25 +833,13 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
     }
   }
 
-  // Clear claimed set and active_batch before commit
-  if (db->flash_write_mutex) {
-    xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
-  }
-  db->compaction_claimed_count = 0;
-  db->last_l0_cache_valid = false;
-  if (db->flash_write_mutex) {
-    xSemaphoreGive(db->flash_write_mutex);
-  }
-
-  // Clear active_batch under region_alloc_mutex before commit
+  // Unpublish and commit/discard atomically with respect to allocation. If
+  // active_batch is cleared before the batch reaches the live cache, an insert
+  // can allocate from the stale live snapshot and overlap a compacted page.
   if (db->region_alloc_mutex) {
     xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
   }
   db->active_batch = NULL;
-  if (db->region_alloc_mutex) {
-    xSemaphoreGive(db->region_alloc_mutex);
-  }
-
   if (success) {
     // Commit the batch to merge with any concurrent inserts
     tsdb_pagecache_batch_sort(batch);
@@ -851,6 +848,21 @@ bool timeseries_compact_level_pages(timeseries_db_t* db, uint8_t from_level, uin
     // Don't commit a failed compaction — discard the batch to avoid
     // making partial/duplicate data visible to queries.
     tsdb_snapshot_release(batch);
+  }
+  if (db->region_alloc_mutex) {
+    xSemaphoreGive(db->region_alloc_mutex);
+  }
+
+  // Keep source pages claimed until the committed snapshot that removes them
+  // is live. Clearing the claim first lets an insert scan the stale live cache
+  // and append to a page that compaction has already marked obsolete.
+  if (db->flash_write_mutex) {
+    xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+  }
+  db->compaction_claimed_count = 0;
+  db->last_l0_cache_valid = false;
+  if (db->flash_write_mutex) {
+    xSemaphoreGive(db->flash_write_mutex);
   }
 
   free(pages);
@@ -1098,6 +1110,112 @@ static void heapsort_descriptors(tsdb_record_descriptor_t* arr, size_t n) {
   }
 }
 
+/* A higher-level page may contain many consecutive ALP records for one
+ * series. Keep only one record iterator live per source page, then merge those
+ * page streams by timestamp. This preserves ordering/deduplication without the
+ * unbounded heap cost of opening every record iterator at once. */
+typedef struct {
+  const tsdb_record_descriptor_t *records;
+  size_t next_record;
+  size_t end_record;
+  uint32_t page_seq;
+
+  timeseries_points_iterator_t iter;
+  bool iter_active;
+  uint16_t points_read;
+  uint16_t record_count;
+
+  bool has_point;
+  uint64_t timestamp;
+  timeseries_field_value_t value;
+  bool has_last_timestamp;
+  uint64_t last_timestamp;
+} tsdb_alp_page_stream_t;
+
+static void alp_page_stream_deinit(tsdb_alp_page_stream_t *stream) {
+  if (stream && stream->iter_active) {
+    timeseries_points_iterator_deinit(&stream->iter);
+    stream->iter_active = false;
+  }
+  if (stream) stream->has_point = false;
+}
+
+/* Consume the current point (if any) and load the next point in this page's
+ * chain of records. Exhaustion is success with has_point=false; malformed or
+ * truncated input is failure. */
+static bool alp_page_stream_advance(timeseries_db_t *db,
+                                    tsdb_alp_page_stream_t *stream) {
+  if (!db || !stream) return false;
+  stream->has_point = false;
+
+  for (;;) {
+    if (stream->iter_active && stream->points_read < stream->record_count) {
+      uint64_t timestamp;
+      timeseries_field_value_t value;
+      if (!timeseries_points_iterator_next_timestamp(&stream->iter, &timestamp) ||
+          !timeseries_points_iterator_next_value(&stream->iter, &value)) {
+        ESP_LOGE(TAG,
+                 "Truncated ALP page stream seq=%" PRIu32 " point=%u/%u",
+                 stream->page_seq, (unsigned)stream->points_read,
+                 (unsigned)stream->record_count);
+        return false;
+      }
+      stream->points_read++;
+      if (stream->has_last_timestamp && timestamp < stream->last_timestamp) {
+        ESP_LOGE(TAG,
+                 "Out-of-order ALP source page seq=%" PRIu32
+                 " (%" PRIu64 " after %" PRIu64 ")",
+                 stream->page_seq, timestamp, stream->last_timestamp);
+        return false;
+      }
+      stream->last_timestamp = timestamp;
+      stream->has_last_timestamp = true;
+      stream->timestamp = timestamp;
+      stream->value = value;
+      stream->has_point = true;
+      return true;
+    }
+
+    if (stream->iter_active) {
+      if (!stream->iter.valid ||
+          stream->iter.current_idx != stream->iter.ts_count) {
+        ESP_LOGE(TAG, "Incomplete ALP source record on page seq=%" PRIu32,
+                 stream->page_seq);
+        return false;
+      }
+      timeseries_points_iterator_deinit(&stream->iter);
+      stream->iter_active = false;
+    }
+
+    if (stream->next_record >= stream->end_record) {
+      return true;
+    }
+
+    const tsdb_record_descriptor_t *record =
+        &stream->records[stream->next_record++];
+    if (record->page_seq != stream->page_seq) {
+      ESP_LOGE(TAG, "ALP page-stream descriptor grouping mismatch");
+      return false;
+    }
+    if (record->record_count == 0) {
+      continue;
+    }
+    if (!timeseries_points_iterator_init(
+            db, record->data_offset, record->record_length,
+            record->record_count, record->field_type, record->data_flags,
+            &stream->iter)) {
+      ESP_LOGE(TAG,
+               "Failed init ALP record iterator seq=%" PRIu32
+               " offset=0x%08" PRIx32,
+               stream->page_seq, record->data_offset);
+      return false;
+    }
+    stream->iter_active = true;
+    stream->points_read = 0;
+    stream->record_count = record->record_count;
+  }
+}
+
 static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_page_t* pages, size_t page_count,
                                         uint8_t to_level, tsdb_page_cache_snapshot_t* batch) {
   if (!db || !pages || page_count == 0) {
@@ -1112,7 +1230,10 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
   tsdb_series_descriptors_t* series_map = NULL;
   size_t series_map_used = 0;
   size_t series_map_cap = 0;
-  size_t total_record_bytes = 0;  // Holds total bytes of all records minus headers
+  // Conservative initial output reservation. Include each field-data header;
+  // omitting them systematically under-sized multi-page compactions and forced
+  // a relocation after the first sector was already populated.
+  size_t total_record_bytes = 0;
 
   for (size_t i = 0; i < page_count; i++) {
     const tsdb_level_page_t* pg = &pages[i];
@@ -1141,7 +1262,12 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
       }
 
       records_read++;
-      total_record_bytes += fd_hdr.record_length;
+      if (total_record_bytes > UINT32_MAX - sizeof(fd_hdr) - fd_hdr.record_length) {
+        ESP_LOGE(TAG, "Compaction input size overflow");
+        timeseries_fielddata_iterator_deinit(&f_iter);
+        goto series_map_cleanup;
+      }
+      total_record_bytes += sizeof(fd_hdr) + fd_hdr.record_length;
 
       // Build descriptor
       tsdb_record_descriptor_t desc;
@@ -1263,15 +1389,11 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
       /* ----------------------------------------------------------------
        * ALP streaming path (FLOAT and INT)
        *
-       * Memory: O(CHUNK_MAX × 16 bytes) — constant regardless of total
-       * points in the series. Sub-iterators are initialised and freed ONE
-       * AT A TIME.  (ts, val) pairs are accumulated into fixed-size arrays;
-       * each full chunk is encoded and written to flash immediately, then
-       * the arrays are reused for the next chunk.
-       *
-       * L1 pages produced by L0→L1 compaction are time-sorted and
-       * non-overlapping per series, so sequential processing in page_seq
-       * order gives a correctly time-ordered output stream without merge.
+       * Memory is bounded by CHUNK_MAX plus one active record iterator per
+       * source page (at most MAX_PAGES_PER_LEVEL). Records from a single page
+       * are chained, then page streams are merged by timestamp. Equal
+       * timestamps are emitted once, with the newest page sequence winning.
+       * This remains correct for backfilled and overlapping L1+ pages.
        * ---------------------------------------------------------------- */
       const size_t chunk_max = TSDB_ALP_CHUNK_MAX_POINTS;
 
@@ -1286,7 +1408,8 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
           (ftype == TIMESERIES_FIELD_TYPE_INT   && !i_arr)) {
         ESP_LOGE(TAG, "OOM allocating ALP streaming buffers s=%zu chunk_max=%zu", s, chunk_max);
         free(ts_arr); free(f_arr); free(i_arr);
-        continue;
+        series_write_failed = true;
+        break;
       }
 
       size_t chunk_used = 0;
@@ -1322,28 +1445,81 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
         } \
       } while (0)
 
-      for (size_t r = 0; r < S->record_used; r++) {
-        const tsdb_record_descriptor_t *RD = &S->records[r];
-        timeseries_points_iterator_t *pit = calloc(1, sizeof(*pit));
-        if (!pit) {
-          ESP_LOGW(TAG, "OOM sub-iter for s=%zu r=%zu", s, r);
-          break;
+      size_t stream_count = 1;
+      for (size_t r = 1; r < S->record_used; r++) {
+        if (S->records[r].page_seq != S->records[r - 1].page_seq) {
+          stream_count++;
         }
-        if (!timeseries_points_iterator_init(db, RD->data_offset, RD->record_length,
-                                             RD->record_count, RD->field_type,
-                                             RD->data_flags, pit)) {
-          ESP_LOGW(TAG, "Failed init sub-iter s=%zu r=%zu offset=0x%08" PRIx32,
-                   s, r, RD->data_offset);
-          free(pit); continue;
+      }
+
+      tsdb_alp_page_stream_t *streams =
+          calloc(stream_count, sizeof(*streams));
+      if (!streams) {
+        ESP_LOGE(TAG, "OOM allocating %zu ALP page streams for s=%zu",
+                 stream_count, s);
+        series_write_failed = true;
+      } else {
+        size_t record_start = 0;
+        for (size_t m = 0; m < stream_count; m++) {
+          size_t record_end = record_start + 1;
+          uint32_t page_seq = S->records[record_start].page_seq;
+          while (record_end < S->record_used &&
+                 S->records[record_end].page_seq == page_seq) {
+            record_end++;
+          }
+          streams[m].records = S->records;
+          streams[m].next_record = record_start;
+          streams[m].end_record = record_end;
+          streams[m].page_seq = page_seq;
+          if (!alp_page_stream_advance(db, &streams[m])) {
+            series_write_failed = true;
+            break;
+          }
+          record_start = record_end;
         }
 
-        uint64_t ts;
-        timeseries_field_value_t fv;
-        while (timeseries_points_iterator_next_timestamp(pit, &ts) &&
-               timeseries_points_iterator_next_value(pit, &fv)) {
-          ts_arr[chunk_used] = (int64_t)ts;
-          if (f_arr) f_arr[chunk_used] = fv.data.float_val;
-          if (i_arr) i_arr[chunk_used] = fv.data.int_val;
+        while (!series_write_failed) {
+          bool any_point = false;
+          uint64_t smallest_timestamp = UINT64_MAX;
+          for (size_t m = 0; m < stream_count; m++) {
+            if (streams[m].has_point &&
+                (!any_point || streams[m].timestamp < smallest_timestamp)) {
+              any_point = true;
+              smallest_timestamp = streams[m].timestamp;
+            }
+          }
+          if (!any_point) break;
+
+          bool have_winner = false;
+          uint32_t winner_seq = 0;
+          timeseries_field_value_t winner_value;
+
+          // Consume every occurrence of this timestamp, including duplicates
+          // at record boundaries within one page. The latest page wins.
+          for (size_t m = 0; m < stream_count && !series_write_failed; m++) {
+            while (streams[m].has_point &&
+                   streams[m].timestamp == smallest_timestamp) {
+              if (!have_winner || streams[m].page_seq >= winner_seq) {
+                winner_seq = streams[m].page_seq;
+                winner_value = streams[m].value;
+                have_winner = true;
+              }
+              if (!alp_page_stream_advance(db, &streams[m])) {
+                series_write_failed = true;
+                break;
+              }
+            }
+          }
+          if (series_write_failed) break;
+          if (!have_winner) {
+            ESP_LOGE(TAG, "ALP merge failed to select a value for s=%zu", s);
+            series_write_failed = true;
+            break;
+          }
+
+          ts_arr[chunk_used] = (int64_t)smallest_timestamp;
+          if (f_arr) f_arr[chunk_used] = winner_value.data.float_val;
+          if (i_arr) i_arr[chunk_used] = winner_value.data.int_val;
           chunk_used++;
 
           if (chunk_used == chunk_max) {
@@ -1351,15 +1527,18 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
           }
         }
 
-        timeseries_points_iterator_deinit(pit);
-        free(pit);
+        for (size_t m = 0; m < stream_count; m++) {
+          alp_page_stream_deinit(&streams[m]);
+        }
+        free(streams);
       }
 
       /* Flush any remaining partial chunk. */
-      FLUSH_ALP_CHUNK();
+      if (!series_write_failed) FLUSH_ALP_CHUNK();
 #undef FLUSH_ALP_CHUNK
 
       free(ts_arr); free(f_arr); free(i_arr);
+      if (series_write_failed) break;
 
     } else {
       /* ----------------------------------------------------------------
@@ -1380,21 +1559,36 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
         break;
       }
 
+      bool sub_init_failed = false;
       for (size_t r = 0; r < S->record_used; r++) {
         const tsdb_record_descriptor_t* RD = &S->records[r];
         sub_iters[r] = calloc(1, sizeof(timeseries_points_iterator_t));
         if (!sub_iters[r]) {
           ESP_LOGW(TAG, "OOM creating sub-iter for series s=%zu, record r=%zu", s, r);
-          continue;
+          sub_init_failed = true;
+          break;
         }
         if (!timeseries_points_iterator_init(db, RD->data_offset, RD->record_length, RD->record_count, RD->field_type,
                                              RD->data_flags, sub_iters[r])) {
           ESP_LOGW(TAG, "Failed init sub-iter offset=0x%08" PRIx32, RD->data_offset);
           free(sub_iters[r]);
           sub_iters[r] = NULL;
-          continue;
+          sub_init_failed = true;
+          break;
         }
         seqs[r] = RD->page_seq;
+      }
+
+      if (sub_init_failed) {
+        for (size_t r = 0; r < S->record_used; r++) {
+          if (sub_iters[r]) {
+            timeseries_points_iterator_deinit(sub_iters[r]);
+            free(sub_iters[r]);
+          }
+        }
+        free(sub_iters); free(seqs);
+        series_write_failed = true;
+        break;
       }
 
       timeseries_multi_points_iterator_t multi_iter;
@@ -1437,6 +1631,14 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
         }
       }
 
+      for (size_t r = 0; r < S->record_used && ts_write_ok; r++) {
+        if (!sub_iters[r]->valid ||
+            sub_iters[r]->current_idx != sub_iters[r]->ts_count) {
+          ESP_LOGE(TAG, "Incomplete source record for s=%zu r=%zu (pass 1)", s, r);
+          ts_write_ok = false;
+        }
+      }
+
       if (!ts_write_ok) {
         timeseries_multi_points_iterator_deinit(&multi_iter);
         for (size_t r = 0; r < S->record_used; r++) {
@@ -1447,27 +1649,55 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
         break;
       }
 
-      timeseries_page_stream_writer_finalize_timestamp(&writer);
+      if (!timeseries_page_stream_writer_finalize_timestamp(&writer)) {
+        ESP_LOGE(TAG, "Failed finalizing timestamps for s=%zu", s);
+        timeseries_multi_points_iterator_deinit(&multi_iter);
+        for (size_t r = 0; r < S->record_used; r++) {
+          if (sub_iters[r]) { timeseries_points_iterator_deinit(sub_iters[r]); free(sub_iters[r]); }
+        }
+        free(sub_iters); free(seqs);
+        series_write_failed = true;
+        break;
+      }
       timeseries_multi_points_iterator_deinit(&multi_iter);
 
       // Re-init sub-iterators for pass #2
       for (size_t r = 0; r < S->record_used; r++) {
-        if (sub_iters[r]) { timeseries_points_iterator_deinit(sub_iters[r]); free(sub_iters[r]); }
+        if (sub_iters[r]) {
+          timeseries_points_iterator_deinit(sub_iters[r]);
+          free(sub_iters[r]);
+          sub_iters[r] = NULL;
+        }
       }
+      sub_init_failed = false;
       for (size_t r = 0; r < S->record_used; r++) {
         const tsdb_record_descriptor_t* RD = &S->records[r];
         sub_iters[r] = calloc(1, sizeof(timeseries_points_iterator_t));
         if (!sub_iters[r]) {
           ESP_LOGW(TAG, "OOM re-creating sub-iter for series s=%zu, record r=%zu", s, r);
-          continue;
+          sub_init_failed = true;
+          break;
         }
         if (!timeseries_points_iterator_init(db, RD->data_offset, RD->record_length, RD->record_count, RD->field_type,
                                              RD->data_flags, sub_iters[r])) {
           ESP_LOGW(TAG, "Failed re-init sub-iter offset=0x%08" PRIx32, RD->data_offset);
           free(sub_iters[r]);
           sub_iters[r] = NULL;
-          continue;
+          sub_init_failed = true;
+          break;
         }
+      }
+
+      if (sub_init_failed) {
+        for (size_t r = 0; r < S->record_used; r++) {
+          if (sub_iters[r]) {
+            timeseries_points_iterator_deinit(sub_iters[r]);
+            free(sub_iters[r]);
+          }
+        }
+        free(sub_iters); free(seqs);
+        series_write_failed = true;
+        break;
       }
 
       if (!timeseries_multi_points_iterator_init(sub_iters, seqs, S->record_used, &multi_iter)) {
@@ -1476,8 +1706,8 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
           if (sub_iters[r]) { timeseries_points_iterator_deinit(sub_iters[r]); free(sub_iters[r]); }
         }
         free(sub_iters); free(seqs);
-        timeseries_page_stream_writer_end_series(&writer);
-        continue;
+        series_write_failed = true;
+        break;
       }
 
       // --- PASS #2: Write values only ---
@@ -1495,6 +1725,14 @@ static bool tsdb_compact_multi_iterator(timeseries_db_t* db, const tsdb_level_pa
             fv.data.string_val.str = NULL;
           }
           if (!val_write_ok) break;
+        }
+      }
+
+      for (size_t r = 0; r < S->record_used && val_write_ok; r++) {
+        if (!sub_iters[r]->valid ||
+            sub_iters[r]->current_idx != sub_iters[r]->ts_count) {
+          ESP_LOGE(TAG, "Incomplete source record for s=%zu r=%zu (pass 2)", s, r);
+          val_write_ok = false;
         }
       }
       timeseries_multi_points_iterator_deinit(&multi_iter);

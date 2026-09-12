@@ -188,22 +188,6 @@ void timeseries_page_rewriter_abort(timeseries_page_rewriter_t *rewriter) {
            (unsigned int)rewriter->base_offset);
   rewriter->finalized = true;
 
-  // Mark the placeholder page as obsolete on flash to prevent it from
-  // appearing as a valid page (with page_size=0xFFFFFFFF) after reboot.
-  // Clearing page_state bits is a valid NOR flash write (only clears bits).
-  timeseries_page_header_t hdr;
-  if (esp_partition_read(rewriter->db->partition, rewriter->base_offset,
-                         &hdr, sizeof(hdr)) == ESP_OK) {
-    hdr.page_state = TIMESERIES_PAGE_STATE_OBSOLETE;
-    esp_partition_write(rewriter->db->partition, rewriter->base_offset,
-                        &hdr, sizeof(hdr));
-  }
-
-  // Remove the placeholder from the page cache
-  if (rewriter->batch_snapshot) {
-    tsdb_pagecache_batch_remove(rewriter->batch_snapshot,
-                                rewriter->base_offset);
-  } else {
-    tsdb_pagecache_remove_entry(rewriter->db, rewriter->base_offset);
-  }
+  tsdb_release_reserved_region(rewriter->db, rewriter->base_offset,
+                               rewriter->batch_snapshot);
 }

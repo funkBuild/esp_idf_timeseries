@@ -17,6 +17,7 @@ typedef struct {
   uint64_t start_time;
   uint64_t end_time;
   uint32_t record_offset;  // absolute offset for this record
+  uint32_t page_seq;
   uint16_t record_count;
   uint16_t record_length;
   uint8_t data_flags;  // raw fd_hdr.flags byte

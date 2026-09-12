@@ -184,6 +184,27 @@ static void count_l1_encoding_flags(int *out_alp_count, int *out_gorilla_count) 
     }
 }
 
+static size_t count_active_level_pages(uint8_t level) {
+    timeseries_db_t *db = timeseries_get_db_handle();
+    if (!db) return 0;
+
+    timeseries_page_cache_iterator_t iter;
+    if (!timeseries_page_cache_iterator_init(db, &iter)) return 0;
+
+    size_t count = 0;
+    timeseries_page_header_t hdr;
+    uint32_t offset, size;
+    while (timeseries_page_cache_iterator_next(&iter, &hdr, &offset, &size)) {
+        if (hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
+            hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE &&
+            hdr.field_data_level == level) {
+            count++;
+        }
+    }
+    timeseries_page_cache_iterator_deinit(&iter);
+    return count;
+}
+
 /**
  * @brief Insert multiple field types for comprehensive testing
  */
@@ -500,6 +521,51 @@ TEST_CASE("compaction: duplicate timestamps same series", "[compaction][dedup]")
 
     timeseries_query_free_result(&result);
     ESP_LOGI(TAG, "Duplicate timestamp handling passed");
+}
+
+/**
+ * Test: overlapping ALP pages at L1 are merged in timestamp order and the
+ * newest page wins duplicate timestamps during L1 -> L2 compaction.
+ */
+TEST_CASE("compaction: overlapping ALP pages dedup at higher levels",
+          "[compaction][dedup][alp][level1]") {
+    setup_database();
+
+    const char *measurement = "alp_overlap";
+    const size_t points = 400;  // one nearly-full L0 page per insert
+    const size_t rounds = 4;    // one L1 page per round, then L1 -> L2
+
+    for (size_t round = 0; round < rounds; round++) {
+        double multiplier = (double)(round + 1);
+        // Four same-range L0 pages force one L0 -> L1 compaction. Values are
+        // identical within the round so only cross-L1 newest-wins behavior is
+        // under test.
+        for (size_t page = 0; page < MIN_PAGES_FOR_COMPACTION; page++) {
+            TEST_ASSERT_TRUE(insert_float_points_with_tags(
+                measurement, "value", NULL, NULL, 0, points,
+                1000, 1000, multiplier));
+        }
+        TEST_ASSERT_TRUE_MESSAGE(timeseries_compact_sync(),
+                                 "Compaction failed while building overlapping L1 pages");
+    }
+
+    TEST_ASSERT_GREATER_OR_EQUAL(1, count_active_level_pages(2));
+
+    timeseries_query_result_t result;
+    TEST_ASSERT_TRUE(query_all_points(measurement, &result));
+    TEST_ASSERT_EQUAL(points, result.num_points);
+    TEST_ASSERT_EQUAL(1, result.num_columns);
+
+    for (size_t i = 0; i < result.num_points; i++) {
+        TEST_ASSERT_EQUAL_UINT64(1000 + i * 1000, result.timestamps[i]);
+        double expected = (double)i * (double)rounds;
+        TEST_ASSERT_DOUBLE_WITHIN(1e-9, expected,
+                                  result.columns[0].values[i].data.float_val);
+        if (i > 0) {
+            TEST_ASSERT_TRUE(result.timestamps[i] > result.timestamps[i - 1]);
+        }
+    }
+    timeseries_query_free_result(&result);
 }
 
 /**

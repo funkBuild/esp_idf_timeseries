@@ -32,7 +32,12 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
  * @return true on success, false if no region found or erase failed
  */
 bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
-                                tsdb_page_cache_snapshot_t *batch_snapshot,
-                                uint32_t *out_offset, uint32_t *out_size);
+                               tsdb_page_cache_snapshot_t *batch_snapshot,
+                               uint32_t *out_offset, uint32_t *out_size);
+bool tsdb_finalize_reserved_region(timeseries_db_t *db, uint32_t offset,
+                                   const timeseries_page_header_t *hdr,
+                                   tsdb_page_cache_snapshot_t *batch_snapshot);
+void tsdb_release_reserved_region(timeseries_db_t *db, uint32_t offset,
+                                  tsdb_page_cache_snapshot_t *batch_snapshot);
 
 #endif // TIMESERIES_DATA_H

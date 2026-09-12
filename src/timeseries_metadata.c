@@ -76,17 +76,9 @@ bool timeseries_metadata_create_page(timeseries_db_t* db) {
     return false;
   }
 
-  timeseries_blank_iterator_t blank_iter;
-  if (!timeseries_blank_iterator_init(db, &blank_iter, TIMESERIES_METADATA_PAGE_SIZE)) {
-    ESP_LOGE(TAG, "Failed to init blank iterator");
-    return false;
-  }
-
   uint32_t blank_offset = 0, blank_length = 0;
-  bool found_blank = timeseries_blank_iterator_next(&blank_iter, &blank_offset, &blank_length);
-  timeseries_blank_iterator_deinit(&blank_iter);
-
-  if (!found_blank) {
+  if (!tsdb_reserve_blank_region(db, TIMESERIES_METADATA_PAGE_SIZE, NULL,
+                                 &blank_offset, &blank_length)) {
     ESP_LOGE(TAG, "No blank region found to create metadata page!");
     return false;
   }
@@ -659,7 +651,13 @@ bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, co
             return false;
           }
 
-          tsdb_soft_delete_entry(db, meta_offsets[p], ent_iter.current_entry_offset);
+          if (!tsdb_soft_delete_entry(db, meta_offsets[p], ent_iter.current_entry_offset)) {
+            ESP_LOGE(TAG, "Failed to retire old tag-index entry after replacement");
+            free(all_series_ids);
+            timeseries_entity_iterator_deinit(&ent_iter);
+            free(tag_key_bufs);
+            return false;
+          }
         }
 
         free(all_series_ids);
@@ -788,28 +786,10 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
 
   // --- Two-phase commit: write new page, then mark old page obsolete ---
 
-  // Phase 1a: Find a blank region for the new metadata page
-  timeseries_blank_iterator_t blank_iter;
-  if (!timeseries_blank_iterator_init(db, &blank_iter, page_size)) {
-    ESP_LOGE(TAG, "Failed to init blank iterator for metadata compaction");
-    free(live_buf);
-    return 0;
-  }
-
+  // Phase 1a: Atomically reserve and erase a region for the new page.
   uint32_t new_page_offset = 0, blank_length = 0;
-  bool found_blank = timeseries_blank_iterator_next(&blank_iter, &new_page_offset, &blank_length);
-  timeseries_blank_iterator_deinit(&blank_iter);
-
-  if (!found_blank) {
+  if (!tsdb_reserve_blank_region(db, page_size, NULL, &new_page_offset, &blank_length)) {
     ESP_LOGE(TAG, "No blank region available for metadata compaction — skipping");
-    free(live_buf);
-    return 0;
-  }
-
-  // Phase 1b: Erase the new region
-  if (esp_partition_erase_range(db->partition, new_page_offset, page_size) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed erasing new region @0x%08" PRIx32 " for metadata compaction",
-             new_page_offset);
     free(live_buf);
     return 0;
   }
@@ -828,6 +808,7 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
 
   if (esp_partition_write(db->partition, new_page_offset, &new_hdr, sizeof(new_hdr)) != ESP_OK) {
     ESP_LOGE(TAG, "Failed writing header to new metadata page @0x%08" PRIx32, new_page_offset);
+    tsdb_release_reserved_region(db, new_page_offset, NULL);
     free(live_buf);
     return 0;
   }
@@ -837,6 +818,7 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
     uint32_t write_offset = new_page_offset + sizeof(new_hdr);
     if (esp_partition_write(db->partition, write_offset, live_buf, buf_offset) != ESP_OK) {
       ESP_LOGE(TAG, "Failed writing entries to new metadata page @0x%08" PRIx32, new_page_offset);
+      tsdb_release_reserved_region(db, new_page_offset, NULL);
       free(live_buf);
       return 0;
     }
@@ -844,6 +826,13 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
 
   free(live_buf);
   live_buf = NULL;
+
+  if (!tsdb_finalize_reserved_region(db, new_page_offset, &new_hdr, NULL)) {
+    ESP_LOGE(TAG, "Failed finalizing metadata reservation @0x%08" PRIx32,
+             new_page_offset);
+    tsdb_release_reserved_region(db, new_page_offset, NULL);
+    return 0;
+  }
 
   // New page is now fully written and ACTIVE on flash.
   // Even if power is lost after this point, both old and new pages are valid
@@ -856,9 +845,6 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
     // Old page is still ACTIVE, new page is also ACTIVE.
     // Not ideal (duplicate data) but no data loss. Add new page to cache anyway.
     ESP_LOGW(TAG, "Failed reading old header for obsolete marking — both pages remain active");
-    if (!tsdb_pagecache_add_entry(db, new_page_offset, &new_hdr)) {
-      ESP_LOGE(TAG, "OOM adding new metadata page @0x%08" PRIx32 " to cache", new_page_offset);
-    }
     db->cached_metadata_valid = false;
     if (out_new_offset) *out_new_offset = new_page_offset;
     return (uint32_t)deleted_data_size;
@@ -869,18 +855,12 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
     // Same fallback: both pages active, no data loss.
     ESP_LOGW(TAG, "Failed marking old page @0x%08" PRIx32 " obsolete — both pages remain active",
              page_offset);
-    if (!tsdb_pagecache_add_entry(db, new_page_offset, &new_hdr)) {
-      ESP_LOGE(TAG, "OOM adding new metadata page @0x%08" PRIx32 " to cache", new_page_offset);
-    }
     db->cached_metadata_valid = false;
     if (out_new_offset) *out_new_offset = new_page_offset;
     return (uint32_t)deleted_data_size;
   }
 
   // Phase 3: Update the page cache — add new page, remove old page
-  if (!tsdb_pagecache_add_entry(db, new_page_offset, &new_hdr)) {
-    ESP_LOGE(TAG, "OOM adding compacted metadata page @0x%08" PRIx32 " to cache", new_page_offset);
-  }
   tsdb_pagecache_remove_entry(db, page_offset);
 
   // Invalidate the metadata page offset cache
@@ -902,13 +882,6 @@ static bool tsdb_create_empty_metadata_page(timeseries_db_t* db, uint32_t page_o
 
   ESP_LOGV(TAG, "Creating empty metadata page at offset=0x%08" PRIx32 "...", page_offset);
 
-  // Erase 8 KB from page_offset
-  esp_err_t err = esp_partition_erase_range(db->partition, page_offset, TIMESERIES_METADATA_PAGE_SIZE);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to erase meta page (err=0x%x)", err);
-    return false;
-  }
-
   timeseries_page_header_t new_hdr;
   memset(&new_hdr, 0xFF, sizeof(new_hdr));
   new_hdr.magic_number = TIMESERIES_MAGIC_NUM;
@@ -920,15 +893,16 @@ static bool tsdb_create_empty_metadata_page(timeseries_db_t* db, uint32_t page_o
   new_hdr.field_data_level = 0;  // not used for metadata
   new_hdr.page_size = TIMESERIES_METADATA_PAGE_SIZE;
 
-  err = esp_partition_write(db->partition, page_offset, &new_hdr, sizeof(new_hdr));
+  esp_err_t err = esp_partition_write(db->partition, page_offset, &new_hdr, sizeof(new_hdr));
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to write new metadata header (err=0x%x)", err);
+    tsdb_release_reserved_region(db, page_offset, NULL);
     return false;
   }
 
-  // Add to page cache
-  if (!tsdb_pagecache_add_entry(db, page_offset, &new_hdr)) {
+  if (!tsdb_finalize_reserved_region(db, page_offset, &new_hdr, NULL)) {
     ESP_LOGE(TAG, "OOM adding metadata page @0x%08" PRIx32 " to cache", page_offset);
+    tsdb_release_reserved_region(db, page_offset, NULL);
     return false;
   }
 
@@ -1088,6 +1062,59 @@ bool tsdb_soft_delete_entry(timeseries_db_t* db, uint32_t page_offset, uint32_t 
   }
 
   ESP_LOGD(TAG, "Soft-deleted old tagindex entry at offset=0x%08" PRIx32, entry_addr);
+  return true;
+}
+
+bool tsdb_replace_seriesid_list_entry(timeseries_db_t* db,
+                                      uint32_t old_page_offset,
+                                      uint32_t old_entry_offset,
+                                      timeseries_keytype_t key_type,
+                                      const char* key,
+                                      const unsigned char* series_ids,
+                                      size_t series_id_count) {
+  if (!db || !key ||
+      (key_type != TIMESERIES_KEYTYPE_TAGINDEX &&
+       key_type != TIMESERIES_KEYTYPE_FIELDLISTINDEX) ||
+      (series_id_count > 0 && !series_ids) ||
+      series_id_count > UINT16_MAX / 16U) {
+    return false;
+  }
+
+  if (series_id_count > 0) {
+    bool created = false;
+    uint32_t meta_offsets[4];
+    size_t meta_count = 0;
+    if (tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
+      // Avoid the old page: if it fills, compaction would copy the entry being
+      // replaced and leave another live copy behind.
+      for (size_t i = 0; i < meta_count && !created; i++) {
+        if (meta_offsets[i] != old_page_offset) {
+          created = tsdb_create_new_index_entry(db, meta_offsets[i], key_type,
+                                                key, series_ids,
+                                                series_id_count * 16U);
+        }
+      }
+    }
+
+    if (!created && timeseries_metadata_create_page(db)) {
+      meta_count = 0;
+      if (tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
+        for (size_t i = 0; i < meta_count && !created; i++) {
+          if (meta_offsets[i] != old_page_offset) {
+            created = tsdb_create_new_index_entry(db, meta_offsets[i], key_type,
+                                                  key, series_ids,
+                                                  series_id_count * 16U);
+          }
+        }
+      }
+    }
+    if (!created) return false;
+  }
+
+  if (!tsdb_soft_delete_entry(db, old_page_offset, old_entry_offset)) {
+    ESP_LOGE(TAG, "Failed to retire replaced metadata entry '%s'", key);
+    return false;
+  }
   return true;
 }
 

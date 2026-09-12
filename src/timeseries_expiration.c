@@ -36,6 +36,7 @@ typedef struct {
   uint32_t page_offset;   // Base offset of the page in the partition
   uint32_t record_offset; // Offset from the start of the page to the record
   uint32_t record_length; // Size of this record, in bytes
+  uint32_t page_sequence; // Detect page replacement at the same flash offset
   unsigned char series_id[16]; // Series ID for TOCTOU validation in mark phase
 } tsdb_oldest_fd_entry_t;
 
@@ -367,6 +368,7 @@ static bool gather_25_oldest_fielddata(timeseries_db_t *db,
         candidate.record_offset = f_iter.current_record_offset;
         // Make sure your actual field name matches what's in your header:
         candidate.record_length = fd_hdr.record_length;
+        candidate.page_sequence = hdr.sequence_num;
         memcpy(candidate.series_id, fd_hdr.series_id, 16);
 
         // Insert into the max-heap
@@ -467,11 +469,20 @@ static bool mark_record_deleted(timeseries_db_t *db, uint32_t record_hdr_abs,
   // (the gather phase ran without flash_write_mutex, so the record could
   // have been modified by a concurrent insert or compaction).
   if (expected) {
-    if (memcmp(fd_hdr.series_id, expected->series_id, 16) != 0 ||
-        fd_hdr.start_time != expected->start_time) {
+    timeseries_page_header_t page_hdr;
+    bool page_matches =
+        esp_partition_read(db->partition, expected->page_offset, &page_hdr,
+                           sizeof(page_hdr)) == ESP_OK &&
+        page_hdr.magic_number == TIMESERIES_MAGIC_NUM &&
+        page_hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE &&
+        page_hdr.sequence_num == expected->page_sequence;
+    if (!page_matches ||
+        memcmp(fd_hdr.series_id, expected->series_id, 16) != 0 ||
+        fd_hdr.start_time != expected->start_time ||
+        fd_hdr.record_length != expected->record_length) {
       ESP_LOGW(TAG,
                "TOCTOU: record @0x%08" PRIx32
-               " changed since gather phase (series_id or start_time mismatch), skipping",
+               " changed since gather phase, skipping",
                record_hdr_abs);
       return false;
     }

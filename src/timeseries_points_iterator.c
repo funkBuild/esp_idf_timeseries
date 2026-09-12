@@ -63,7 +63,8 @@ bool timeseries_points_iterator_init(
   iter->current_idx = 0;
 
   // Boundary check
-  if (record_data_offset + record_length > db->partition->size) {
+  if (record_data_offset > db->partition->size ||
+      record_length > db->partition->size - record_data_offset) {
     ESP_LOGE(TAG, "Record end out of bounds: 0x%08X + %u > 0x%08X",
              (unsigned)record_data_offset, (unsigned)record_length,
              (unsigned)db->partition->size);
@@ -394,6 +395,13 @@ bool timeseries_points_iterator_init(
     }
 
     uint32_t ts_size = record_count * sizeof(uint64_t);
+    if (uc_hdr.ts_len != ts_size ||
+        uc_hdr.ts_len > record_length - (uint32_t)sizeof(uc_hdr) ||
+        uc_hdr.val_len > record_length - (uint32_t)sizeof(uc_hdr) - uc_hdr.ts_len) {
+      ESP_LOGE(TAG, "Uncompressed column lengths exceed record bounds");
+      iter->valid = false;
+      return false;
+    }
     uint32_t ts_offset = record_data_offset + sizeof(uc_hdr);
     uint32_t val_offset = ts_offset + uc_hdr.ts_len;
 

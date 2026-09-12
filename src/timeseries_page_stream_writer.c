@@ -70,18 +70,7 @@ static bool relocate_region(timeseries_page_stream_writer_t* writer_ctx, uint32_
   // 2) Copy old data to new
   if (!copy_flash_block(db->partition, old_offset, found_ofs, old_size)) {
     ESP_LOGE(TAG, "Failed copying region 0x%08" PRIx32 " => 0x%08" PRIx32, old_offset, found_ofs);
-    // Cleanup: mark the newly reserved region as OBSOLETE so it can be reclaimed
-    timeseries_page_header_t new_hdr;
-    if (esp_partition_read(db->partition, found_ofs, &new_hdr, sizeof(new_hdr)) == ESP_OK) {
-      new_hdr.page_state = TIMESERIES_PAGE_STATE_OBSOLETE;
-      esp_partition_write(db->partition, found_ofs, &new_hdr, sizeof(new_hdr));
-    }
-    // Remove the placeholder from the page cache
-    if (writer_ctx->batch_snapshot) {
-      tsdb_pagecache_batch_remove(writer_ctx->batch_snapshot, found_ofs);
-    } else {
-      tsdb_pagecache_remove_entry(db, found_ofs);
-    }
+    tsdb_release_reserved_region(db, found_ofs, writer_ctx->batch_snapshot);
     return false;
   }
 
@@ -134,10 +123,7 @@ static bool ensure_capacity(timeseries_page_stream_writer_t* writer, size_t need
   timeseries_page_header_t verify_hdr;
   if (esp_partition_read(writer->db->partition, new_offset, &verify_hdr, sizeof(verify_hdr)) != ESP_OK) {
     ESP_LOGE(TAG, "Failed reading header at new location 0x%08" PRIx32, new_offset);
-    // Mark orphaned new region as OBSOLETE (page_state byte: ACTIVE=0x01 -> OBSOLETE=0x00)
-    tsdb_flash_write_byte(writer->db->partition,
-                          new_offset + offsetof(timeseries_page_header_t, page_state),
-                          TIMESERIES_PAGE_STATE_OBSOLETE);
+    tsdb_release_reserved_region(writer->db, new_offset, writer->batch_snapshot);
     return false;
   }
 
@@ -148,11 +134,13 @@ static bool ensure_capacity(timeseries_page_stream_writer_t* writer, size_t need
   if (writer->batch_snapshot) {
     if (!tsdb_pagecache_batch_add(writer->batch_snapshot, new_offset, &verify_hdr)) {
       ESP_LOGE(TAG, "OOM updating batch cache after relocation");
+      tsdb_release_reserved_region(writer->db, new_offset, writer->batch_snapshot);
       return false;
     }
   } else {
     if (!tsdb_pagecache_add_entry(writer->db, new_offset, &verify_hdr)) {
       ESP_LOGE(TAG, "OOM updating page cache after relocation @0x%08" PRIx32, new_offset);
+      tsdb_release_reserved_region(writer->db, new_offset, writer->batch_snapshot);
       return false;
     }
   }
@@ -248,6 +236,13 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
     ESP_LOGE(TAG, "Failed to find blank region (size=%u)", (unsigned int)initial_size);
     return false;
   }
+  if (found_page_size < initial_size) {
+    ESP_LOGE(TAG, "Reserved region is smaller than requested (%u < %u)",
+             (unsigned int)found_page_size, (unsigned int)initial_size);
+    writer->base_offset = region_ofs;
+    timeseries_page_stream_writer_abort(writer);
+    return false;
+  }
 
   int64_t end_time = esp_timer_get_time();
   ESP_LOGI(TAG, "Reserved blank region in %.3f ms", (end_time - start_time) / 1000.0);
@@ -262,7 +257,7 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
   // page allocations (the field is _Atomic but ++ is a non-atomic RMW).
   hdr.sequence_num = atomic_fetch_add(&db->sequence_num, 1) + 1;
   hdr.field_data_level = to_level;
-  hdr.page_size = initial_size;
+  hdr.page_size = found_page_size;
 
   ESP_LOGV(TAG, "Init: Writing header @0x%08" PRIx32 " type=%u state=%u level=%u",
            region_ofs, hdr.page_type, hdr.page_state, to_level);
@@ -270,7 +265,7 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
   if (esp_partition_write(db->partition, region_ofs, &hdr, sizeof(hdr)) != ESP_OK) {
     ESP_LOGE(TAG, "Failed writing initial page header");
     writer->base_offset = region_ofs;
-    writer->capacity = initial_size;
+    writer->capacity = found_page_size;
     timeseries_page_stream_writer_abort(writer);
     return false;
   }
@@ -286,7 +281,7 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
 
   writer->base_offset = region_ofs;
   writer->write_ptr = region_ofs + sizeof(timeseries_page_header_t);
-  writer->capacity = initial_size;
+  writer->capacity = found_page_size;
   writer->finalized = false;
 
   return true;
@@ -725,22 +720,6 @@ void timeseries_page_stream_writer_abort(timeseries_page_stream_writer_t* writer
   gorilla_stream_deinit(&writer->ts_stream);
   gorilla_stream_deinit(&writer->val_stream);
 
-  // Mark the partially-written page as OBSOLETE on flash so it won't be
-  // re-scanned on reboot.  Clearing page_state bits (ACTIVE 0x01 ->
-  // OBSOLETE 0x00) is a valid NOR flash write (only clears bits).
-  timeseries_page_header_t hdr;
-  if (esp_partition_read(writer->db->partition, writer->base_offset,
-                         &hdr, sizeof(hdr)) == ESP_OK) {
-    hdr.page_state = TIMESERIES_PAGE_STATE_OBSOLETE;
-    esp_partition_write(writer->db->partition, writer->base_offset,
-                        &hdr, sizeof(hdr));
-  }
-
-  // Remove the placeholder / in-progress entry from the page cache
-  if (writer->batch_snapshot) {
-    tsdb_pagecache_batch_remove(writer->batch_snapshot,
-                                writer->base_offset);
-  } else {
-    tsdb_pagecache_remove_entry(writer->db, writer->base_offset);
-  }
+  tsdb_release_reserved_region(writer->db, writer->base_offset,
+                               writer->batch_snapshot);
 }

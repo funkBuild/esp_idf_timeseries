@@ -21,6 +21,7 @@ static bool tsdb_mark_series_deleted_in_page(timeseries_db_t* db, uint32_t page_
   }
 
   timeseries_field_data_header_t fdh;
+  bool success = true;
   while (timeseries_fielddata_iterator_next(&fdata_iter, &fdh)) {
     // Skip if already flagged as deleted
     if ((fdh.flags & TSDB_FIELDDATA_FLAG_DELETED) == 0) {
@@ -54,6 +55,7 @@ static bool tsdb_mark_series_deleted_in_page(timeseries_db_t* db, uint32_t page_
       ESP_LOGE(TAG, "Failed to write updated header at offset 0x%08X: %s", (unsigned int)header_offset,
                esp_err_to_name(err));
       // Continue with other deletions despite this error
+      success = false;
       continue;
     }
 
@@ -61,7 +63,7 @@ static bool tsdb_mark_series_deleted_in_page(timeseries_db_t* db, uint32_t page_
   }
 
   timeseries_fielddata_iterator_deinit(&fdata_iter);
-  return true;
+  return success;
 }
 
 static bool tsdb_mark_metadata_deleted_in_page(timeseries_db_t* db, uint32_t page_offset, uint32_t page_size,
@@ -95,6 +97,8 @@ static bool tsdb_mark_metadata_deleted_in_page(timeseries_db_t* db, uint32_t pag
               break;
             }
           }
+        } else {
+          success = false;
         }
       }
     } else if (e_hdr.key_type == TIMESERIES_KEYTYPE_FIELDLISTINDEX ||
@@ -108,17 +112,43 @@ static bool tsdb_mark_metadata_deleted_in_page(timeseries_db_t* db, uint32_t pag
           break;
         }
         char key_buf[128];
-        if (e_hdr.key_len >= sizeof(key_buf)) { free(series_ids); continue; }
+        if (e_hdr.key_len >= sizeof(key_buf)) {
+          free(series_ids);
+          success = false;
+          continue;
+        }
         if (timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key_buf, series_ids)) {
+          key_buf[e_hdr.key_len] = '\0';
           size_t num_ids = e_hdr.value_len / 16;
-          for (size_t s = 0; s < num_ids && !should_delete; s++) {
+          size_t retained = 0;
+          bool removed = false;
+          for (size_t s = 0; s < num_ids; s++) {
+            bool delete_id = false;
             for (size_t d = 0; d < series_to_delete->count; d++) {
               if (memcmp(series_ids + s * 16, series_to_delete->ids[d].bytes, 16) == 0) {
-                should_delete = true;
+                delete_id = true;
                 break;
               }
             }
+            if (delete_id) {
+              removed = true;
+            } else {
+              if (retained != s) {
+                memmove(series_ids + retained * 16, series_ids + s * 16, 16);
+              }
+              retained++;
+            }
           }
+
+          if (removed && !tsdb_replace_seriesid_list_entry(
+                  db, page_offset, ent_iter.current_entry_offset,
+                  (timeseries_keytype_t)e_hdr.key_type, key_buf,
+                  series_ids, retained)) {
+            ESP_LOGE(TAG, "Failed to replace shared metadata index '%s'", key_buf);
+            success = false;
+          }
+        } else {
+          success = false;
         }
         free(series_ids);
       }
@@ -158,6 +188,7 @@ bool tsdb_series_delete(timeseries_db_t* db, timeseries_series_id_list_t* series
   // Initialize the result structure
   int64_t start_time = esp_timer_get_time();
   size_t deleted_count = 0;
+  bool success = true;
 
   timeseries_page_cache_iterator_t page_iter;
   if (!timeseries_page_cache_iterator_init(db, &page_iter)) {
@@ -172,9 +203,15 @@ bool tsdb_series_delete(timeseries_db_t* db, timeseries_series_id_list_t* series
   while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &page_offset, &page_size)) {
     // Only process FIELD_DATA pages
     if (hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA) {
-      tsdb_mark_series_deleted_in_page(db, page_offset, page_size, series_to_delete, &deleted_count);
+      if (!tsdb_mark_series_deleted_in_page(db, page_offset, page_size,
+                                            series_to_delete, &deleted_count)) {
+        success = false;
+      }
     } else if (hdr.page_type == TIMESERIES_PAGE_TYPE_METADATA) {
-      tsdb_mark_metadata_deleted_in_page(db, page_offset, page_size, series_to_delete);
+      if (!tsdb_mark_metadata_deleted_in_page(db, page_offset, page_size,
+                                              series_to_delete)) {
+        success = false;
+      }
     }
   }
   timeseries_page_cache_iterator_deinit(&page_iter);
@@ -182,7 +219,7 @@ bool tsdb_series_delete(timeseries_db_t* db, timeseries_series_id_list_t* series
   int64_t end_time = esp_timer_get_time();
   ESP_LOGI(TAG, "Deleted %zu series records in %.3f ms", deleted_count, (end_time - start_time) / 1000.0);
 
-  return true;
+  return success;
 }
 
 /**

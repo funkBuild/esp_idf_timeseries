@@ -571,8 +571,9 @@ static bool merge_sorted_field_data(timeseries_query_result_t *result,
     return true;
   }
 
-  // Single-pass: try placing values assuming all timestamps exist.
-  // If we encounter a missing timestamp, count remaining inserts and fall through to merge.
+  // First pass is count-only. Do not overwrite matching slots yet: if a later
+  // timestamp needs inserting, the reverse merge still needs to read the old
+  // value (and, for strings, retain its ownership until that read occurs).
   size_t insert_count = 0;
   {
     size_t oi = 0;
@@ -597,21 +598,21 @@ static bool merge_sorted_field_data(timeseries_query_result_t *result,
         }
         break;
       }
-      // Timestamp exists — place value immediately (combines count + placement).
-      // If a previous series mapped to this same column (columns are keyed by
-      // field name) already placed an owned string at this (column,timestamp),
-      // free it before overwriting so we don't leak it.
-      {
+      oi++;
+    }
+    if (insert_count == 0) {
+      // All timestamps exist, so it is now safe to replace the values in place.
+      oi = 0;
+      for (ni = 0; ni < new_count; ni++) {
+        while (result->timestamps[oi] < new_ts[ni]) oi++;
         timeseries_field_value_t *slot = &result->columns[col_index].values[oi];
         if (slot->type == TIMESERIES_FIELD_TYPE_STRING && slot->data.string_val.str) {
           free(slot->data.string_val.str);
         }
+        *slot = new_vals[ni];
+        oi++;
       }
-      result->columns[col_index].values[oi] = new_vals[ni];
-      oi++;
-    }
-    if (insert_count == 0) {
-      return true;  // All timestamps existed, values already placed
+      return true;
     }
   }
 
@@ -760,6 +761,8 @@ static int cmp_record_by_start_time(const void *a, const void *b) {
   const field_record_info_t *rb = (const field_record_info_t *)b;
   if (ra->start_time < rb->start_time) return -1;
   if (ra->start_time > rb->start_time) return 1;
+  if (ra->page_seq < rb->page_seq) return -1;
+  if (ra->page_seq > rb->page_seq) return 1;
   return 0;
 }
 
@@ -770,6 +773,7 @@ static int cmp_record_by_start_time(const void *a, const void *b) {
 static bool field_record_array_append(series_record_list_t *srl,
                                       const timeseries_field_data_header_t *fdh,
                                       uint32_t absolute_offset,
+                                      uint32_t page_seq,
                                       unsigned int limit) {
   if (srl->count >= srl->capacity) {
     size_t new_cap = srl->capacity ? srl->capacity * 2 : 8;
@@ -784,6 +788,7 @@ static bool field_record_array_append(series_record_list_t *srl,
 
   field_record_info_t *rec = &srl->records[srl->count++];
   rec->record_offset = absolute_offset;
+  rec->page_seq = page_seq;
   rec->start_time = fdh->start_time;
   rec->end_time = fdh->end_time;
   rec->record_count = fdh->record_count;
@@ -934,7 +939,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
         ESP_LOGD(TAG, "MATCH: series %02X%02X%02X%02X... @0x%08X count=%u len=%u compressed=%d",
                  fdh.series_id[0], fdh.series_id[1], fdh.series_id[2], fdh.series_id[3],
                  (unsigned int)absolute_offset, fdh.record_count, fdh.record_length, is_compressed);
-        field_record_array_append(srl, &fdh, absolute_offset,
+        field_record_array_append(srl, &fdh, absolute_offset, hdr.sequence_num,
                                   query->limit);
       } else {
         ESP_LOGD(TAG, "No match for series %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X (flags=0x%02X, records=%u)",
@@ -1140,7 +1145,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
           if (!ok) continue;
           timeseries_points_iterator_set_time_range(pit, query->start_ms, query->end_ms);
           sub_iters[idx] = pit;
-          page_seqs[idx] = 0;
+          page_seqs[idx] = rec->page_seq;
           idx++;
         }
 
@@ -1318,7 +1323,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
           if (!ok) continue;
           timeseries_points_iterator_set_time_range(pit, query->start_ms, query->end_ms);
           sub_iters[idx] = pit;
-          page_seqs[idx] = 0;
+          page_seqs[idx] = rec->page_seq;
           idx++;
         }
 

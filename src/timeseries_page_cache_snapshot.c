@@ -36,9 +36,16 @@ tsdb_page_cache_snapshot_t *tsdb_snapshot_create(size_t initial_capacity) {
 }
 
 tsdb_page_cache_snapshot_t *tsdb_snapshot_clone(const tsdb_page_cache_snapshot_t *src) {
-    if (!src) {
-        return tsdb_snapshot_create(8);
-    }
+    return tsdb_snapshot_clone_with_room(src, 0);
+}
+
+tsdb_page_cache_snapshot_t *tsdb_snapshot_clone_with_room(const tsdb_page_cache_snapshot_t *src,
+                                                        size_t additional) {
+    size_t count = src ? src->count : 0;
+    size_t maximum = SIZE_MAX / sizeof(timeseries_cached_page_t);
+    if (count > maximum || additional > maximum - count) return NULL;
+    size_t capacity = count + additional;
+    if (!count && capacity < 8) capacity = 8;
 
     tsdb_page_cache_snapshot_t *snap = calloc(1, sizeof(tsdb_page_cache_snapshot_t));
     if (!snap) {
@@ -46,18 +53,19 @@ tsdb_page_cache_snapshot_t *tsdb_snapshot_clone(const tsdb_page_cache_snapshot_t
         return NULL;
     }
 
-    snap->capacity = src->count > 0 ? src->count : 8;
-    snap->entries = calloc(snap->capacity, sizeof(timeseries_cached_page_t));
+    snap->capacity = capacity;
+    // Every live entry is copied below; unused headroom is initialized by add.
+    snap->entries = malloc(snap->capacity * sizeof(timeseries_cached_page_t));
     if (!snap->entries) {
         ESP_LOGE(TAG, "OOM allocating clone entries");
         free(snap);
         return NULL;
     }
 
-    if (src->count > 0) {
-        memcpy(snap->entries, src->entries, src->count * sizeof(timeseries_cached_page_t));
+    if (count > 0) {
+        memcpy(snap->entries, src->entries, count * sizeof(timeseries_cached_page_t));
     }
-    snap->count = src->count;
+    snap->count = count;
     atomic_store(&snap->refcount, 1);
     snap->removed_offsets = NULL;
     snap->removed_count = 0;

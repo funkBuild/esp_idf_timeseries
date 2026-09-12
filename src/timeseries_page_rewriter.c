@@ -1,4 +1,5 @@
 #include "timeseries_page_rewriter.h"
+#include "timeseries_revision.h"
 
 #include "esp_log.h"
 #include "esp_partition.h"
@@ -21,7 +22,9 @@ static bool write_initial_page_header(timeseries_page_rewriter_t *rewriter) {
   memset(&hdr, 0xFF, sizeof(hdr));
   hdr.magic_number = TIMESERIES_MAGIC_NUM;
   hdr.page_type = TIMESERIES_PAGE_TYPE_FIELD_DATA;
-  hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
+  // The live cache reservation excludes allocators. On flash, FREE keeps a
+  // partially copied page invisible to startup until finalize activates it.
+  hdr.page_state = TIMESERIES_PAGE_STATE_FREE;
   // Atomic increment to avoid duplicate sequence numbers across concurrent
   // page allocations (the field is _Atomic but ++ is a non-atomic RMW).
   hdr.sequence_num = atomic_fetch_add(&rewriter->db->sequence_num, 1) + 1;
@@ -39,7 +42,7 @@ static bool write_initial_page_header(timeseries_page_rewriter_t *rewriter) {
 bool timeseries_page_rewriter_start(timeseries_db_t *db, uint8_t level,
                                     uint32_t prev_data_size,
                                     timeseries_page_rewriter_t *rewriter) {
-  if (!db || !rewriter) {
+  if (!rewriter) {
     return false;
   }
   // Preserve batch_snapshot that may have been set before init
@@ -48,7 +51,9 @@ bool timeseries_page_rewriter_start(timeseries_db_t *db, uint8_t level,
   rewriter->batch_snapshot = saved_batch;
   rewriter->db = db;
   rewriter->level = level;
-  rewriter->finalized = false;
+  rewriter->finalized = true;
+  if (!db || !db->partition || prev_data_size < sizeof(timeseries_page_header_t) ||
+      prev_data_size > UINT32_MAX - 4095 || prev_data_size > db->partition->size) return false;
 
   // Calculate the initial size rounded up to 4K.
   uint32_t initial_size = tsdb_round_up_4k(prev_data_size);
@@ -65,6 +70,8 @@ bool timeseries_page_rewriter_start(timeseries_db_t *db, uint8_t level,
   rewriter->base_offset = region_ofs;
   rewriter->write_ptr = region_ofs + sizeof(timeseries_page_header_t);
   rewriter->capacity = region_size;
+  rewriter->reserved = true;
+  rewriter->finalized = false;
 
   // Write the placeholder page header.
   if (!write_initial_page_header(rewriter)) {
@@ -81,66 +88,73 @@ bool timeseries_page_rewriter_start(timeseries_db_t *db, uint8_t level,
 bool timeseries_page_rewriter_write_field_data(
     timeseries_page_rewriter_t *rewriter, uint32_t old_page_ofs,
     uint32_t record_offset, const timeseries_field_data_header_t *fd_hdr) {
-  if (!rewriter || !fd_hdr || rewriter->finalized) {
-    return false;
-  }
-  // Calculate the total length of the record: header + payload.
-  uint32_t record_total_len =
-      sizeof(timeseries_field_data_header_t) + fd_hdr->record_length;
+  if (!rewriter || rewriter->finalized || rewriter->failed || !rewriter->reserved) return false;
+  if (!fd_hdr || !rewriter->db || !rewriter->db->partition) goto fail;
+  const esp_partition_t *partition = rewriter->db->partition;
+  uint32_t original_length = sizeof(*fd_hdr) + fd_hdr->record_length;
+  bool legacy = (fd_hdr->flags & TSDB_FIELDDATA_FLAG_REVISION) != 0;
+  if (legacy && fd_hdr->record_length > UINT16_MAX - sizeof(uint64_t)) goto fail;
+  uint32_t length = original_length + (legacy ? sizeof(uint64_t) : 0);
+  if (old_page_ofs > partition->size || record_offset > UINT32_MAX - old_page_ofs ||
+      record_offset > partition->size - old_page_ofs) goto fail;
+  uint32_t source = old_page_ofs + record_offset;
+  if (original_length > partition->size - source ||
+      rewriter->base_offset > partition->size || rewriter->capacity > partition->size - rewriter->base_offset ||
+      rewriter->write_ptr < rewriter->base_offset ||
+      rewriter->write_ptr - rewriter->base_offset > rewriter->capacity ||
+      length > rewriter->capacity - (rewriter->write_ptr - rewriter->base_offset)) goto fail;
 
-  // Allocate temporary buffer to hold the record.
-  unsigned char *rec_buf = (unsigned char *)malloc(record_total_len);
-  if (!rec_buf) {
-    ESP_LOGE(TAG, "OOM copying record from old page @0x%08X",
-             (unsigned int)old_page_ofs);
-    return false;
-  }
-
-  // Calculate the absolute address of the record in flash.
-  uint32_t old_record_abs = old_page_ofs + record_offset;
-
-  // Read the record from the old page.
-  if (esp_partition_read(rewriter->db->partition, old_record_abs, rec_buf,
-                         record_total_len) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed reading record from 0x%08X",
-             (unsigned int)old_record_abs);
-    free(rec_buf);
-    return false;
-  }
-
-  // Check if there is enough capacity in the new page.
-  if ((rewriter->write_ptr + record_total_len) >
-      (rewriter->base_offset + rewriter->capacity)) {
-    ESP_LOGE(
-        TAG,
-        "Not enough capacity in new page to write record (needed %u bytes)",
-        (unsigned int)record_total_len);
-    free(rec_buf);
-    return false;
+  uint64_t revision = 0;
+  timeseries_field_data_header_t rewritten = *fd_hdr;
+  if (legacy) {
+    timeseries_page_header_t header;
+    if (sizeof(header) > partition->size - old_page_ofs ||
+        esp_partition_read(partition, old_page_ofs, &header, sizeof(header)) != ESP_OK) goto fail;
+    revision = tsdb_legacy_revision(header.sequence_num, source + sizeof(*fd_hdr));
+    rewritten.flags &= ~TSDB_FIELDDATA_FLAG_REVISION;
+    rewritten.flags |= TSDB_FIELDDATA_FLAG_REVISION_VECTOR;
+    rewritten.record_length += sizeof(revision);
   }
 
-  // Write the record into the new page.
-  if (esp_partition_write(rewriter->db->partition, rewriter->write_ptr, rec_buf,
-                          record_total_len) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed writing record to new page @0x%08X",
-             (unsigned int)rewriter->write_ptr);
-    free(rec_buf);
-    return false;
+  uint8_t fallback[512];
+  uint8_t *buffer = fallback;
+  size_t capacity = sizeof(fallback);
+  if (rewriter->copy_buffer && rewriter->copy_buffer_capacity >= sizeof(fallback)) {
+    buffer = rewriter->copy_buffer;
+    capacity = rewriter->copy_buffer_capacity;
   }
-  rewriter->write_ptr += record_total_len;
-  free(rec_buf);
+  for (uint32_t copied = 0; copied < length;) {
+    size_t bytes = length - copied;
+    if (bytes > capacity) bytes = capacity;
+    size_t from_source = copied < original_length ? original_length - copied : 0;
+    if (from_source > bytes) from_source = bytes;
+    if (from_source && esp_partition_read(partition, source + copied, buffer, from_source) != ESP_OK) goto fail;
+    if (!copied) {
+      if (memcmp(buffer, fd_hdr, sizeof(*fd_hdr))) goto fail;
+      if (legacy) memcpy(buffer, &rewritten, sizeof(rewritten));
+    }
+    if (bytes > from_source) {
+      size_t revision_offset = copied > original_length ? copied - original_length : 0;
+      memcpy(buffer + from_source, (const uint8_t *)&revision + revision_offset, bytes - from_source);
+    }
+    if (esp_partition_write(partition, rewriter->write_ptr + copied, buffer, bytes) != ESP_OK) goto fail;
+    copied += bytes;
+  }
+  rewriter->write_ptr += length;
   return true;
+fail:
+  rewriter->failed = true;
+  return false;
 }
 
 bool timeseries_page_rewriter_finalize(timeseries_page_rewriter_t *rewriter) {
-  if (!rewriter || rewriter->finalized) {
+  if (!rewriter || rewriter->finalized || rewriter->failed || !rewriter->reserved) {
     return false;
   }
 
-  // Determine the number of bytes used.
-  uint32_t used_bytes = rewriter->write_ptr - rewriter->base_offset;
-  // Round up to next 4K.
-  uint32_t final_size = tsdb_round_up_4k(used_bytes);
+  // Retain the reservation. The normal caller has sized it exactly; shrinking
+  // an overestimate could require erasing a sector that already contains data.
+  uint32_t final_size = rewriter->capacity;
 
   // Read the existing page header.
   timeseries_page_header_t hdr;
@@ -151,12 +165,15 @@ bool timeseries_page_rewriter_finalize(timeseries_page_rewriter_t *rewriter) {
     return false;
   }
 
-  // Update the header with the final page size (NOR-flash-safe rewrite).
-  uint32_t old_page_size = hdr.page_size;
-  hdr.page_size = final_size;
-  if (!tsdb_safe_rewrite_page_header(rewriter->db->partition, rewriter->base_offset, &hdr, old_page_size)) {
-    ESP_LOGE(TAG, "Failed patching final page header at 0x%08X",
-             (unsigned int)rewriter->base_offset);
+  if (hdr.magic_number != TIMESERIES_MAGIC_NUM || hdr.page_state != TIMESERIES_PAGE_STATE_FREE ||
+      hdr.page_size != rewriter->capacity) { rewriter->failed = true; return false; }
+  // All records are complete. Activation only clears bits, with no erase.
+  hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
+  // Once activation is attempted, any failure requires abort. In particular,
+  // a cache-publication failure must not permit appending to an active page.
+  rewriter->failed = true;
+  if (esp_partition_write(rewriter->db->partition, rewriter->base_offset, &hdr, sizeof(hdr)) != ESP_OK) {
+    rewriter->failed = true;
     return false;
   }
 
@@ -177,16 +194,19 @@ bool timeseries_page_rewriter_finalize(timeseries_page_rewriter_t *rewriter) {
     }
   }
   rewriter->finalized = true;
+  rewriter->reserved = false;
+  rewriter->failed = false;
   return true;
 }
 
 void timeseries_page_rewriter_abort(timeseries_page_rewriter_t *rewriter) {
-  if (!rewriter || !rewriter->db) {
+  if (!rewriter || !rewriter->db || !rewriter->reserved || rewriter->finalized) {
     return;
   }
   ESP_LOGW(TAG, "Aborting page rewriter for page @0x%08X",
            (unsigned int)rewriter->base_offset);
   rewriter->finalized = true;
+  rewriter->reserved = false;
 
   tsdb_release_reserved_region(rewriter->db, rewriter->base_offset,
                                rewriter->batch_snapshot);

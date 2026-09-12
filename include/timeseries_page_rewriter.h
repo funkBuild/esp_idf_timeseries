@@ -17,8 +17,14 @@ typedef struct {
   uint32_t capacity;    // Total allocated capacity (in bytes).
   uint8_t level;        // Field data level (from header).
   bool finalized;
+  bool failed;
+  bool reserved;
   // Batch snapshot for compaction (when non-NULL, cache ops go through batch)
   tsdb_page_cache_snapshot_t *batch_snapshot;
+  // Optional borrowed scratch. The caller must exclude other users for the
+  // duration of each write; this buffer is never freed by the rewriter.
+  uint8_t *copy_buffer;
+  size_t copy_buffer_capacity;
 } timeseries_page_rewriter_t;
 
 /**
@@ -30,7 +36,8 @@ typedef struct {
  *
  * @param db             Pointer to the database structure.
  * @param level          Field data level to use in the new page header.
- * @param prev_data_size The size (in bytes) of the previous compressed data.
+ * @param prev_data_size Planned total size, including the page header. The
+ *                       rounded reservation is retained through finalization.
  * @param rewriter       Pointer to the rewriter structure to initialize.
  *
  * @return true on success, false on failure.
@@ -42,9 +49,8 @@ bool timeseries_page_rewriter_start(timeseries_db_t *db, uint8_t level,
 /**
  * @brief Write one field data record from an old page into the new page.
  *
- * This function reads the entire record (header + payload) from flash using the
- * old page offset plus the record’s relative offset, and writes it to the new
- * page.
+ * Copies in bounded chunks, using borrowed scratch or a 512-byte fallback. A
+ * failed copy poisons the writer; abort it instead of attempting to finalize.
  *
  * @param rewriter       Pointer to an initialized rewriter.
  * @param old_page_ofs   Base offset of the old page.
@@ -61,8 +67,8 @@ bool timeseries_page_rewriter_write_field_data(
 /**
  * @brief Finalize the new page.
  *
- * This function updates the page header (for example, its size) based on the
- * amount of data written, and optionally adds the new page to the page cache.
+ * Activates the complete page and publishes it in the page cache. Its allocated
+ * extent is retained so finalization never erases a sector containing records.
  *
  * @param rewriter Pointer to the rewriter.
  *

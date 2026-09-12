@@ -766,12 +766,19 @@ TEST_CASE("data: insert with same timestamp for all points", "[data][timestamp]"
     values[i].data.int_val = (int64_t)i;
   }
 
-  // This should still succeed (though may not be typical use case)
-  TEST_ASSERT_TRUE(insert_points_direct(db, series_id, timestamps, values, count));
-  TEST_ASSERT_TRUE(verify_l0_data_exists(db, series_id, count));
-
+  bool inserted = insert_points_direct(db, series_id, timestamps, values, count);
+  bool single_point = verify_l0_data_exists(db, series_id, 1);
+  int64_t stored_value = -1;
+  esp_err_t read = esp_partition_read(db->partition,
+      db->last_l0_page_offset + sizeof(timeseries_page_header_t) +
+      sizeof(timeseries_field_data_header_t) + sizeof(timeseries_col_data_header_t) + sizeof(uint64_t),
+      &stored_value, sizeof(stored_value));
   free(timestamps);
   free(values);
+  TEST_ASSERT_TRUE(inserted);
+  TEST_ASSERT_TRUE(single_point);
+  TEST_ASSERT_EQUAL(ESP_OK, read);
+  TEST_ASSERT_EQUAL_INT64(9, stored_value);
 }
 
 TEST_CASE("data: insert with timestamp zero", "[data][timestamp]") {
@@ -1072,9 +1079,8 @@ TEST_CASE("data: verify record length calculation for float", "[data][record]") 
         timeseries_field_data_header_t f_hdr;
         while (timeseries_fielddata_iterator_next(&f_iter, &f_hdr)) {
           if (memcmp(f_hdr.series_id, series_id, 16) == 0) {
-            // Expected: col_header(8) + timestamps(10*8) + values(10*8) = 168
-            // bytes
-            TEST_ASSERT_EQUAL(168, f_hdr.record_length);
+            // Column header + timestamps + values + scalar revision.
+            TEST_ASSERT_EQUAL(176, f_hdr.record_length);
             TEST_ASSERT_EQUAL(count, f_hdr.record_count);
             found = true;
             break;
@@ -1114,7 +1120,7 @@ TEST_CASE("data: verify record length for varying string sizes", "[data][record]
   TEST_ASSERT_TRUE(insert_points_direct(db, series_id, timestamps, values, count));
 
   // Expected: col_header(8) + timestamps(3*8=24) + values(4+1 + 4+2 + 4+3 =
-  // 18) = 50 bytes Find and verify
+  // 18) + revision(8) = 58 bytes. Find and verify
   timeseries_page_cache_iterator_t page_iter;
   TEST_ASSERT_TRUE(timeseries_page_cache_iterator_init(db, &page_iter));
 
@@ -1132,7 +1138,7 @@ TEST_CASE("data: verify record length for varying string sizes", "[data][record]
         timeseries_field_data_header_t f_hdr;
         while (timeseries_fielddata_iterator_next(&f_iter, &f_hdr)) {
           if (memcmp(f_hdr.series_id, series_id, 16) == 0) {
-            TEST_ASSERT_EQUAL(50, f_hdr.record_length);
+            TEST_ASSERT_EQUAL(58, f_hdr.record_length);
             TEST_ASSERT_EQUAL(count, f_hdr.record_count);
             found = true;
             break;
@@ -1295,12 +1301,8 @@ TEST_CASE("data: verify flags field initialization", "[data][bug]") {
         timeseries_field_data_header_t f_hdr;
         while (timeseries_fielddata_iterator_next(&f_iter, &f_hdr)) {
           if (memcmp(f_hdr.series_id, series_id, 16) == 0) {
-            // Flags is set to 0xFF in the code - is this intentional?
-            ESP_LOGI(TAG, "Flags field value: 0x%02X", f_hdr.flags);
-            // Note: 0xFF means all bits set, which includes DELETED and
-            // COMPRESSED This might be a bug - uncompressed, active data should
-            // probably have flags=0
-            TEST_ASSERT_EQUAL(0xFF, f_hdr.flags);
+            // NOR flags: active, raw, scalar revision present (bit 3 clear).
+            TEST_ASSERT_EQUAL(0xF7, f_hdr.flags);
             found = true;
             break;
           }

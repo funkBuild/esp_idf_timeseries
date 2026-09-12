@@ -89,6 +89,15 @@ bool float_stream_decoder_get_value(FloatStreamDecoder *dec, double *value) {
     if (second_bit == 0) {
       // Control code "10": reuse previous header.
       // No new header is read; stored header remains.
+      //
+      // Reject a reuse that has no header to reuse. prev_tzb starts at -1
+      // (see the initialisers), so a malformed stream opening with "10"
+      // reached the shift below with a negative count — undefined behaviour.
+      // The "11" branch validates prev_tzb after computing it; this branch
+      // had no equivalent.
+      if (dec->prev_tzb < 0) {
+        return false; // reuse before any header was seen
+      }
     } else if (second_bit == 1) {
       // Control code "11": new header follows.
       uint64_t header;

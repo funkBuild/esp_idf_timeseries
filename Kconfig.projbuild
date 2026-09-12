@@ -64,7 +64,11 @@ menu "ESP IDF Timeseries Configuration"
             the peak allocation is ~16 KB for inputs plus ~18 KB for the encoded
             output buffers — acceptable for ESP32 targets without PSRAM. Raising
             this reduces the number of ALP records per series but increases
-            transient RAM use proportionally. Test builds may set a lower value
-            (e.g. 200) to exercise the chunking code path with small datasets.
+            transient RAM use proportionally up to an effective cap of 1024
+            points. Larger configuration values remain accepted, but the
+            compactor caps its input buffers at 1024 points. String records
+            also have a separate byte budget to bound retained string data.
+            Test builds may set a lower value (e.g. 200) to exercise chunking
+            with small datasets.
 
 endmenu

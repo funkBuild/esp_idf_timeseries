@@ -17,6 +17,11 @@
 
 static const char *TAG = "PointsIterator";
 
+// Same sanity cap the compressed path applies (see
+// gorilla/string_stream_decoder.c): no stored string is ever this large, so
+// anything bigger is a corrupt length word.
+#define TSDB_STRING_MAX_LEN 65536
+
 /* --------------------------------------------------------------------------
  * Gorilla decoder fill callback
  * --------------------------------------------------------------------------*/
@@ -43,12 +48,12 @@ static bool decoder_fill_callback(void *context, uint8_t *buffer,
 /* --------------------------------------------------------------------------
  * timeseries_points_iterator_init(...)
  * --------------------------------------------------------------------------*/
-bool timeseries_points_iterator_init(
+static bool points_iterator_init_impl(
     timeseries_db_t *db, uint32_t record_data_offset, uint32_t record_length,
     uint16_t record_count, timeseries_field_type_e series_type,
     uint8_t data_flags,
-    timeseries_points_iterator_t *iter) {
-  if (!db || !iter) {
+    timeseries_points_iterator_t *iter, uint64_t start_ms, uint64_t end_ms, const uint64_t *cached_revision) {
+  if (!db || !db->partition || !iter) {
     return false;
   }
   memset(iter, 0, sizeof(*iter));
@@ -57,6 +62,7 @@ bool timeseries_points_iterator_init(
   iter->ts_count = record_count;
   iter->series_type = series_type;
   iter->is_column_format = true;
+  iter->has_revision = (data_flags & TSDB_FIELDDATA_FLAG_REVISION) == 0;
   // Derive compressed from flags: bit1=0 means compressed, bit1=1 means raw
   bool compressed = (data_flags & TSDB_FIELDDATA_FLAG_COMPRESSED) == 0;
   iter->is_compressed = compressed;
@@ -145,6 +151,12 @@ bool timeseries_points_iterator_init(
       free(record_buf);
       iter->valid = false;
       return false;
+    }
+
+    size_t columns_length = sizeof(col_hdr) + col_hdr.ts_len + col_hdr.val_len;
+    if (!tsdb_revision_decode(data_flags, record_buf + columns_length, record_length - columns_length,
+                               record_count, &iter->revisions)) {
+      free(record_buf); iter->valid = false; return false;
     }
 
     // Pointers into the single buffer
@@ -394,6 +406,25 @@ bool timeseries_points_iterator_init(
       return false;
     }
 
+    // Same subtraction-based bound as the compressed path: ts_len/val_len are
+    // uint32 read from flash, and additive forms can wrap for a corrupt record,
+    // letting val_offset point at unrelated flash.
+    if (record_length < sizeof(uc_hdr) ||
+        uc_hdr.ts_len > record_length - (uint32_t)sizeof(uc_hdr) ||
+        uc_hdr.val_len > record_length - (uint32_t)sizeof(uc_hdr) - uc_hdr.ts_len) {
+      ESP_LOGE(TAG, "Uncompressed column data extends out of record");
+      iter->valid = false;
+      return false;
+    }
+
+    uint32_t columns_length = sizeof(uc_hdr) + uc_hdr.ts_len + uc_hdr.val_len;
+    if (cached_revision && iter->has_revision && (data_flags & TSDB_FIELDDATA_FLAG_REVISION_VECTOR)) {
+      if (record_length - columns_length != sizeof(uint64_t)) { iter->valid = false; return false; }
+      iter->revisions.value = *cached_revision;
+    } else if (!tsdb_revision_read(db, record_data_offset, record_length, columns_length,
+                                    record_count, data_flags, &iter->revisions)) {
+      iter->valid = false; return false;
+    }
     uint32_t ts_size = record_count * sizeof(uint64_t);
     if (uc_hdr.ts_len != ts_size ||
         uc_hdr.ts_len > record_length - (uint32_t)sizeof(uc_hdr) ||
@@ -420,6 +451,34 @@ bool timeseries_points_iterator_init(
       iter->ts_array = NULL;
       iter->valid = false;
       return false;
+    }
+
+    // Use decoded timestamps to trim fixed-width columns before reading
+    // values. Validate the ORIGINAL column length before narrowing it.
+    if ((start_ms || end_ms) && series_type != TIMESERIES_FIELD_TYPE_STRING) {
+      uint32_t width;
+      switch (series_type) {
+        case TIMESERIES_FIELD_TYPE_INT:
+        case TIMESERIES_FIELD_TYPE_FLOAT: width = 8; break;
+        case TIMESERIES_FIELD_TYPE_BOOL: width = 1; break;
+        default:
+          timeseries_points_iterator_deinit(iter);
+          return false;
+      }
+      if (uc_hdr.val_len < (uint32_t)record_count * width) {
+        timeseries_points_iterator_deinit(iter);
+        return false;
+      }
+      timeseries_points_iterator_set_time_range(iter, start_ms, end_ms);
+      uint16_t first = iter->current_idx;
+      iter->revision_first = first;
+      record_count = iter->ts_count - first;
+      memmove(iter->ts_array, iter->ts_array + first, record_count * sizeof(uint64_t));
+      iter->current_idx = 0;
+      iter->ts_count = record_count;
+      val_offset += (uint32_t)first * width;
+      uc_hdr.val_len = (uint32_t)record_count * width;
+      if (record_count == 0) return true;
     }
 
     // B) Allocate and read values directly from flash
@@ -541,7 +600,11 @@ bool timeseries_points_iterator_init(
 
         // Allocate and copy the string data
         if (str_len > 0) {
-          if (offset + str_len > uc_hdr.val_len) {
+          // Subtraction form: offset <= val_len holds here (the length-word
+          // check above just passed), so this cannot wrap the way the
+          // additive form could for a corrupt str_len near UINT32_MAX.
+          if (str_len > uc_hdr.val_len - offset ||
+              str_len > TSDB_STRING_MAX_LEN) {
             ESP_LOGE(TAG, "Value buffer too small for string data at i=%zu", i);
             iter->valid = false;
             break;
@@ -600,6 +663,32 @@ bool timeseries_points_iterator_init(
   }
 
   return iter->valid;
+}
+
+bool timeseries_points_iterator_init_range_with_revision(
+    timeseries_db_t *db, uint32_t offset, uint32_t length, uint16_t count,
+    timeseries_field_type_e type, uint8_t flags, timeseries_points_iterator_t *iter,
+    uint64_t start_ms, uint64_t end_ms, const uint64_t *cached_revision) {
+  if (!points_iterator_init_impl(db, offset, length, count, type, flags, iter, start_ms, end_ms, cached_revision)) {
+    if (iter && db && db->partition) { free(iter->revisions.values); iter->revisions.values = NULL; }
+    return false;
+  }
+  if (start_ms || end_ms) timeseries_points_iterator_set_time_range(iter, start_ms, end_ms);
+  return true;
+}
+
+bool timeseries_points_iterator_init_range(
+    timeseries_db_t *db, uint32_t offset, uint32_t length, uint16_t count,
+    timeseries_field_type_e type, uint8_t flags, timeseries_points_iterator_t *iter,
+    uint64_t start_ms, uint64_t end_ms) {
+  return timeseries_points_iterator_init_range_with_revision(db, offset, length, count, type,
+                                                             flags, iter, start_ms, end_ms, NULL);
+}
+
+bool timeseries_points_iterator_init(
+    timeseries_db_t *db, uint32_t offset, uint32_t length, uint16_t count,
+    timeseries_field_type_e type, uint8_t flags, timeseries_points_iterator_t *iter) {
+  return timeseries_points_iterator_init_range(db, offset, length, count, type, flags, iter, 0, 0);
 }
 
 /* --------------------------------------------------------------------------
@@ -864,6 +953,8 @@ void timeseries_points_iterator_deinit(timeseries_points_iterator_t *iter) {
     return;
   }
 
+  free(iter->revisions.values);
+  iter->revisions.values = NULL;
   if (iter->alp_ts) {
     // ALP path: free decoded arrays
     free(iter->alp_ts);
@@ -907,29 +998,14 @@ void timeseries_points_iterator_deinit(timeseries_points_iterator_t *iter) {
       free(iter->ts_array);
       iter->ts_array = NULL;
     }
-    if (iter->float_array) {
-      free(iter->float_array);
-      iter->float_array = NULL;
+    // These pointers share a union. Freeing the scalar pointer first would
+    // clear string_array before its unconsumed strings could be released.
+    if (iter->series_type == TIMESERIES_FIELD_TYPE_STRING && iter->string_array) {
+      for (size_t i = 0; i < iter->string_array_count; i++)
+        free(iter->string_array[i].str);
     }
-    if (iter->int_array) {
-      free(iter->int_array);
-      iter->int_array = NULL;
-    }
-    if (iter->bool_array) {
-      free(iter->bool_array);
-      iter->bool_array = NULL;
-    }
-    if (iter->string_array) {
-      // Free each string allocation (use string_array_count, not ts_count,
-      // because set_time_range may have narrowed ts_count)
-      for (size_t i = 0; i < iter->string_array_count; i++) {
-        if (iter->string_array[i].str) {
-          free(iter->string_array[i].str);
-        }
-      }
-      free(iter->string_array);
-      iter->string_array = NULL;
-    }
+    free(iter->float_array);
+    iter->float_array = NULL;
   }
 
   memset(iter, 0, sizeof(*iter));

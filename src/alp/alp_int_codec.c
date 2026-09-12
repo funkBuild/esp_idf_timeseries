@@ -21,7 +21,7 @@ static uint8_t int_required_bw(int64_t min_val, int64_t max_val) {
  */
 __attribute__((optimize("O3")))
 static size_t encode_block_int(const int64_t *deltas, size_t count,
-                                uint8_t *out_buf) {
+                                uint8_t *out_buf, uint64_t **aligned_scratch) {
     /* Pass 1: find min and max */
     int64_t min_val = INT64_MAX, max_val = INT64_MIN;
     for (size_t i = 0; i < count; i++) {
@@ -39,8 +39,27 @@ static size_t encode_block_int(const int64_t *deltas, size_t count,
     memcpy(out_buf,     &bh0, 8);
     memcpy(out_buf + 8, &bh1, 8);
 
-    /* Pass 2: FFOR pack directly into output (always 8-byte aligned) */
-    alp_ffor_pack(deltas, count, min_val, bw, (uint64_t *)(out_buf + 16));
+    /* Pass 2: FFOR pack.
+     *
+     * out_buf + 16 is NOT 8-byte aligned: the stream header is 20 bytes and each block
+     * header is 16, so the packed area always lands on a 4-byte boundary. alp_ffor_pack
+     * dereferences uint64_t pointers directly, so packing straight into it is undefined
+     * behaviour -- UndefinedBehaviorSanitizer on the host build reports "store to
+     * misaligned address ... for type 'uint64_t'" at alp_ffor.h:41/59/73/76. The decoder
+     * below already gets this right and says so in its own comment; this path had a
+     * comment asserting the opposite. Pack through an aligned scratch and copy out,
+     * mirroring the decoder. The scratch is owned by the caller so this costs one
+     * allocation per encode, not one per block. */
+    if (((uintptr_t)(out_buf + 16) & 7u) != 0 && packed_words > 0) {
+        if (!*aligned_scratch) {
+            *aligned_scratch = (uint64_t *)malloc((ALP_INT_BLOCK_SIZE + 1) * sizeof(uint64_t));
+            if (!*aligned_scratch) return 0;   /* caller treats 0 as failure */
+        }
+        alp_ffor_pack(deltas, count, min_val, bw, *aligned_scratch);
+        memcpy(out_buf + 16, *aligned_scratch, packed_words * 8);
+    } else {
+        alp_ffor_pack(deltas, count, min_val, bw, (uint64_t *)(out_buf + 16));
+    }
 
     return 16 + packed_words * 8;
 }
@@ -70,7 +89,7 @@ size_t alp_encode_int(const int64_t *values, size_t count, uint8_t **out) {
     int64_t anchor = values[0];
     deltas[0] = 0; /* first delta is 0; anchor stored in stream header */
     for (size_t i = 1; i < count; i++) {
-        deltas[i] = values[i] - values[i - 1];
+        deltas[i] = alp_i64_sub(values[i], values[i - 1]);
     }
 
     /* Conservative upper bound per block:
@@ -94,16 +113,25 @@ size_t alp_encode_int(const int64_t *values, size_t count, uint8_t **out) {
     memcpy(p, &tail,   2); p += 2;
     memcpy(p, &anchor, 8); p += 8;
 
-    /* Encode each block of deltas */
+    /* Encode each block of deltas. aligned_scratch is allocated lazily by
+     * encode_block_int on the first misaligned block and reused for the rest. */
+    uint64_t *aligned_scratch = NULL;
     for (size_t b = 0; b < num_blocks; b++) {
         size_t offset = b * ALP_INT_BLOCK_SIZE;
         size_t bcount = ALP_INT_BLOCK_SIZE;
         if (offset + bcount > count) bcount = count - offset;
 
-        size_t written = encode_block_int(deltas + offset, bcount, p);
+        size_t written = encode_block_int(deltas + offset, bcount, p, &aligned_scratch);
+        if (written == 0) {          /* scratch allocation failed */
+            free(aligned_scratch);
+            free(deltas);
+            free(buf);
+            return 0;
+        }
         p += written;
     }
 
+    free(aligned_scratch);
     free(deltas);
 
     size_t total_bytes = (size_t)(p - buf);
@@ -212,9 +240,9 @@ bool alp_decode_int(const uint8_t * restrict data, size_t data_len,
      * out[0] is delta=0, so out[0] = anchor + 0 = anchor.
      * out[i] = out[i-1] + delta[i]. */
     if (out_idx > 0) {
-        out[0] += anchor;
+        out[0] = alp_i64_add(out[0], (uint64_t)anchor);
         for (size_t i = 1; i < out_idx; i++) {
-            out[i] += out[i - 1];
+            out[i] = alp_i64_add(out[i], (uint64_t)out[i - 1]);
         }
     }
 

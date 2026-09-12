@@ -18,10 +18,13 @@ TEST_CASE("initializes the timeseries db", "[esp_idf_timeseries]") {
 }
 
 TEST_CASE("clears the existing data", "[esp_idf_timeseries]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   TEST_ASSERT_TRUE(timeseries_clear_all());
 }
 
 TEST_CASE("query returns nothing with an empty db", "[esp_idf_timeseries]") {
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_TRUE(timeseries_clear_all());
   timeseries_query_t query;
   memset(&query, 0, sizeof(query));
 
@@ -49,7 +52,9 @@ TEST_CASE("query returns nothing with an empty db", "[esp_idf_timeseries]") {
   timeseries_query_free_result(&result);
 }
 
-TEST_CASE("Inserts a small amount of data", "[esp_idf_timeseries]") {
+static void insert_small_fixture(void) {
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_TRUE(timeseries_clear_all());
   const char *tags_keys[] = {"suburb", "city"};
   const char *tags_values[] = {"beldon", "perth"};
   size_t num_tags = 2;
@@ -102,7 +107,12 @@ TEST_CASE("Inserts a small amount of data", "[esp_idf_timeseries]") {
   TEST_ASSERT_TRUE(timeseries_insert(&insert_data1));
 }
 
+TEST_CASE("Inserts a small amount of data", "[esp_idf_timeseries]") {
+  insert_small_fixture();
+}
+
 TEST_CASE("Can query the data with no aggregation", "[esp_idf_timeseries]") {
+  insert_small_fixture();
   timeseries_query_t query;
   memset(&query, 0, sizeof(query));
 

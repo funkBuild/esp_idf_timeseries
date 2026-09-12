@@ -78,6 +78,13 @@ static bool read_word(Simple8bStreamDecoder *decoder, uint64_t *word) {
       ESP_LOGE(TAG, "Fill callback returned zero bytes");
       return false;
     }
+    /* Clamp to the space offered, as the other readers do. An over-reporting
+     * callback has already overrun `buffer` by the time we get here, but
+     * letting `got` exceed sizeof(buffer) also corrupts this loop's own
+     * accounting. */
+    if (filled > sizeof(buffer) - got) {
+      filled = sizeof(buffer) - got;
+    }
     got += filled;
   }
   memcpy(word, buffer, sizeof(buffer));

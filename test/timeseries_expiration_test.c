@@ -239,11 +239,14 @@ TEST_CASE("expiration: initialize database", "[expiration]") {
 }
 
 TEST_CASE("expiration: clear database before tests", "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   TEST_ASSERT_TRUE(timeseries_clear_all());
 }
 
 TEST_CASE("expiration: empty database - no expiration needed",
           "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_TRUE(timeseries_clear_all());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -259,6 +262,7 @@ TEST_CASE("expiration: empty database - no expiration needed",
 }
 
 TEST_CASE("expiration: invalid arguments rejected", "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -291,6 +295,7 @@ TEST_CASE("expiration: invalid arguments rejected", "[expiration]") {
 }
 
 TEST_CASE("expiration: below threshold - no expiration", "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -332,6 +337,7 @@ TEST_CASE("expiration: below threshold - no expiration", "[expiration]") {
 
 TEST_CASE("expiration: above threshold - oldest records deleted",
           "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -385,6 +391,7 @@ TEST_CASE("expiration: above threshold - oldest records deleted",
 }
 
 TEST_CASE("expiration: deletion marker handling", "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -436,6 +443,7 @@ TEST_CASE("expiration: deletion marker handling", "[expiration]") {
 
 TEST_CASE("expiration: multiple series with different timestamps",
           "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -497,6 +505,7 @@ TEST_CASE("expiration: multiple series with different timestamps",
 
 TEST_CASE("expiration: boundary condition - exactly at threshold",
           "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -561,6 +570,7 @@ TEST_CASE("expiration: boundary condition - exactly at threshold",
 
 TEST_CASE("expiration: reduction threshold controls amount deleted",
           "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -644,6 +654,7 @@ TEST_CASE("expiration: reduction threshold controls amount deleted",
 }
 
 TEST_CASE("expiration: storage reclamation verification", "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -702,6 +713,7 @@ TEST_CASE("expiration: storage reclamation verification", "[expiration]") {
 }
 
 TEST_CASE("expiration: max heap maintains 25 oldest records", "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -747,6 +759,7 @@ TEST_CASE("expiration: max heap maintains 25 oldest records", "[expiration]") {
 
 TEST_CASE("expiration: different field types handled correctly",
           "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -813,6 +826,7 @@ TEST_CASE("expiration: different field types handled correctly",
 
 TEST_CASE("expiration: zero byte target still deletes at least one record",
           "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -847,6 +861,7 @@ TEST_CASE("expiration: zero byte target still deletes at least one record",
 
 TEST_CASE("expiration: compaction is called for modified pages",
           "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -888,6 +903,7 @@ TEST_CASE("expiration: compaction is called for modified pages",
 
 TEST_CASE("expiration: consecutive runs handle remaining data correctly",
           "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
 
@@ -952,6 +968,7 @@ TEST_CASE("expiration: consecutive runs handle remaining data correctly",
 }
 
 TEST_CASE("expiration: final cleanup", "[expiration]") {
+  TEST_ASSERT_TRUE(timeseries_init());
   TEST_ASSERT_TRUE(timeseries_clear_all());
   ESP_LOGI(TAG, "All expiration tests completed successfully");
 }

@@ -54,6 +54,11 @@ static inline bool br_next_byte(BitReader *br, uint8_t *b) {
       return false;
     if (filled == 0)
       return false;
+    /* Clamp to what we actually offered. A fill callback that over-reports
+     * would otherwise push buf_size past sizeof(br->buffer) and every
+     * subsequent br->buffer[br->buf_byte] read past the 64-byte buffer. */
+    if (filled > sizeof(br->buffer))
+      filled = sizeof(br->buffer);
     br->buf_size = (int)filled;
     br->buf_byte = 0;
   }

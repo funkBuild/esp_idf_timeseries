@@ -97,6 +97,7 @@ TEST_CASE("page_stream_writer: write_value with NULL value", "[psw][null]") {
     bool result = timeseries_page_stream_writer_write_value(&writer, NULL);
     TEST_ASSERT_FALSE(result);
 
+    timeseries_page_stream_writer_abort(&writer);
     teardown_database();
 }
 

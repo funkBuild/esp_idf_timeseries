@@ -64,6 +64,10 @@ typedef struct {
   size_t record_capacity;
 } tsdb_series_descriptors_t;
 
+// Direct level/all-level/page-list helpers require one compactor per database. Concurrent
+// callers should use timeseries_compact(), timeseries_compact_sync(), or
+// timeseries_compact_force_sync(), which own the compaction-in-progress slot.
+
 /**
  * @brief Perform level-0 compaction of field data pages.
  *        Merges multiple single-value entries (seriesID + timestamp + fieldVal)

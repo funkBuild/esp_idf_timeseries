@@ -284,7 +284,7 @@ size_t alp_encode(const double *values, size_t count, uint8_t **out) {
     /* Compute deltas in-place (backward pass to avoid overwrite) */
     int64_t anchor = encoded[0];
     for (size_t i = count - 1; i > 0; i--) {
-        encoded[i] -= encoded[i - 1];
+        encoded[i] = alp_i64_sub(encoded[i], encoded[i - 1]);
     }
     encoded[0] = 0; /* first delta is 0; anchor stored in stream header */
 

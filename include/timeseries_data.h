@@ -12,6 +12,22 @@ typedef struct {
 
 _Static_assert(sizeof(timeseries_col_data_header_t) == 8, "unexpected padding in col_data_header");
 
+/* Reject values that cannot fit in one L0 record, before reserving flash. */
+bool tsdb_validate_point_values(const timeseries_field_value_t *values, size_t count);
+
+/* A borrowed-input ordering plan. NULL indices denotes an already ordered,
+ * unique batch. Otherwise indices selects the last input at each timestamp. */
+typedef struct {
+  size_t *indices;
+  size_t count;
+  size_t source_count;
+} tsdb_point_order_t;
+bool tsdb_point_order_init(const uint64_t *timestamps, size_t count, tsdb_point_order_t *order);
+void tsdb_point_order_deinit(tsdb_point_order_t *order);
+bool tsdb_append_ordered_points(timeseries_db_t *db, const unsigned char series_id[16],
+                                const uint64_t *timestamps, const timeseries_field_value_t *values,
+                                const tsdb_point_order_t *order);
+
 bool tsdb_append_multiple_points(timeseries_db_t *db,
                                  const unsigned char series_id[16],
                                  const uint64_t *timestamps,

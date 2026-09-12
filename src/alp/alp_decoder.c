@@ -111,10 +111,10 @@ bool alp_decode(const uint8_t * restrict data, size_t data_len,
         /* Delta decode: prefix-sum with running carry across blocks.       */
         /* Track min/max for the int32 fast-path check below.               */
         /* ---------------------------------------------------------------- */
-        decoded_ints[0] += running;
+        decoded_ints[0] = alp_i64_add(decoded_ints[0], (uint64_t)running);
         int64_t blk_min = decoded_ints[0], blk_max = decoded_ints[0];
         for (size_t i = 1; i < block_count; i++) {
-            decoded_ints[i] += decoded_ints[i - 1];
+            decoded_ints[i] = alp_i64_add(decoded_ints[i], (uint64_t)decoded_ints[i - 1]);
             if (decoded_ints[i] < blk_min) blk_min = decoded_ints[i];
             if (decoded_ints[i] > blk_max) blk_max = decoded_ints[i];
         }

@@ -3,6 +3,19 @@
 #include <stddef.h>
 #include <string.h>
 
+/* Delta and frame arithmetic is modulo 2^64, including int64 endpoints. */
+static inline int64_t alp_i64_bits(uint64_t bits) {
+    int64_t value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+static inline int64_t alp_i64_add(int64_t a, uint64_t b) {
+    return alp_i64_bits((uint64_t)a + b);
+}
+static inline int64_t alp_i64_sub(int64_t a, int64_t b) {
+    return alp_i64_bits((uint64_t)a - (uint64_t)b);
+}
+
 /* Returns number of uint64_t words actually used in the packed stream.
  * Callers that allocate buffers for pack/unpack must add +1 word of headroom
  * because the generic path may read/write one word past the last full word
@@ -25,7 +38,7 @@ static inline void alp_ffor_pack(const int64_t *values, size_t count,
     if (bw == 0) return;
     if (bw == 64) {
         for (size_t i = 0; i < count; i++) {
-            out[i] = (uint64_t)(values[i] - base);
+            out[i] = ((uint64_t)values[i] - (uint64_t)base);
         }
         return;
     }
@@ -37,7 +50,7 @@ static inline void alp_ffor_pack(const int64_t *values, size_t count,
             size_t n_words = alp_ffor_buf_words(count, 1);
             memset(out, 0, n_words * 8);
             for (size_t i = 0; i < count; i++) {
-                uint64_t delta = (uint64_t)(values[i] - base) & 1ULL;
+                uint64_t delta = ((uint64_t)values[i] - (uint64_t)base) & 1ULL;
                 out[i >> 6] |= delta << (i & 63u);
             }
             return;
@@ -46,7 +59,7 @@ static inline void alp_ffor_pack(const int64_t *values, size_t count,
             size_t n_words = alp_ffor_buf_words(count, 2);
             memset(out, 0, n_words * 8);
             for (size_t i = 0; i < count; i++) {
-                uint64_t delta = (uint64_t)(values[i] - base) & 3ULL;
+                uint64_t delta = ((uint64_t)values[i] - (uint64_t)base) & 3ULL;
                 out[i >> 5] |= delta << ((i & 31u) * 2u);
             }
             return;
@@ -55,7 +68,7 @@ static inline void alp_ffor_pack(const int64_t *values, size_t count,
             size_t n_words = alp_ffor_buf_words(count, 4);
             memset(out, 0, n_words * 8);
             for (size_t i = 0; i < count; i++) {
-                uint64_t delta = (uint64_t)(values[i] - base) & 0xFULL;
+                uint64_t delta = ((uint64_t)values[i] - (uint64_t)base) & 0xFULL;
                 out[i >> 4] |= delta << ((i & 15u) * 4u);
             }
             return;
@@ -69,7 +82,7 @@ static inline void alp_ffor_pack(const int64_t *values, size_t count,
     size_t   word_idx = 0;
     unsigned bit_off  = 0;
     for (size_t i = 0; i < count; i++) {
-        uint64_t val = (uint64_t)(values[i] - base) & mask;
+        uint64_t val = ((uint64_t)values[i] - (uint64_t)base) & mask;
         out[word_idx] |= val << bit_off;
         unsigned new_off = bit_off + bw;
         if (new_off > 64) {
@@ -109,12 +122,12 @@ static inline void alp_ffor_unpack(const uint64_t *in, size_t count,
                 uint64_t w = *src++;
 #pragma GCC ivdep
                 for (unsigned b = 0; b < 64; b++, i++)
-                    out[i] = (int64_t)((w >> b) & 1u) + base;
+                    out[i] = alp_i64_add(base, ((w >> b) & 1u));
             }
             if (i < count) {
                 uint64_t w = *src;
                 for (; i < count; i++)
-                    out[i] = (int64_t)((w >> (i & 63u)) & 1u) + base;
+                    out[i] = alp_i64_add(base, ((w >> (i & 63u)) & 1u));
             }
             return;
         }
@@ -127,12 +140,12 @@ static inline void alp_ffor_unpack(const uint64_t *in, size_t count,
                 uint64_t w = *src++;
 #pragma GCC ivdep
                 for (unsigned b = 0; b < 64; b += 2, i++)
-                    out[i] = (int64_t)((w >> b) & 3u) + base;
+                    out[i] = alp_i64_add(base, ((w >> b) & 3u));
             }
             if (i < count) {
                 uint64_t w = *src;
                 for (; i < count; i++)
-                    out[i] = (int64_t)((w >> ((i & 31u) * 2u)) & 3u) + base;
+                    out[i] = alp_i64_add(base, ((w >> ((i & 31u) * 2u)) & 3u));
             }
             return;
         }
@@ -145,12 +158,12 @@ static inline void alp_ffor_unpack(const uint64_t *in, size_t count,
                 uint64_t w = *src++;
 #pragma GCC ivdep
                 for (unsigned b = 0; b < 64; b += 4, i++)
-                    out[i] = (int64_t)((w >> b) & 0xFu) + base;
+                    out[i] = alp_i64_add(base, ((w >> b) & 0xFu));
             }
             if (i < count) {
                 uint64_t w = *src;
                 for (; i < count; i++)
-                    out[i] = (int64_t)((w >> ((i & 15u) * 4u)) & 0xFu) + base;
+                    out[i] = alp_i64_add(base, ((w >> ((i & 15u) * 4u)) & 0xFu));
             }
             return;
         }
@@ -160,7 +173,7 @@ static inline void alp_ffor_unpack(const uint64_t *in, size_t count,
             const uint8_t *bytes = (const uint8_t *)in;
 #pragma GCC ivdep
             for (size_t i = 0; i < count; i++)
-                out[i] = (int64_t)bytes[i] + base;
+                out[i] = alp_i64_add(base, bytes[i]);
             return;
         }
 
@@ -169,7 +182,7 @@ static inline void alp_ffor_unpack(const uint64_t *in, size_t count,
             const uint16_t *shorts = (const uint16_t *)in;
 #pragma GCC ivdep
             for (size_t i = 0; i < count; i++)
-                out[i] = (int64_t)shorts[i] + base;
+                out[i] = alp_i64_add(base, shorts[i]);
             return;
         }
 
@@ -178,13 +191,13 @@ static inline void alp_ffor_unpack(const uint64_t *in, size_t count,
             const uint32_t *words = (const uint32_t *)in;
 #pragma GCC ivdep
             for (size_t i = 0; i < count; i++)
-                out[i] = (int64_t)words[i] + base;
+                out[i] = alp_i64_add(base, words[i]);
             return;
         }
 
         case 64:
 #pragma GCC ivdep
-            for (size_t i = 0; i < count; i++) out[i] = (int64_t)in[i] + base;
+            for (size_t i = 0; i < count; i++) out[i] = alp_i64_add(base, in[i]);
             return;
 
         default:
@@ -213,6 +226,6 @@ static inline void alp_ffor_unpack(const uint64_t *in, size_t count,
         } else {
             bit_off = new_off;
         }
-        out[i] = (int64_t)val + base;
+        out[i] = alp_i64_add(base, val);
     }
 }

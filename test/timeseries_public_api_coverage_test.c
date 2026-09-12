@@ -1150,10 +1150,10 @@ TEST_CASE("public_api: negative INT values aggregate correctly", "[public_api][a
     TEST_ASSERT_EQUAL_INT64(-25, r.columns[0].values[0].data.int_val);
     timeseries_query_free_result(&r);
 
-    // AVG: (-10 + -20 + 5) / 3 = -8.333... → (int64_t)(-8.333+0.5) = (int64_t)(-7.833) = -7
+    // AVG: (-10 + -20 + 5) / 3 = -8.333..., rounded to nearest = -8
     TEST_ASSERT_TRUE(query_agg("eneg", TSDB_AGGREGATION_AVG, 500, &r));
     TEST_ASSERT_EQUAL(1, r.num_points);
-    TEST_ASSERT_EQUAL_INT64(-7, r.columns[0].values[0].data.int_val);
+    TEST_ASSERT_EQUAL_INT64(-8, r.columns[0].values[0].data.int_val);
     timeseries_query_free_result(&r);
 }
 

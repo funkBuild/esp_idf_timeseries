@@ -260,7 +260,7 @@ typedef struct {
   struct {
     uint32_t offset, sequence, used;
     uint64_t min_time, max_time;
-  } l0_usage_cache[TSDB_L0_USAGE_CACHE_SIZE];
+  } *l0_usage_cache; // Optional heap cache; NULL uses authoritative page scans.
 
   // Last used L0 page/offset
   bool last_l0_cache_valid;

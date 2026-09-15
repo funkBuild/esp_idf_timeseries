@@ -212,7 +212,7 @@ bool timeseries_init(void) {
 
   if (!tsdb_revision_recover(&s_tsdb)) goto init_fail;
 
-  memset(s_tsdb.l0_usage_cache, 0, sizeof(s_tsdb.l0_usage_cache));
+  s_tsdb.l0_usage_cache = calloc(TSDB_L0_USAGE_CACHE_SIZE, sizeof(*s_tsdb.l0_usage_cache));
   s_tsdb.last_l0_cache_valid = false;
   s_tsdb.last_l0_page_offset = 0;
   s_tsdb.last_l0_used_offset = 0;
@@ -288,6 +288,8 @@ bool timeseries_init(void) {
   return true;
 
 init_fail:
+  free(s_tsdb.l0_usage_cache);
+  s_tsdb.l0_usage_cache = NULL;
   // Clean up any resources allocated during partial init
   if (s_tsdb.write_buffer) {
     free(s_tsdb.write_buffer);
@@ -717,6 +719,9 @@ void timeseries_deinit(void) {
     s_tsdb.meas_cache = NULL;
   }
 
+  free(s_tsdb.l0_usage_cache);
+  s_tsdb.l0_usage_cache = NULL;
+
   // Free type cache
   if (s_tsdb.type_cache) {
     free(s_tsdb.type_cache);
@@ -847,7 +852,8 @@ bool timeseries_clear_all(void) {
   tsdb_cache_clear(&s_tsdb);      // Clear series ID cache
   tsdb_clear_type_cache(&s_tsdb); // Clear series type cache
 
-  memset(s_tsdb.l0_usage_cache, 0, sizeof(s_tsdb.l0_usage_cache));
+  if (s_tsdb.l0_usage_cache)
+    memset(s_tsdb.l0_usage_cache, 0, TSDB_L0_USAGE_CACHE_SIZE * sizeof(*s_tsdb.l0_usage_cache));
 
   // Reset the last L0 cache
   s_tsdb.last_l0_cache_valid = false;

@@ -868,7 +868,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
     // A cached L0 used length also avoids reading the erased tail. The same
     // sequence check as the insert path rejects occupancy from recycled pages.
     size_t usage_slot = (page_offset / TIMESERIES_FIELD_DATA_PAGE_SIZE) % TSDB_L0_USAGE_CACHE_SIZE;
-    if (hdr.field_data_level == 0 && hdr.sequence_num != 0 &&
+    if (db->l0_usage_cache && hdr.field_data_level == 0 && hdr.sequence_num != 0 &&
         db->l0_usage_cache[usage_slot].offset == page_offset &&
         db->l0_usage_cache[usage_slot].sequence == hdr.sequence_num &&
         db->l0_usage_cache[usage_slot].used <= page_size) {
@@ -954,7 +954,7 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
       }
     } // end while fielddata_iterator
     if (fdata_iter.read_error) complete = false;
-    else if (hdr.field_data_level == 0 && hdr.sequence_num != 0) {
+    else if (db->l0_usage_cache && hdr.field_data_level == 0 && hdr.sequence_num != 0) {
       // Warm occupancy and time bounds even when the first access after boot
       // is a query. All record headers, including other series, were scanned.
       db->l0_usage_cache[usage_slot].offset = page_offset;

@@ -540,7 +540,7 @@ static bool find_level0_page_with_space(timeseries_db_t *db,
 
       size_t slot = l0_usage_slot(page_offset);
       uint32_t last_offset = sizeof(timeseries_page_header_t);
-      if (hdr.sequence_num != 0 && db->l0_usage_cache[slot].offset == page_offset &&
+      if (db->l0_usage_cache && hdr.sequence_num != 0 && db->l0_usage_cache[slot].offset == page_offset &&
           db->l0_usage_cache[slot].sequence == hdr.sequence_num) {
         last_offset = db->l0_usage_cache[slot].used;
       } else {
@@ -573,11 +573,13 @@ static bool find_level0_page_with_space(timeseries_db_t *db,
         bool read_error = f_iter.read_error;
         timeseries_fielddata_iterator_deinit(&f_iter);
         if (read_error) continue;
-        db->l0_usage_cache[slot].offset = page_offset;
-        db->l0_usage_cache[slot].sequence = hdr.sequence_num;
-        db->l0_usage_cache[slot].used = last_offset;
-        db->l0_usage_cache[slot].min_time = min_time;
-        db->l0_usage_cache[slot].max_time = max_time;
+        if (db->l0_usage_cache) {
+          db->l0_usage_cache[slot].offset = page_offset;
+          db->l0_usage_cache[slot].sequence = hdr.sequence_num;
+          db->l0_usage_cache[slot].used = last_offset;
+          db->l0_usage_cache[slot].min_time = min_time;
+          db->l0_usage_cache[slot].max_time = max_time;
+        }
       }
 
       uint32_t free_space = page_size - last_offset;
@@ -666,11 +668,13 @@ static bool create_level0_field_page(timeseries_db_t *db,
   db->last_l0_page_size = l0_size;
 
   size_t slot = l0_usage_slot(blank_offset);
-  db->l0_usage_cache[slot].offset = blank_offset;
-  db->l0_usage_cache[slot].sequence = new_hdr.sequence_num;
-  db->l0_usage_cache[slot].used = sizeof(timeseries_page_header_t);
-  db->l0_usage_cache[slot].min_time = UINT64_MAX;
-  db->l0_usage_cache[slot].max_time = 0;
+  if (db->l0_usage_cache) {
+    db->l0_usage_cache[slot].offset = blank_offset;
+    db->l0_usage_cache[slot].sequence = new_hdr.sequence_num;
+    db->l0_usage_cache[slot].used = sizeof(timeseries_page_header_t);
+    db->l0_usage_cache[slot].min_time = UINT64_MAX;
+    db->l0_usage_cache[slot].max_time = 0;
+  }
 
   // 5) Increment tracked L0 page count
   atomic_fetch_add(&db->l0_page_count, 1);
@@ -781,7 +785,7 @@ static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
   }
 
   size_t slot = l0_usage_slot(page_offset);
-  if (db->l0_usage_cache[slot].offset == page_offset) {
+  if (db->l0_usage_cache && db->l0_usage_cache[slot].offset == page_offset) {
     db->l0_usage_cache[slot].used = used_offset + sizeof(fhdr) + fhdr.record_length;
     if (fhdr.start_time < db->l0_usage_cache[slot].min_time)
       db->l0_usage_cache[slot].min_time = fhdr.start_time;

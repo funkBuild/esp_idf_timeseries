@@ -11,8 +11,11 @@ import sys
 repo, here = map(Path, sys.argv[1:])
 project = repo / 'tools/host_test/esp_idf_timeseries_test_app/CMakeLists.txt'
 text = project.read_text()
+# Relative to the generated project, like gen_project.py's own paths, so the
+# tracked project never points at the checkout that last ran this script.
+overlay = '${CMAKE_CURRENT_LIST_DIR}/' + str(Path(__import__('os').path.relpath(here / 'linux_overlay', project.parent)))
 text = text.replace('set(EXTRA_COMPONENT_DIRS\n',
-                    f'set(EXTRA_COMPONENT_DIRS\n    "{here}/linux_overlay"\n')
+                    'set(EXTRA_COMPONENT_DIRS\n    "' + overlay + '"\n')
 text = text.replace('project(esp_idf_timeseries_linux_test)', '''
 # Linux has no chip MMU Kconfig; partition.c still needs the page-size constant.
 idf_build_set_property(COMPILE_DEFINITIONS "CONFIG_MMU_PAGE_SIZE=65536" APPEND)

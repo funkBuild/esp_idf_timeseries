@@ -212,7 +212,7 @@ TEST_CASE("api: get_fields NULL params", "[api][fields]") {
 // timeseries_get_tags_for_measurement
 // ============================================================================
 
-TEST_CASE("api: get_tags for measurement with no tags returns false",
+TEST_CASE("api: get_tags for measurement with no tags returns empty list",
           "[api][tags]") {
   clear_db();
 
@@ -221,9 +221,12 @@ TEST_CASE("api: get_tags for measurement with no tags returns false",
 
   tsdb_tag_pair_t *tags = NULL;
   size_t count = 0;
+  /* An untagged measurement is a successful lookup with zero pairs; callers
+   * (the HTTP API included) must not see it as a backend failure. */
   bool ok = timeseries_get_tags_for_measurement("no_tags", &tags, &count);
-  TEST_ASSERT_FALSE(ok);
+  TEST_ASSERT_TRUE(ok);
   TEST_ASSERT_EQUAL(0, count);
+  free(tags);
 }
 
 TEST_CASE("api: get_tags returns tags for measurement", "[api][tags]") {

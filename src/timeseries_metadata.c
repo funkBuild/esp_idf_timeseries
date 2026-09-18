@@ -1735,8 +1735,6 @@ bool tsdb_list_fields_for_measurement(timeseries_db_t* db, uint32_t measurement_
     return false;
   }
 
-  bool found_any = false;
-
   // 2) Scan each metadata page for FIELDLISTINDEX entries
   for (size_t p = 0; p < meta_count; p++) {
     uint32_t page_offset = meta_offsets[p];
@@ -1799,9 +1797,7 @@ bool tsdb_list_fields_for_measurement(timeseries_db_t* db, uint32_t measurement_
         uint32_t listed_meas_id = (uint32_t)strtoul(key_buf, NULL, 10);
         if (listed_meas_id == measurement_id) {
           // Add field_part to out_fields
-          if (tsdb_string_list_append_unique(out_fields, field_part)) {
-            found_any = true;
-          }
+          tsdb_string_list_append_unique(out_fields, field_part);
         }
       }
     }
@@ -1809,7 +1805,10 @@ bool tsdb_list_fields_for_measurement(timeseries_db_t* db, uint32_t measurement_
     timeseries_entity_iterator_deinit(&ent_iter);
   }
 
-  return found_any;
+  /* A measurement whose fields have all been deleted lists empty; that is a
+   * successful lookup, not a failure. Callers that need the distinction check
+   * out_fields->count. */
+  return true;
 }
 
 bool tsdb_find_all_series_ids_for_measurement(timeseries_db_t* db, uint32_t measurement_id,
@@ -2214,8 +2213,9 @@ bool timeseries_metadata_get_tags_for_measurement(timeseries_db_t* db, uint32_t 
   size_t capacity = 0;
   size_t count = 0;
   tsdb_tag_pair_t* tags = NULL;
+  bool oom = false;
 
-  for (size_t p = 0; p < meta_count; p++) {
+  for (size_t p = 0; p < meta_count && !oom; p++) {
     uint32_t page_offset = meta_offsets[p];
     uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
 
@@ -2282,6 +2282,7 @@ bool timeseries_metadata_get_tags_for_measurement(timeseries_db_t* db, uint32_t 
         tsdb_tag_pair_t* new_tags = realloc(tags, new_cap * sizeof(tsdb_tag_pair_t));
         if (!new_tags) {
           ESP_LOGE(TAG, "OOM growing tag pair array");
+          oom = true;
           break;
         }
         tags = new_tags;
@@ -2295,6 +2296,7 @@ bool timeseries_metadata_get_tags_for_measurement(timeseries_db_t* db, uint32_t 
         free(tags[count].key);
         free(tags[count].val);
         ESP_LOGE(TAG, "OOM duplicating tag strings");
+        oom = true;
         break;
       }
       count++;
@@ -2303,7 +2305,18 @@ bool timeseries_metadata_get_tags_for_measurement(timeseries_db_t* db, uint32_t 
     timeseries_entity_iterator_deinit(&ent_iter);
   }
 
+  if (oom) {
+    /* A partial list would silently drop tags, so report the failure. */
+    for (size_t i = 0; i < count; i++) {
+      free(tags[i].key);
+      free(tags[i].val);
+    }
+    free(tags);
+    return false;
+  }
+
+  /* A measurement with no tags is an empty list, not an error. */
   *out_tags = tags;
   *out_num_tags = count;
-  return (count > 0);
+  return true;
 }

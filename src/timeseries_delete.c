@@ -207,14 +207,45 @@ bool tsdb_series_delete(timeseries_db_t* db, timeseries_series_id_list_t* series
                                             series_to_delete, &deleted_count)) {
         success = false;
       }
-    } else if (hdr.page_type == TIMESERIES_PAGE_TYPE_METADATA) {
+    }
+  }
+  timeseries_page_cache_iterator_deinit(&page_iter);
+
+  // Metadata pages. Replacing a shared index entry can relocate another
+  // metadata page (tsdb_compact_metadata_page), which retires the offset this
+  // page snapshot holds for it, so after any relocation the pass restarts from
+  // a fresh snapshot. Re-processing a page is a no-op: its entries no longer
+  // reference the deleted series, so every restart follows real progress.
+  for (int pass = 0;; pass++) {
+    if (!timeseries_page_cache_iterator_init(db, &page_iter)) {
+      ESP_LOGE(TAG, "Failed to init page iterator");
+      return false;
+    }
+    const uint32_t gen_before = db->metadata_page_gen;
+    bool relocated = false;
+    while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &page_offset, &page_size)) {
+      if (hdr.page_type != TIMESERIES_PAGE_TYPE_METADATA) {
+        continue;
+      }
       if (!tsdb_mark_metadata_deleted_in_page(db, page_offset, page_size,
                                               series_to_delete)) {
         success = false;
       }
+      if (db->metadata_page_gen != gen_before) {
+        relocated = true;
+        break;
+      }
+    }
+    timeseries_page_cache_iterator_deinit(&page_iter);
+    if (!relocated) {
+      break;
+    }
+    if (pass >= 16) {
+      ESP_LOGE(TAG, "Metadata pages kept relocating during series delete");
+      success = false;
+      break;
     }
   }
-  timeseries_page_cache_iterator_deinit(&page_iter);
 
   int64_t end_time = esp_timer_get_time();
   ESP_LOGI(TAG, "Deleted %zu series records in %.3f ms", deleted_count, (end_time - start_time) / 1000.0);

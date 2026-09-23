@@ -285,6 +285,11 @@ typedef struct {
   uint32_t cached_metadata_offsets[4];  // Cache up to 4 metadata page offsets
   size_t cached_metadata_count;
   bool cached_metadata_valid;
+  // Incremented each time tsdb_compact_metadata_page moves a metadata page to
+  // a new region. After that, page/entry offsets captured before the
+  // compaction may name a retired page whose region can be reused. Protected
+  // by flash_write_mutex, like every metadata writer.
+  uint32_t metadata_page_gen;
 
   // Pre-allocated write buffer for chunks
   uint8_t *write_buffer;

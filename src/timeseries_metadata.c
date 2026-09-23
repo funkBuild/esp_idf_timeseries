@@ -44,6 +44,9 @@ static bool tsdb_find_metadata_pages(timeseries_db_t* db,
                                      size_t max_pages, size_t* found_count);
 
 // tsdb_soft_delete_entry is declared in timeseries_metadata.h (non-static)
+static bool tsdb_retire_replaced_entry(timeseries_db_t* db, uint32_t gen_before, uint32_t page_offset,
+                                       uint32_t entry_offset, timeseries_keytype_t key_type, const char* key_str,
+                                       const unsigned char* old_value, size_t old_value_len);
 
 static bool tsdb_create_new_index_entry(timeseries_db_t* db, uint32_t page_offset, timeseries_keytype_t key_type,
                                         const char* key_str, const unsigned char* series_ids, size_t series_ids_len);
@@ -514,13 +517,14 @@ bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, co
 
   // Limit batch size to keep stack usage bounded
   if (num_tags > 16) {
-    // Fall back to per-tag upsert for unusually large tag sets
+    // Fall back to per-tag upsert for unusually large tag sets. An upsert can
+    // relocate a metadata page, so the page list is re-read for every tag.
     uint32_t meta_offsets[4];
     size_t meta_count = 0;
-    if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
-      return false;
-    }
     for (size_t i = 0; i < num_tags; i++) {
+      if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
+        return false;
+      }
       char key_buf[128];
       int n = snprintf(key_buf, sizeof(key_buf), "%" PRIu32 ":%s:%s", measurement_id, tag_keys[i], tag_values[i]);
       if (n < 0 || (size_t)n >= sizeof(key_buf)) return false;
@@ -549,13 +553,17 @@ bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, co
 
   uint32_t meta_offsets[4];
   size_t meta_count = 0;
+  // Single scan: iterate each metadata page once, checking all pending tags.
+  // A replacement that relocates a metadata page retires meta_offsets[] and
+  // the page ent_iter walks, so the scan restarts from a fresh page list; the
+  // tag just replaced is already marked done, so at most num_tags restarts.
+rescan:
   if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
     ESP_LOGE(TAG, "No active metadata pages for tag indexing");
     free(tag_key_bufs);
     return false;
   }
 
-  // Single scan: iterate each metadata page once, checking all pending tags
   for (size_t p = 0; p < meta_count; p++) {
     // Check if all tags are done
     bool all_done = true;
@@ -627,6 +635,7 @@ bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, co
           memcpy(new_ids, all_series_ids, series_count * 16);
           memcpy(new_ids + series_count * 16, series_id, 16);
 
+          const uint32_t gen_before = db->metadata_page_gen;
           bool entry_created = tsdb_create_new_index_entry(
               db, meta_offsets[p], TIMESERIES_KEYTYPE_TAGINDEX,
               tag_key_bufs + t * 128, new_ids, new_size);
@@ -659,12 +668,19 @@ bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, co
             return false;
           }
 
-          if (!tsdb_soft_delete_entry(db, meta_offsets[p], ent_iter.current_entry_offset)) {
+          if (!tsdb_retire_replaced_entry(db, gen_before, meta_offsets[p], ent_iter.current_entry_offset,
+                                          TIMESERIES_KEYTYPE_TAGINDEX, tag_key_bufs + t * 128,
+                                          all_series_ids, series_count * 16)) {
             ESP_LOGE(TAG, "Failed to retire old tag-index entry after replacement");
             free(all_series_ids);
             timeseries_entity_iterator_deinit(&ent_iter);
             free(tag_key_bufs);
             return false;
+          }
+          if (db->metadata_page_gen != gen_before) {
+            free(all_series_ids);
+            timeseries_entity_iterator_deinit(&ent_iter);
+            goto rescan;
           }
         }
 
@@ -676,11 +692,15 @@ bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, co
     timeseries_entity_iterator_deinit(&ent_iter);
   }  // for each metadata page
 
-  // Create new entries for tags not found in any page
+  // Create new entries for tags not found in any page. Creating one can
+  // relocate a metadata page, so the page list is re-read for every tag.
   for (size_t t = 0; t < num_tags; t++) {
     if (tag_done[t]) continue;
 
     bool created = false;
+    if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
+      meta_count = 0;
+    }
     for (size_t p = 0; p < meta_count && !created; p++) {
       created = tsdb_create_new_index_entry(
           db, meta_offsets[p], TIMESERIES_KEYTYPE_TAGINDEX,
@@ -854,6 +874,7 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
     // Not ideal (duplicate data) but no data loss. Add new page to cache anyway.
     ESP_LOGW(TAG, "Failed reading old header for obsolete marking — both pages remain active");
     db->cached_metadata_valid = false;
+    db->metadata_page_gen++;
     if (out_new_offset) *out_new_offset = new_page_offset;
     return (uint32_t)deleted_data_size;
   }
@@ -864,6 +885,7 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
     ESP_LOGW(TAG, "Failed marking old page @0x%08" PRIx32 " obsolete — both pages remain active",
              page_offset);
     db->cached_metadata_valid = false;
+    db->metadata_page_gen++;
     if (out_new_offset) *out_new_offset = new_page_offset;
     return (uint32_t)deleted_data_size;
   }
@@ -871,8 +893,10 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
   // Phase 3: Update the page cache — add new page, remove old page
   tsdb_pagecache_remove_entry(db, page_offset);
 
-  // Invalidate the metadata page offset cache
+  // Invalidate the metadata page offset cache, and every page/entry offset a
+  // caller captured before this call (see tsdb_retire_replaced_entry).
   db->cached_metadata_valid = false;
+  db->metadata_page_gen++;
 
   ESP_LOGI(TAG, "Metadata page compaction: @0x%08" PRIx32 " -> @0x%08" PRIx32 ", reclaimed %zu bytes",
            page_offset, new_page_offset, deleted_data_size);
@@ -1071,6 +1095,76 @@ bool tsdb_soft_delete_entry(timeseries_db_t* db, uint32_t page_offset, uint32_t 
 
   ESP_LOGD(TAG, "Soft-deleted old tagindex entry at offset=0x%08" PRIx32, entry_addr);
   return true;
+}
+
+/**
+ * @brief Soft-delete the entry that a new index entry has just replaced.
+ *
+ * page_offset/entry_offset were captured before the replacement was written.
+ * If no metadata page was relocated since then (metadata_page_gen still equals
+ * gen_before), they are still valid and the entry is deleted in place.
+ * Otherwise the page may have been retired, and its region reused, by
+ * tsdb_compact_metadata_page. Compaction copied the old entry (still live at
+ * the time) into the new page, so every live entry with the same key_type,
+ * key and exact old value is looked up in the current metadata pages and
+ * soft-deleted there instead. The replacement has a different value, so it is
+ * never matched.
+ */
+static bool tsdb_retire_replaced_entry(timeseries_db_t* db, uint32_t gen_before, uint32_t page_offset,
+                                       uint32_t entry_offset, timeseries_keytype_t key_type, const char* key_str,
+                                       const unsigned char* old_value, size_t old_value_len) {
+  if (db->metadata_page_gen == gen_before) {
+    return tsdb_soft_delete_entry(db, page_offset, entry_offset);
+  }
+
+  size_t key_len = strlen(key_str);
+  if (key_len >= 128 || old_value_len > UINT16_MAX) {
+    return false;
+  }
+  uint32_t meta_offsets[4];
+  size_t meta_count = 0;
+  if (!tsdb_find_metadata_pages(db, meta_offsets, 4, &meta_count)) {
+    return false;
+  }
+  unsigned char* value_buf = malloc(old_value_len > 0 ? old_value_len : 1);
+  if (!value_buf) {
+    return false;
+  }
+
+  bool ok = true;
+  size_t retired = 0;
+  for (size_t p = 0; p < meta_count && ok; p++) {
+    timeseries_entity_iterator_t ent_iter;
+    if (!timeseries_entity_iterator_init(db, meta_offsets[p], TIMESERIES_METADATA_PAGE_SIZE, &ent_iter)) {
+      continue;
+    }
+    timeseries_entry_header_t e_hdr;
+    while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
+      if (e_hdr.key_type != key_type || e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID ||
+          e_hdr.key_len != key_len || e_hdr.value_len != old_value_len) {
+        continue;
+      }
+      char stored_key[128];
+      if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, stored_key, value_buf)) {
+        continue;
+      }
+      if (memcmp(stored_key, key_str, key_len) != 0 || memcmp(value_buf, old_value, old_value_len) != 0) {
+        continue;
+      }
+      if (!tsdb_soft_delete_entry(db, meta_offsets[p], ent_iter.current_entry_offset)) {
+        ok = false;
+        break;
+      }
+      retired++;
+    }
+    timeseries_entity_iterator_deinit(&ent_iter);
+  }
+  free(value_buf);
+
+  if (ok && retired == 0) {
+    ESP_LOGW(TAG, "Replaced entry '%s' not found after metadata page relocation", key_str);
+  }
+  return ok;
 }
 
 bool tsdb_replace_seriesid_list_entry(timeseries_db_t* db,
@@ -1432,6 +1526,7 @@ static bool tsdb_upsert_seriesid_list_entry(timeseries_db_t* db, timeseries_keyt
             memcpy(all_series_ids + series_count * 16, series_id, 16);
 
             // Create new entry with new_size - try same page first, then others
+            const uint32_t gen_before = db->metadata_page_gen;
             bool entry_created = tsdb_create_new_index_entry(db, page_offset, target_key_type, key_str, all_series_ids, new_size);
             if (!entry_created) {
               // Same page is full - try other pages
@@ -1459,8 +1554,9 @@ static bool tsdb_upsert_seriesid_list_entry(timeseries_db_t* db, timeseries_keyt
               }
             }
 
-            // Soft-delete the old entry
-            if (!tsdb_soft_delete_entry(db, page_offset, ent_iter.current_entry_offset)) {
+            // Soft-delete the old entry (the first series_count IDs are its value)
+            if (!tsdb_retire_replaced_entry(db, gen_before, page_offset, ent_iter.current_entry_offset,
+                                            target_key_type, key_str, all_series_ids, series_count * 16)) {
               ESP_LOGW(TAG, "Failed to soft-delete old entry: '%s'", key_str);
             }
             updated = true;

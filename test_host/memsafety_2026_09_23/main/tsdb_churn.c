@@ -246,6 +246,99 @@ static void admin_task(void* arg) {
   vTaskDelete(NULL);
 }
 
+/* Deterministic single-task phase (PROTO-TS-1). Every insert brings a new
+ * series (a new "node" tag value), so the shared tag and field-list index
+ * entries are rewritten on every insert and the metadata pages fill and get
+ * compacted in the middle of inserts. A field delete every 50 inserts runs the
+ * series-delete path, which rewrites shared index entries too. Afterwards the
+ * tag index must still find exactly the points written for every
+ * (measurement, grp) pair and for sampled node values: a replaced entry that
+ * was left live, or a new entry written into a retired page, shows up as a
+ * wrong count. The default of 160 inserts keeps the live metadata within the
+ * metadata pages the component uses; far larger runs make inserts fail for
+ * lack of metadata space, which is not this defect. Returns the number of
+ * failed checks (the first 10 are printed). */
+static int det_phase(unsigned inserts) {
+  static const char* dmeas[] = {"det0", "det1", "det2", "det3"};
+  static const char* dfields[] = {"a", "b"};
+  static const char* dgrp[] = {"g0", "g1", "g2"};
+  unsigned per[4][3];
+  memset(per, 0, sizeof per);
+  uint64_t ts = 1600000000000ULL;
+  int bad = 0;
+  for (unsigned i = 0; i < inserts; i++) {
+    char node[16];
+    snprintf(node, sizeof node, "n%u", i);
+    // Every 25th insert carries 17 tags, which takes the per-tag upsert path
+    // (more than 16 tags) instead of the batched tag scan.
+    const char* tk[17] = {"node", "grp", "k2", "k3", "k4", "k5", "k6", "k7", "k8",
+                          "k9", "k10", "k11", "k12", "k13", "k14", "k15", "k16"};
+    const char* tv[17] = {node, dgrp[i % 3], "v", "v", "v", "v", "v", "v", "v", "v", "v", "v", "v", "v", "v", "v", "v"};
+    timeseries_field_value_t fv[2];
+    fv[0].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    fv[0].data.float_val = (double)i;
+    fv[1].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    fv[1].data.float_val = (double)i / 2.0;
+    ts += 1000;
+    timeseries_insert_data_t d = {.measurement_name = dmeas[i % 4],
+                                  .tag_keys = tk,
+                                  .tag_values = tv,
+                                  .num_tags = (i % 25 == 0) ? 17 : 2,
+                                  .field_names = dfields,
+                                  .field_values = fv,
+                                  .num_fields = 2,
+                                  .timestamps_ms = &ts,
+                                  .num_points = 1};
+    if (!timeseries_insert(&d)) {
+      if (bad++ < 10) printf("det: insert %u failed\n", i);
+    } else {
+      per[i % 4][i % 3]++;
+    }
+    if (i % 50 == 49) timeseries_delete_measurement_and_field("det3", "b");
+  }
+  printf("det: inserts=%u flash writes=%u over-non-erased=%u\n", inserts, atomic_load(&s_writes),
+         atomic_load(&s_bad_writes));
+  for (unsigned m = 0; m < 3; m++) {
+    for (unsigned g = 0; g < 3; g++) {
+      const char* tk[1] = {"grp"};
+      const char* tv[1] = {dgrp[g]};
+      const char* qf[1] = {"a"};
+      timeseries_query_t q = {.measurement_name = dmeas[m], .tag_keys = tk, .tag_values = tv, .num_tags = 1,
+                              .field_names = qf, .num_fields = 1};
+      timeseries_query_result_t r;
+      memset(&r, 0, sizeof r);
+      size_t got = 0;
+      if (timeseries_query(&q, &r)) {
+        got = r.num_points;
+        timeseries_query_free_result(&r);
+      }
+      if (got != per[m][g]) {
+        if (bad++ < 10) printf("det: FAIL %s grp=%s points=%zu want=%u\n", dmeas[m], dgrp[g], got, per[m][g]);
+      }
+    }
+  }
+  for (unsigned i = 0; i < inserts; i += 7) {
+    if (i % 4 == 3) continue;  // det3 has field deletes
+    char node[16];
+    snprintf(node, sizeof node, "n%u", i);
+    const char* tk[1] = {"node"};
+    const char* tv[1] = {node};
+    timeseries_query_t q = {.measurement_name = dmeas[i % 4], .tag_keys = tk, .tag_values = tv, .num_tags = 1};
+    timeseries_query_result_t r;
+    memset(&r, 0, sizeof r);
+    size_t got = 0, cols = 0;
+    if (timeseries_query(&q, &r)) {
+      got = r.num_points;
+      cols = r.num_columns;
+      timeseries_query_free_result(&r);
+    }
+    if (got != 1 || cols != 2) {
+      if (bad++ < 10) printf("det: FAIL %s node=%s points=%zu columns=%zu want 1/2\n", dmeas[i % 4], node, got, cols);
+    }
+  }
+  return bad;
+}
+
 void app_main(void) {
   const char* e = getenv("CHURN_SEED");
   if (e) s_seed = (unsigned)strtoul(e, NULL, 0);
@@ -263,6 +356,19 @@ void app_main(void) {
     exit(2);
   }
   timeseries_clear_all();
+  e = getenv("CHURN_DET_INSERTS");
+  unsigned det_inserts = e ? (unsigned)strtoul(e, NULL, 0) : 160;
+  if (det_inserts) {
+    int det_bad = det_phase(det_inserts);
+    unsigned det_bad_writes = atomic_load(&s_bad_writes);
+    if (det_bad || det_bad_writes) {
+      printf("FAIL PROTO-TS-1 deterministic phase: %d failed checks, %u writes over non-erased flash\n", det_bad,
+             det_bad_writes);
+      exit(5);
+    }
+    printf("PASS deterministic phase: %u inserts\n", det_inserts);
+    timeseries_clear_all();
+  }
   printf("churn: seed=%u seconds=%d\n", s_seed, secs);
   unsigned mask = 31;
   e = getenv("CHURN_TASKS");  // bit0 hb, bit1 lua, bit2 query, bit3 meta, bit4 admin

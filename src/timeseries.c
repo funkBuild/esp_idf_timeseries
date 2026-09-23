@@ -863,8 +863,7 @@ bool timeseries_clear_all(void) {
   atomic_store(&s_tsdb.l0_page_count, 0);
 
   // Reset metadata page cache
-  s_tsdb.cached_metadata_valid = false;
-  s_tsdb.cached_metadata_count = 0;
+  tsdb_metadata_cache_invalidate(&s_tsdb);
 
   // Reset measurement ID cache
   if (s_tsdb.meas_cache) {
@@ -1053,7 +1052,7 @@ bool timeseries_delete_measurement(const char* measurement_name) {
     // Invalidate all caches that may reference the deleted measurement's data
     tsdb_cache_clear(&s_tsdb);        // Series ID cache
     tsdb_clear_type_cache(&s_tsdb);   // Series type cache
-    s_tsdb.cached_metadata_valid = false;  // Metadata page offset cache
+    tsdb_metadata_cache_invalidate(&s_tsdb);  // Metadata page offset cache
   }
   if (s_tsdb.flash_write_mutex) {
     xSemaphoreGive(s_tsdb.flash_write_mutex);
@@ -1076,7 +1075,7 @@ bool timeseries_delete_measurement_and_field(const char* measurement_name, const
     // Invalidate all caches that may reference the deleted field's data
     tsdb_cache_clear(&s_tsdb);        // Series ID cache
     tsdb_clear_type_cache(&s_tsdb);   // Series type cache
-    s_tsdb.cached_metadata_valid = false;  // Metadata page offset cache
+    tsdb_metadata_cache_invalidate(&s_tsdb);  // Metadata page offset cache
     // Invalidate measurement ID cache for this measurement
     if (s_tsdb.meas_cache) {
       for (int mc = 0; mc < MEAS_ID_CACHE_SIZE; mc++) {

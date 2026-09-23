@@ -383,8 +383,35 @@ tsdb_page_cache_snapshot_t *tsdb_pagecache_begin_batch(timeseries_db_t *db) {
   tsdb_page_cache_snapshot_t *current = tsdb_snapshot_acquire_current(db);
   tsdb_page_cache_snapshot_t *batch = tsdb_snapshot_clone(current);
   tsdb_snapshot_release(current);
+  if (!batch) {
+    return NULL;
+  }
 
+  // Remember what the batch started from (entries are sorted by offset), so
+  // the commit can tell a live removal from a page the batch added itself.
+  if (batch->count > 0) {
+    batch->base_offsets = malloc(batch->count * sizeof(*batch->base_offsets));
+    if (!batch->base_offsets) {
+      tsdb_snapshot_release(batch);
+      return NULL;
+    }
+    for (size_t i = 0; i < batch->count; i++) {
+      batch->base_offsets[i] = batch->entries[i].offset;
+    }
+    batch->base_count = batch->count;
+  }
   return batch;
+}
+
+static bool batch_base_contains(const tsdb_page_cache_snapshot_t *batch, uint32_t offset) {
+  size_t lo = 0, hi = batch->base_count;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (batch->base_offsets[mid] == offset) return true;
+    if (batch->base_offsets[mid] < offset) lo = mid + 1;
+    else hi = mid;
+  }
+  return false;
 }
 
 bool tsdb_pagecache_batch_reserve(tsdb_page_cache_snapshot_t *snap, size_t additional) {
@@ -494,6 +521,21 @@ bool tsdb_pagecache_commit_batch(timeseries_db_t *db, tsdb_page_cache_snapshot_t
   xSemaphoreTake(db->snapshot_mutex, portMAX_DELAY);
   tsdb_page_cache_snapshot_t *live = db->current_snapshot;
   if (live) {
+    // Pages removed from the live cache while the batch was open (for example
+    // a metadata page retired by an insert's metadata compaction) are still in
+    // the batch's copy. Drop them, or the commit would list them ACTIVE again
+    // while their flash region is already free for reuse.
+    size_t kept = 0;
+    for (size_t i = 0; i < batch->count; i++) {
+      uint32_t offset = batch->entries[i].offset;
+      size_t pos;
+      if (batch_base_contains(batch, offset) && !pagecache_find_index(live, offset, &pos)) {
+        continue;
+      }
+      batch->entries[kept++] = batch->entries[i];
+    }
+    batch->count = kept;
+
     for (size_t i = 0; i < live->count; i++) {
       uint32_t offset = live->entries[i].offset;
       bool removed = false;

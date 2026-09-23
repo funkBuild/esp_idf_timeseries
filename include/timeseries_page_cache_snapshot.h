@@ -24,6 +24,11 @@ typedef struct tsdb_page_cache_snapshot {
     uint32_t *removed_offsets;   // offsets removed during batch
     size_t removed_count;
     size_t removed_capacity;
+    // Sorted offsets the batch was cloned with (tsdb_pagecache_begin_batch).
+    // At commit, one of these that is no longer in the live cache was removed
+    // by a concurrent writer while the batch was open, and is dropped.
+    uint32_t *base_offsets;
+    size_t base_count;
 } tsdb_page_cache_snapshot_t;
 
 // Reader references pin immutable contents. With only the database reference,

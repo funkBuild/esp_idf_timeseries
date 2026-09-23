@@ -22,6 +22,10 @@
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "spi_flash_mmap.h"
+#include "freertos/semphr.h"
+#include "timeseries_internal.h"
+#include "timeseries_iterator.h"
+#include "timeseries_page_cache.h"
 
 /* Flash-integrity oracle (PROTO-TS-1). The linux esp_partition_write returns
  * ESP_ERR_FLASH_OP_FAIL when a write needs a 0->1 bit transition (a write over
@@ -36,6 +40,30 @@ esp_err_t __wrap_esp_partition_write(const esp_partition_t* p, size_t off, const
   atomic_fetch_add(&s_writes, 1);
   if (r == ESP_ERR_FLASH_OP_FAIL) atomic_fetch_add(&s_bad_writes, 1);
   return r;
+}
+
+/* PROTO-TS-1b hooks. tsdb_snapshot_acquire_current() hands us the db pointer;
+ * timeseries_page_cache_iterator_deinit() is where tsdb_find_metadata_pages()
+ * finishes scanning a page-cache snapshot, just before it publishes the scan
+ * as db->cached_metadata_offsets. When armed for one task, that task is
+ * parked there until the test lets it go. */
+static timeseries_db_t* _Atomic s_db;
+static TaskHandle_t _Atomic s_race_reader;
+static atomic_bool s_race_armed;
+static SemaphoreHandle_t s_race_scanned, s_race_resume, s_race_done;
+tsdb_page_cache_snapshot_t* __real_tsdb_snapshot_acquire_current(timeseries_db_t* db);
+tsdb_page_cache_snapshot_t* __wrap_tsdb_snapshot_acquire_current(timeseries_db_t* db) {
+  atomic_store(&s_db, db);
+  return __real_tsdb_snapshot_acquire_current(db);
+}
+void __real_timeseries_page_cache_iterator_deinit(timeseries_page_cache_iterator_t* iter);
+void __wrap_timeseries_page_cache_iterator_deinit(timeseries_page_cache_iterator_t* iter) {
+  if (atomic_load(&s_race_armed) && xTaskGetCurrentTaskHandle() == atomic_load(&s_race_reader)) {
+    atomic_store(&s_race_armed, false);
+    xSemaphoreGive(s_race_scanned);
+    xSemaphoreTake(s_race_resume, portMAX_DELAY);
+  }
+  __real_timeseries_page_cache_iterator_deinit(iter);
 }
 
 static atomic_bool s_stop;
@@ -339,6 +367,142 @@ static int det_phase(unsigned inserts) {
   return bad;
 }
 
+/* Deterministic PROTO-TS-1b phase, part 1: the background compaction publishes
+ * its private page-cache batch (cloned from the live cache when the batch
+ * began) with tsdb_pagecache_commit_batch(). A page that an insert removed
+ * from the live cache while the batch was open (a metadata page retired by a
+ * metadata compaction) must stay removed: if the commit brings it back, it is
+ * listed ACTIVE again while its flash region is free for reuse. Uses a dummy
+ * cache entry only; nothing is written to flash. Returns failed checks. */
+static int batch_phase(void) {
+  timeseries_db_t* db = atomic_load(&s_db);
+  if (!db) {
+    printf("batch: FAIL no db pointer captured\n");
+    return 1;
+  }
+  const uint32_t off = (uint32_t)db->partition->size - 8192;
+  timeseries_page_header_t h;
+  memset(&h, 0xFF, sizeof h);
+  h.magic_number = TIMESERIES_MAGIC_NUM;
+  h.page_type = TIMESERIES_PAGE_TYPE_METADATA;
+  h.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
+  h.sequence_num = 1;
+  h.page_size = 8192;
+  int bad = 0;
+  if (!tsdb_pagecache_add_entry(db, off, &h)) {
+    printf("batch: FAIL could not add the dummy page\n");
+    return 1;
+  }
+  tsdb_page_cache_snapshot_t* batch = tsdb_pagecache_begin_batch(db);
+  if (!batch) abort();
+  tsdb_pagecache_remove_entry(db, off);  // live removal while the batch is open
+  if (!tsdb_pagecache_commit_batch(db, batch)) {
+    printf("batch: FAIL commit failed\n");
+    bad++;
+  }
+  timeseries_page_cache_iterator_t it;
+  if (timeseries_page_cache_iterator_init(db, &it)) {
+    timeseries_page_header_t ph;
+    uint32_t po = 0, ps = 0;
+    while (timeseries_page_cache_iterator_next(&it, &ph, &po, &ps)) {
+      if (po == off) {
+        printf("batch: FAIL page @0x%05" PRIx32 " removed from the live cache is listed again after the batch commit\n",
+               off);
+        bad++;
+      }
+    }
+    timeseries_page_cache_iterator_deinit(&it);
+  }
+  tsdb_pagecache_remove_entry(db, off);
+  return bad;
+}
+
+static void race_reader_task(void* arg) {
+  (void)arg;
+  atomic_store(&s_race_reader, xTaskGetCurrentTaskHandle());
+  atomic_store(&s_race_armed, true);
+  char** ms = NULL;
+  size_t n = 0;
+  if (timeseries_get_measurements(&ms, &n)) {
+    for (size_t i = 0; i < n; i++) free(ms[i]);
+    free(ms);
+  }
+  atomic_store(&s_race_armed, false);
+  xSemaphoreGive(s_race_done);
+  vTaskDelete(NULL);
+}
+
+/* Deterministic PROTO-TS-1b phase: a metadata reader that does not hold
+ * flash_write_mutex (here timeseries_get_measurements; the insert type lookup,
+ * the other listings and the timestamp range behave the same) rescans the
+ * page cache for metadata pages. It is parked after the scan, before it
+ * publishes the page list. Meanwhile an insert compacts a metadata page, which
+ * retires a page the parked reader saw. When the reader resumes, the metadata
+ * offset cache must not name that retired page, or later index writes go into
+ * it (writes over reused flash, or lost index entries). Returns failed checks. */
+static int race_phase(void) {
+  s_race_scanned = xSemaphoreCreateBinary();
+  s_race_resume = xSemaphoreCreateBinary();
+  s_race_done = xSemaphoreCreateBinary();
+  if (!s_race_scanned || !s_race_resume || !s_race_done) abort();
+  int bad = 0;
+  // Leaves the metadata page-offset cache invalid, so the reader rescans.
+  timeseries_delete_measurement("race_none");
+  timeseries_db_t* db = atomic_load(&s_db);
+  if (!db) {
+    printf("race: FAIL no db pointer captured\n");
+    return 1;
+  }
+  xTaskCreate(race_reader_task, "race_rd", 32768, NULL, 1, NULL);
+  if (xSemaphoreTake(s_race_scanned, pdMS_TO_TICKS(10000)) != pdTRUE) {
+    printf("race: FAIL reader did not rescan the metadata page list\n");
+    atomic_store(&s_race_armed, false);
+    xSemaphoreTake(s_race_done, pdMS_TO_TICKS(10000));
+    return 1;
+  }
+  const uint32_t gen0 = db->metadata_page_gen;
+  uint64_t ts = 1500000000000ULL;
+  unsigned i;
+  for (i = 0; i < 3000 && db->metadata_page_gen == gen0; i++) {
+    char node[16];
+    snprintf(node, sizeof node, "r%u", i);
+    const char* tk[2] = {"node", "grp"};
+    const char* tv[2] = {node, (i & 1) ? "x" : "y"};
+    const char* fn[2] = {"a", "b"};
+    timeseries_field_value_t fv[2] = {{.type = TIMESERIES_FIELD_TYPE_FLOAT, .data.float_val = i},
+                                      {.type = TIMESERIES_FIELD_TYPE_FLOAT, .data.float_val = i}};
+    ts += 1000;
+    timeseries_insert_data_t d = {.measurement_name = "race", .tag_keys = tk, .tag_values = tv, .num_tags = 2,
+                                  .field_names = fn, .field_values = fv, .num_fields = 2,
+                                  .timestamps_ms = &ts, .num_points = 1};
+    timeseries_insert(&d);
+  }
+  if (db->metadata_page_gen == gen0) {
+    printf("race: FAIL no metadata page compaction after %u inserts\n", i);
+    bad++;
+  }
+  xSemaphoreGive(s_race_resume);
+  if (xSemaphoreTake(s_race_done, pdMS_TO_TICKS(10000)) != pdTRUE) {
+    printf("race: FAIL reader did not finish\n");
+    return bad + 1;
+  }
+  if (db->cached_metadata_valid) {
+    for (size_t k = 0; k < db->cached_metadata_count; k++) {
+      timeseries_page_header_t h;
+      uint32_t off = db->cached_metadata_offsets[k];
+      if (esp_partition_read(db->partition, off, &h, sizeof h) != ESP_OK ||
+          h.magic_number != TIMESERIES_MAGIC_NUM || h.page_type != TIMESERIES_PAGE_TYPE_METADATA ||
+          h.page_state != TIMESERIES_PAGE_STATE_ACTIVE) {
+        printf("race: FAIL metadata page cache names page @0x%05" PRIx32 " (state=%u), not an active metadata page\n",
+               off, (unsigned)h.page_state);
+        bad++;
+      }
+    }
+  }
+  printf("race: inserts=%u compaction_gen %" PRIu32 "->%" PRIu32 " failed=%d\n", i, gen0, db->metadata_page_gen, bad);
+  return bad;
+}
+
 void app_main(void) {
   const char* e = getenv("CHURN_SEED");
   if (e) s_seed = (unsigned)strtoul(e, NULL, 0);
@@ -356,6 +520,21 @@ void app_main(void) {
     exit(2);
   }
   timeseries_clear_all();
+  if (!getenv("CHURN_NO_RACE")) {
+    int batch_bad = batch_phase();
+    if (batch_bad) {
+      printf("FAIL PROTO-TS-1b batch phase: %d failed checks\n", batch_bad);
+      exit(6);
+    }
+    printf("PASS batch phase\n");
+    int race_bad = race_phase();
+    if (race_bad) {
+      printf("FAIL PROTO-TS-1b race phase: %d failed checks\n", race_bad);
+      exit(6);
+    }
+    printf("PASS race phase\n");
+    timeseries_clear_all();
+  }
   e = getenv("CHURN_DET_INSERTS");
   unsigned det_inserts = e ? (unsigned)strtoul(e, NULL, 0) : 160;
   if (det_inserts) {

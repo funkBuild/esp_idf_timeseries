@@ -873,7 +873,7 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
     // Old page is still ACTIVE, new page is also ACTIVE.
     // Not ideal (duplicate data) but no data loss. Add new page to cache anyway.
     ESP_LOGW(TAG, "Failed reading old header for obsolete marking — both pages remain active");
-    db->cached_metadata_valid = false;
+    tsdb_metadata_cache_invalidate(db);
     db->metadata_page_gen++;
     if (out_new_offset) *out_new_offset = new_page_offset;
     return (uint32_t)deleted_data_size;
@@ -884,7 +884,7 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
     // Same fallback: both pages active, no data loss.
     ESP_LOGW(TAG, "Failed marking old page @0x%08" PRIx32 " obsolete — both pages remain active",
              page_offset);
-    db->cached_metadata_valid = false;
+    tsdb_metadata_cache_invalidate(db);
     db->metadata_page_gen++;
     if (out_new_offset) *out_new_offset = new_page_offset;
     return (uint32_t)deleted_data_size;
@@ -895,7 +895,7 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
 
   // Invalidate the metadata page offset cache, and every page/entry offset a
   // caller captured before this call (see tsdb_retire_replaced_entry).
-  db->cached_metadata_valid = false;
+  tsdb_metadata_cache_invalidate(db);
   db->metadata_page_gen++;
 
   ESP_LOGI(TAG, "Metadata page compaction: @0x%08" PRIx32 " -> @0x%08" PRIx32 ", reclaimed %zu bytes",
@@ -908,9 +908,6 @@ static bool tsdb_create_empty_metadata_page(timeseries_db_t* db, uint32_t page_o
   if (!db) {
     return false;
   }
-
-  // Invalidate metadata page cache since we're creating a new page
-  db->cached_metadata_valid = false;
 
   ESP_LOGV(TAG, "Creating empty metadata page at offset=0x%08" PRIx32 "...", page_offset);
 
@@ -937,6 +934,8 @@ static bool tsdb_create_empty_metadata_page(timeseries_db_t* db, uint32_t page_o
     tsdb_release_reserved_region(db, page_offset, NULL);
     return false;
   }
+  // The new page is in the page cache now; drop the cached page list.
+  tsdb_metadata_cache_invalidate(db);
 
   ESP_LOGV(TAG, "Empty metadata page created at offset=0x%08" PRIx32 " size = %d", page_offset,
            TIMESERIES_METADATA_PAGE_SIZE);
@@ -1033,15 +1032,23 @@ static bool tsdb_find_metadata_pages(timeseries_db_t* db, uint32_t* out_offsets,
   }
   *found_count = 0;
 
-  // Check cache first
+  // The cache is shared with readers that do not hold flash_write_mutex, so
+  // it is read and written under snapshot_mutex.
+  if (db->snapshot_mutex) xSemaphoreTake(db->snapshot_mutex, portMAX_DELAY);
   if (db->cached_metadata_valid && db->cached_metadata_count > 0) {
     size_t copy_count = (db->cached_metadata_count < max_pages) ? db->cached_metadata_count : max_pages;
     for (size_t i = 0; i < copy_count; i++) {
       out_offsets[i] = db->cached_metadata_offsets[i];
     }
     *found_count = copy_count;
+    if (db->snapshot_mutex) xSemaphoreGive(db->snapshot_mutex);
     return true;
   }
+  // Read before the snapshot is taken below. If the page cache changes after
+  // that snapshot, the writer invalidates afterwards, the epoch moves on, and
+  // this (possibly stale) scan is not published.
+  const uint32_t epoch = db->cached_metadata_epoch;
+  if (db->snapshot_mutex) xSemaphoreGive(db->snapshot_mutex);
 
   // Cache miss - do full scan
   timeseries_page_cache_iterator_t page_iter;
@@ -1066,17 +1073,31 @@ static bool tsdb_find_metadata_pages(timeseries_db_t* db, uint32_t* out_offsets,
   }
   timeseries_page_cache_iterator_deinit(&page_iter);
 
-  // Update cache with results
+  // Update cache with results, unless it was invalidated since the scan began
   if (*found_count > 0) {
-    size_t cache_count = (*found_count < 4) ? *found_count : 4;
-    for (size_t i = 0; i < cache_count; i++) {
-      db->cached_metadata_offsets[i] = out_offsets[i];
+    if (db->snapshot_mutex) xSemaphoreTake(db->snapshot_mutex, portMAX_DELAY);
+    if (db->cached_metadata_epoch == epoch) {
+      size_t cache_count = (*found_count < 4) ? *found_count : 4;
+      for (size_t i = 0; i < cache_count; i++) {
+        db->cached_metadata_offsets[i] = out_offsets[i];
+      }
+      db->cached_metadata_count = cache_count;
+      db->cached_metadata_valid = true;
     }
-    db->cached_metadata_count = cache_count;
-    db->cached_metadata_valid = true;
+    if (db->snapshot_mutex) xSemaphoreGive(db->snapshot_mutex);
   }
 
   return (*found_count > 0);
+}
+
+void tsdb_metadata_cache_invalidate(timeseries_db_t* db) {
+  if (!db) {
+    return;
+  }
+  if (db->snapshot_mutex) xSemaphoreTake(db->snapshot_mutex, portMAX_DELAY);
+  db->cached_metadata_valid = false;
+  db->cached_metadata_epoch++;
+  if (db->snapshot_mutex) xSemaphoreGive(db->snapshot_mutex);
 }
 
 bool tsdb_soft_delete_entry(timeseries_db_t* db, uint32_t page_offset, uint32_t current_entry_offset) {

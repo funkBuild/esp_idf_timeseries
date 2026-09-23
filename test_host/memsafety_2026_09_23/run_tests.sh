@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # memsafety 2026-09-23 (PROTO): seeded multi-task churn of esp_idf_timeseries.
 # Usage: run_tests.sh [asan|tsan] ; env CHURN_SECONDS (default 60), CHURN_SEEDS
-# (default "1 2 3 4 5 6"), CHURN_TASKS (task bitmask, default 30, see below),
+# (default "1 2 3 4 5 6"), CHURN_TASKS (task bitmask, default 31 = all),
 # CHURN_DET_INSERTS (deterministic single-task
 # metadata phase run before each churn, default 160, 0 = skip), BUILD_ROOT
 # (default $TMPDIR or /tmp), TIMESERIES_AUDIT_SOURCE_DIR (build a saved copy of
@@ -33,11 +33,10 @@ export TSAN_OPTIONS="suppressions=$REPO/tools/host_test/tsan.supp:history_size=7
 RUNNER=()
 [ "$SAN" = tsan ] && RUNNER=(setarch "$(uname -m)" -R)
 rc=0
-# Default task mix: lua, query, meta and admin (bit0 "hb" off). A second
-# concurrent inserter (CHURN_TASKS=3 or 31) still produces writes over
-# non-erased flash after the PROTO-TS-1 fix; that is a separate cross-task
-# defect (a retired metadata page is handed out again) tracked on its own.
-export CHURN_TASKS="${CHURN_TASKS:-30}"
+# Default task mix: all five tasks (hb, lua, query, meta, admin). Each process
+# first runs the deterministic PROTO-TS-1b batch and race phases (CHURN_NO_RACE=1
+# skips both) and the deterministic PROTO-TS-1 phase, then the seeded churn.
+export CHURN_TASKS="${CHURN_TASKS:-31}"
 # The linux FreeRTOS port blocks SIGTERM, so a hung run is killed with SIGKILL
 # (-k) after the timeout's SIGTERM is ignored; it then counts as a failure.
 for seed in ${CHURN_SEEDS:-1 2 3 4 5 6}; do
@@ -45,7 +44,7 @@ for seed in ${CHURN_SEEDS:-1 2 3 4 5 6}; do
   ( cd "$wd" && CHURN_SEED=$seed CHURN_SECONDS=${CHURN_SECONDS:-60} timeout -k 10 $(( ${CHURN_SECONDS:-60} + 300 )) "${RUNNER[@]}" "$ELF" </dev/null >"$log" 2>&1 ) || { rc=1; echo "FAIL seed=$seed: process exited non-zero"; }
   # Sanitizer reports, verbatim
   grep -A40 -E "ERROR: AddressSanitizer|WARNING: ThreadSanitizer|runtime error:" "$log" | head -80
-  grep -E "^det:|^churn ops|^flash writes|^PASS|^FAIL" "$log"
+  grep -E "^batch:|^race:|^det:|^churn ops|^flash writes|^PASS|^FAIL" "$log"
   rm -rf "$wd"
 done
 exit $rc

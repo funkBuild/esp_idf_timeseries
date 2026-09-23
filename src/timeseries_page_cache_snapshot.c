@@ -97,6 +97,7 @@ void tsdb_snapshot_release(tsdb_page_cache_snapshot_t *snap) {
         // Refcount dropped to 0 -- free everything
         free(snap->entries);
         free(snap->removed_offsets);
+        free(snap->base_offsets);
         free(snap);
     }
 }

@@ -180,6 +180,15 @@ bool tsdb_find_all_series_ids_for_measurement(
 bool tsdb_soft_delete_entry(timeseries_db_t *db, uint32_t page_offset,
                             uint32_t current_entry_offset);
 
+/**
+ * @brief Drop the cached list of active metadata page offsets.
+ *
+ * Call after the page cache has been updated (a metadata page added, retired
+ * or removed), never before: a scan that started earlier is then refused
+ * when it tries to publish its list.
+ */
+void tsdb_metadata_cache_invalidate(timeseries_db_t *db);
+
 bool tsdb_replace_seriesid_list_entry(timeseries_db_t *db,
                                       uint32_t old_page_offset,
                                       uint32_t old_entry_offset,

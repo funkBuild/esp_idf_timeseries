@@ -11,6 +11,8 @@
  * by TSan. Exit 0 = no sanitizer report and every API call returned sanely.
  */
 #include <inttypes.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,6 +66,82 @@ void __wrap_timeseries_page_cache_iterator_deinit(timeseries_page_cache_iterator
     xSemaphoreTake(s_race_resume, portMAX_DELAY);
   }
   __real_timeseries_page_cache_iterator_deinit(iter);
+}
+
+/* PROTO-TS-1c (simulator artifact, not product code). The linux FreeRTOS port
+ * runs every task on a pthread and switches tasks from its SIGALRM tick
+ * handler, at any instruction. If the switched-out thread holds a
+ * process-wide lock that is not a FreeRTOS object, the next task that needs
+ * that lock blocks in the kernel, the scheduler never runs again, and the
+ * whole simulation stops. Two such locks were caught with gdb:
+ *  - glibc's thread-stack lock, held by the idle task in pthread_join()
+ *    (vPortCancelThread reaping a deleted task, outside a critical section)
+ *    while the next xTaskCreate() needed it in pthread_create();
+ *  - an ASan allocator size-class mutex, held by the idle task freeing a
+ *    deleted task's memory, while another task needed it in malloc().
+ * On the device FreeRTOS owns every lock, so this cannot happen there. Run
+ * these calls with all signals blocked, as the port does for pthread_create
+ * (vPortEnterCritical). The previous mask is restored, so a call made inside
+ * a critical section stays inside it. */
+#define SIG_GUARD_BEGIN     \
+  sigset_t sg_all_, sg_old_; \
+  sigfillset(&sg_all_);      \
+  pthread_sigmask(SIG_BLOCK, &sg_all_, &sg_old_)
+#define SIG_GUARD_END pthread_sigmask(SIG_SETMASK, &sg_old_, NULL)
+int __real_pthread_join(pthread_t thread, void** retval);
+int __wrap_pthread_join(pthread_t thread, void** retval) {
+  SIG_GUARD_BEGIN;
+  int rc = __real_pthread_join(thread, retval);
+  SIG_GUARD_END;
+  return rc;
+}
+void* __real_malloc(size_t n);
+void* __wrap_malloc(size_t n) {
+  SIG_GUARD_BEGIN;
+  void* p = __real_malloc(n);
+  SIG_GUARD_END;
+  return p;
+}
+void* __real_calloc(size_t n, size_t sz);
+void* __wrap_calloc(size_t n, size_t sz) {
+  SIG_GUARD_BEGIN;
+  void* p = __real_calloc(n, sz);
+  SIG_GUARD_END;
+  return p;
+}
+void* __real_realloc(void* ptr, size_t n);
+void* __wrap_realloc(void* ptr, size_t n) {
+  SIG_GUARD_BEGIN;
+  void* p = __real_realloc(ptr, n);
+  SIG_GUARD_END;
+  return p;
+}
+void* __real_aligned_alloc(size_t align, size_t n);
+void* __wrap_aligned_alloc(size_t align, size_t n) {
+  SIG_GUARD_BEGIN;
+  void* p = __real_aligned_alloc(align, n);
+  SIG_GUARD_END;
+  return p;
+}
+void __real_free(void* ptr);
+void __wrap_free(void* ptr) {
+  SIG_GUARD_BEGIN;
+  __real_free(ptr);
+  SIG_GUARD_END;
+}
+char* __real_strdup(const char* str);
+char* __wrap_strdup(const char* str) {
+  SIG_GUARD_BEGIN;
+  char* p = __real_strdup(str);
+  SIG_GUARD_END;
+  return p;
+}
+char* __real_strndup(const char* str, size_t n);
+char* __wrap_strndup(const char* str, size_t n) {
+  SIG_GUARD_BEGIN;
+  char* p = __real_strndup(str, n);
+  SIG_GUARD_END;
+  return p;
 }
 
 static atomic_bool s_stop;

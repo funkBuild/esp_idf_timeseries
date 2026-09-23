@@ -22,6 +22,6 @@ CFLAGS=(-std=gnu11 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -
         -I"$OUT" -I"$HERE/stubs" -I"$COMP/include" -I"$COMP/src")
 rc=0
 gcc "${CFLAGS[@]}" "$HERE/test_page_scan_audit.c" "$COMP/src/timeseries_page_cache.c" \
-    "$COMP/src/timeseries_page_cache_snapshot.c" -o "$OUT/test_page_scan_audit" || exit 2
+    "$COMP/src/timeseries_page_cache_snapshot.c" "$COMP/src/timeseries_epoch.c" -o "$OUT/test_page_scan_audit" || exit 2
 ASAN_OPTIONS=detect_leaks=0 "$OUT/test_page_scan_audit" || rc=1
 exit $rc

@@ -17,5 +17,8 @@ target_link_options(${COMPONENT_LIB} INTERFACE
 if(IDF_TARGET STREQUAL "linux")
     target_link_options(${COMPONENT_LIB} INTERFACE
         "-Wl,--wrap=timeseries_page_stream_writer_finalize_timestamp"
-        "-Wl,--wrap=timeseries_points_iterator_next_value" "-Wl,--wrap=tsdb_pagecache_batch_sort" "-Wl,--wrap=malloc" "-Wl,--wrap=realloc" "-Wl,--wrap=calloc" "-Wl,--wrap=esp_partition_read")
+        "-Wl,--wrap=timeseries_points_iterator_next_value" "-Wl,--wrap=tsdb_pagecache_batch_sort" "-Wl,--wrap=malloc" "-Wl,--wrap=realloc" "-Wl,--wrap=calloc" "-Wl,--wrap=esp_partition_read"
+        # Linux-simulator lock guards (timeseries_host_sim_guards.c)
+        "-Wl,--wrap=free" "-Wl,--wrap=pthread_join"
+        "-Wl,--wrap=esp_log_impl_lock" "-Wl,--wrap=esp_log_impl_lock_timeout" "-Wl,--wrap=esp_log_impl_unlock")
 endif()

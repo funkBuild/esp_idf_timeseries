@@ -1,3 +1,4 @@
+#include "timeseries_epoch.h"
 #include "timeseries_expiration.h"
 
 #include "esp_err.h"
@@ -107,7 +108,7 @@ static bool expire_oldest(timeseries_db_t *db, uint32_t bytes_to_free) {
   if (ok && count) {
     // Sort the candidate heap in place, before taking the insert lock.
     qsort(top25, count, sizeof(*top25), compare_fd_entries);
-    if (db->flash_write_mutex) xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+    if (db->flash_write_mutex) tsdb_write_lock(db);
     ok = mark_entries_deleted(db, top25, count, bytes_to_free, &modified);
     if (db->flash_write_mutex) xSemaphoreGive(db->flash_write_mutex);
     // Even a partially failed mark pass should reclaim successfully deleted records.

@@ -6,7 +6,7 @@
 # metadata phase run before each churn, default 160, 0 = skip), BUILD_ROOT
 # (default $TMPDIR or /tmp), TIMESERIES_AUDIT_SOURCE_DIR (build a saved copy of
 # the component's src/ + include/ instead, e.g. a pre-fix control).
-# Exit 0 = all seeds pass.
+# KEEP_FAILED_LOGS=<dir> keeps the full log of a failing seed. Exit 0 = all seeds pass.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../../.." && pwd)"
@@ -33,6 +33,9 @@ export TSAN_OPTIONS="suppressions=$REPO/tools/host_test/tsan.supp:history_size=7
 RUNNER=()
 [ "$SAN" = tsan ] && RUNNER=(setarch "$(uname -m)" -R)
 rc=0
+# Every process first runs the TSDB_REVIEW deterministic phases R1-R12
+# (tsdb_review_phases.c; CHURN_NO_REVIEW=1 skips them, REVIEW=<id> runs one
+# phase and exits). The churn ends with a data-correctness check (data:).
 # Default task mix: all five tasks (hb, lua, query, meta, admin). Each process
 # first runs the deterministic PROTO-TS-1b batch and race phases (CHURN_NO_RACE=1
 # skips both) and the deterministic PROTO-TS-1 phase, then the seeded churn.
@@ -41,10 +44,19 @@ export CHURN_TASKS="${CHURN_TASKS:-31}"
 # (-k) after the timeout's SIGTERM is ignored; it then counts as a failure.
 for seed in ${CHURN_SEEDS:-1 2 3 4 5 6}; do
   wd="$(mktemp -d)"; log="$wd/run.log"
-  ( cd "$wd" && CHURN_SEED=$seed CHURN_SECONDS=${CHURN_SECONDS:-60} timeout -k 10 $(( ${CHURN_SECONDS:-60} + 300 )) "${RUNNER[@]}" "$ELF" </dev/null >"$log" 2>&1 ) || { rc=1; echo "FAIL seed=$seed: process exited non-zero"; }
+  st=0
+  ( cd "$wd" && CHURN_SEED=$seed CHURN_SECONDS=${CHURN_SECONDS:-60} timeout -k 10 $(( ${CHURN_SECONDS:-60} + 300 )) "${RUNNER[@]}" "$ELF" </dev/null >"$log" 2>&1 ) || st=$?
+  if [ $st -ne 0 ]; then
+    rc=1; echo "FAIL seed=$seed: process exited with status $st (124/137 = timeout, hung)"
+    echo "--- last lines of the failed run ---"; grep -v "^progress" "$log" | tail -20
+    if [ -n "${KEEP_FAILED_LOGS:-}" ]; then
+      cp "$log" "$KEEP_FAILED_LOGS/run_${SAN}_seed$seed.log"
+      for f in tsdb_flash.bin tsdb_cache.txt; do [ -f "$wd/$f" ] && cp "$wd/$f" "$KEEP_FAILED_LOGS/${SAN}_seed${seed}_$f"; done
+    fi
+  fi
   # Sanitizer reports, verbatim
   grep -A40 -E "ERROR: AddressSanitizer|WARNING: ThreadSanitizer|runtime error:" "$log" | head -80
-  grep -E "^batch:|^race:|^det:|^churn ops|^flash writes|^PASS|^FAIL" "$log"
+  grep -E "^R[0-9]+:|^batch:|^race:|^det:|^data:|^review|^churn ops|^flash writes|^PASS|^FAIL" "$log"
   rm -rf "$wd"
 done
 exit $rc

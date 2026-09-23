@@ -111,15 +111,17 @@ TEST_CASE("twelfth: failed reservation leaves batch and live entries unchanged",
     tsdb_page_cache_snapshot_t *live=tsdb_snapshot_acquire_current(db);
     if(!reserved) {
       failures++;
-      stable &= offset==UINT32_MAX && size==UINT32_MAX && live->count==before->count && batch->count==before->count && !batch->removed_count;
+      // The batch is the compaction's journal: a failed reservation adds nothing to it.
+      stable &= offset==UINT32_MAX && size==UINT32_MAX && live->count==before->count && batch->count==0 && !batch->removed_count;
       if(live->count==before->count)stable &= !memcmp(live->entries,before->entries,before->count*sizeof(*before->entries));
-      if(batch->count==before->count)stable &= !memcmp(batch->entries,before->entries,before->count*sizeof(*before->entries));
     }
     tsdb_snapshot_release(live); tsdb_snapshot_release(batch); tsdb_snapshot_release(before);
     if(reserved)TEST_ASSERT_TRUE(tsdb_pagecache_remove_entry(db,offset));
   }
   atomic_store(&db->compaction_in_progress,false); timeseries_deinit();
-  TEST_ASSERT_GREATER_OR_EQUAL(3,failures); TEST_ASSERT_TRUE(stable);
+  // The journal is pre-sized when the batch begins, so the reservation's
+  // allocations are the live snapshot's copy-on-write (struct + entries).
+  TEST_ASSERT_GREATER_OR_EQUAL(2,failures); TEST_ASSERT_TRUE(stable);
 }
 #endif
 TEST_CASE("twelfth: zero-sized reservation is rejected without cache changes","[twelfth][twelfth_zero]") {

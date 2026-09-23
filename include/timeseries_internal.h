@@ -281,19 +281,31 @@ typedef struct {
   series_type_cache_entry_t *type_cache;
   size_t type_cache_size;
 
-  // Metadata page offset cache (Priority 1 optimization)
-  uint32_t cached_metadata_offsets[4];  // Cache up to 4 metadata page offsets
-  size_t cached_metadata_count;
-  bool cached_metadata_valid;
-  // Incremented by tsdb_metadata_cache_invalidate(). The three cached_metadata_*
-  // fields and this epoch are read and written under snapshot_mutex, because
-  // readers that do not hold flash_write_mutex refill the cache too.
-  uint32_t cached_metadata_epoch;
   // Incremented each time tsdb_compact_metadata_page moves a metadata page to
   // a new region. After that, page/entry offsets captured before the
   // compaction may name a retired page whose region can be reused. Protected
   // by flash_write_mutex, like every metadata writer.
   uint32_t metadata_page_gen;
+  // Schema generation: incremented under flash_write_mutex by every operation
+  // that removes metadata (measurement/field delete, clear_all). An insert
+  // that decided from the series-id / measurement caches without holding the
+  // mutex re-checks it under the mutex before each append, and restarts if it
+  // moved, so its points are never written for a series a delete has removed.
+  _Atomic uint32_t schema_gen;
+
+  // Epoch-based reclamation of flash regions (timeseries_epoch.h). Slots are
+  // internal DRAM (16 x 12 bytes); the retired-region table is PSRAM.
+#define TSDB_EPOCH_SLOTS 16
+  _Atomic uint32_t reclaim_epoch;
+  struct {
+    TaskHandle_t _Atomic owner;
+    _Atomic uint32_t epoch;
+    _Atomic bool idle;
+  } epoch_slots[TSDB_EPOCH_SLOTS];
+  struct tsdb_retired_region {
+    uint32_t offset, size, epoch;
+  } *retired;  // guarded by snapshot_mutex
+  size_t retired_count, retired_cap;
 
   // Pre-allocated write buffer for chunks
   uint8_t *write_buffer;

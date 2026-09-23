@@ -1,3 +1,4 @@
+#include "timeseries_epoch.h"
 #include "timeseries_query.h"
 #include "esp_timer.h"
 #include "timeseries_data.h"
@@ -18,9 +19,11 @@
 
 static const char *TAG = "timeseries_query";
 
-// Snapshots own headers, not flash bytes. Hold these locks only while this
-// query can still read flash; iterator next/deinit operate on owned RAM.
-// Lock order matches inserts: flash writes, then region allocation.
+// Snapshots own headers, not flash bytes. Hold flash_write_mutex only while
+// this query can still read flash (L0 pages are appended in place); iterator
+// next/deinit operate on owned RAM. The pages this query's snapshot lists
+// cannot be erased or reused while it runs (timeseries_epoch.h), so it does
+// not need to hold off region allocation.
 typedef struct {
   timeseries_db_t *db;
   bool held;
@@ -29,7 +32,6 @@ typedef struct {
 static void query_read_unlock(query_read_guard_t *guard) {
   if (!guard->held) return;
   guard->held = false;
-  if (guard->db->region_alloc_mutex) xSemaphoreGive(guard->db->region_alloc_mutex);
   if (guard->db->flash_write_mutex) xSemaphoreGive(guard->db->flash_write_mutex);
 }
 
@@ -159,8 +161,7 @@ bool timeseries_query_execute(timeseries_db_t *db,
   }
 
   query_read_guard_t guard = {.db = db, .held = true};
-  if (db->flash_write_mutex) xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
-  if (db->region_alloc_mutex) xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
+  if (db->flash_write_mutex) tsdb_write_lock(db);
 
   uint64_t start_time, end_time;
 

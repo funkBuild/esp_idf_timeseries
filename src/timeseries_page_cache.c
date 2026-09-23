@@ -1,6 +1,7 @@
 #include "timeseries_page_cache.h"
 #include "timeseries_iterator.h"
 #include "timeseries_page_cache_snapshot.h"
+#include "timeseries_epoch.h"
 
 #include "esp_log.h"
 #include <string.h>
@@ -164,7 +165,12 @@ static bool update_unshared(timeseries_db_t *db, uint32_t offset,
     bool found = pagecache_find_index(snap, offset, &index);
     if (!header) {
       *handled = true;
-      if (found) { erase_entry(snap, index); ok = true; }
+      if (found) {
+        // An older snapshot a reader still holds may list it.
+        tsdb_retire_region_locked(db, offset, snap->entries[index].header.page_size);
+        erase_entry(snap, index);
+        ok = true;
+      }
     } else if (found || snap->count < snap->capacity) {
       if (found) memcpy(&snap->entries[index].header, header, sizeof(*header));
       else insert_entry(snap, index, offset, header);
@@ -191,7 +197,10 @@ static bool publish_contended(timeseries_db_t *db, tsdb_page_cache_snapshot_t *c
   tsdb_page_cache_snapshot_t *old = db->current_snapshot;
   bool ok = snapshot_refresh_clone(clone, old, header ? 1 : 0);
   if (ok) ok = header ? tsdb_pagecache_batch_add(clone, offset, header) : remove_live_entry(clone, offset);
-  if (ok) db->current_snapshot = clone;
+  if (ok) {
+    tsdb_retire_diff_locked(db, old, clone);
+    db->current_snapshot = clone;
+  }
   xSemaphoreGive(db->snapshot_mutex);
   if (ok) tsdb_snapshot_release(old);
   else tsdb_snapshot_release(clone);
@@ -372,46 +381,21 @@ void tsdb_pagecache_clear(timeseries_db_t *db) {
 }
 
 // ---------------------------------------------------------------------------
-// Batch API (operates on a private mutable snapshot -- not shared)
+// Batch API: a compaction's journal of its own page-cache changes
 // ---------------------------------------------------------------------------
+//
+// A batch is private to one compaction. It records only what that compaction
+// intends: "set" entries (the pages it writes, kept sorted in entries[]) and
+// removals (removed_offsets[]: its source pages and the regions it gave up).
+// Per offset the last operation wins. At publication the journal is replayed
+// onto the live snapshot current at that moment, so nothing another task did
+// meanwhile can be lost or resurrected, and no merge rule is needed.
 
 tsdb_page_cache_snapshot_t *tsdb_pagecache_begin_batch(timeseries_db_t *db) {
   if (!db) {
     return NULL;
   }
-
-  tsdb_page_cache_snapshot_t *current = tsdb_snapshot_acquire_current(db);
-  tsdb_page_cache_snapshot_t *batch = tsdb_snapshot_clone(current);
-  tsdb_snapshot_release(current);
-  if (!batch) {
-    return NULL;
-  }
-
-  // Remember what the batch started from (entries are sorted by offset), so
-  // the commit can tell a live removal from a page the batch added itself.
-  if (batch->count > 0) {
-    batch->base_offsets = malloc(batch->count * sizeof(*batch->base_offsets));
-    if (!batch->base_offsets) {
-      tsdb_snapshot_release(batch);
-      return NULL;
-    }
-    for (size_t i = 0; i < batch->count; i++) {
-      batch->base_offsets[i] = batch->entries[i].offset;
-    }
-    batch->base_count = batch->count;
-  }
-  return batch;
-}
-
-static bool batch_base_contains(const tsdb_page_cache_snapshot_t *batch, uint32_t offset) {
-  size_t lo = 0, hi = batch->base_count;
-  while (lo < hi) {
-    size_t mid = lo + (hi - lo) / 2;
-    if (batch->base_offsets[mid] == offset) return true;
-    if (batch->base_offsets[mid] < offset) lo = mid + 1;
-    else hi = mid;
-  }
-  return false;
+  return tsdb_snapshot_create(8);
 }
 
 bool tsdb_pagecache_batch_reserve(tsdb_page_cache_snapshot_t *snap, size_t additional) {
@@ -427,6 +411,15 @@ bool tsdb_pagecache_batch_reserve(tsdb_page_cache_snapshot_t *snap, size_t addit
   snap->entries = entries;
   snap->capacity = capacity;
   return true;
+}
+
+static void forget_removal(tsdb_page_cache_snapshot_t *snap, uint32_t offset) {
+  for (size_t r = 0; r < snap->removed_count; r++) {
+    if (snap->removed_offsets[r] == offset) {
+      snap->removed_offsets[r] = snap->removed_offsets[--snap->removed_count];
+      return;
+    }
+  }
 }
 
 bool tsdb_pagecache_batch_add(tsdb_page_cache_snapshot_t *snap, uint32_t offset,
@@ -447,45 +440,35 @@ bool tsdb_pagecache_batch_add(tsdb_page_cache_snapshot_t *snap, uint32_t offset,
   if (!tsdb_pagecache_batch_reserve(snap, 1)) return false;
 
   insert_entry(snap, pos, offset, hdr);
+  // A journal that gave this region up and now uses it again keeps it.
+  forget_removal(snap, offset);
   return true;
 }
 
 bool tsdb_pagecache_batch_remove(tsdb_page_cache_snapshot_t *snap, uint32_t offset) {
-  if (!snap || !snap->entries) {
+  if (!snap) {
     return false;
   }
-
-  for (size_t i = 0; i < snap->count; i++) {
-    if (snap->entries[i].offset == offset) {
-      // Ensure removed_offsets has capacity BEFORE modifying entries,
-      // so OOM doesn't leave entries array in an inconsistent state
-      if (snap->removed_count == snap->removed_capacity) {
-        size_t newcap = (snap->removed_capacity == 0) ? 8 : snap->removed_capacity * 2;
-        uint32_t *newarr = realloc(snap->removed_offsets, newcap * sizeof(uint32_t));
-        if (!newarr) {
-          ESP_LOGE(TAG, "OOM tracking removed offset 0x%08" PRIx32 " - removal aborted", offset);
-          return false;
-        }
-        snap->removed_offsets = newarr;
-        snap->removed_capacity = newcap;
-      }
-
-      // Now safe to remove from entries
-      size_t remaining = snap->count - (i + 1);
-      if (remaining > 0) {
-        memmove(&snap->entries[i], &snap->entries[i + 1],
-                remaining * sizeof(snap->entries[i]));
-      }
-      snap->count--;
-
-      snap->removed_offsets[snap->removed_count++] = offset;
-
-      ESP_LOGV(TAG, "Batch removed page cache entry for offset=0x%08" PRIx32, offset);
-      return true;
-    }
+  for (size_t r = 0; r < snap->removed_count; r++) {
+    if (snap->removed_offsets[r] == offset) return true;
   }
-
-  return false;
+  // Grow the removal list BEFORE dropping any pending entry, so OOM leaves
+  // the journal unchanged.
+  if (snap->removed_count == snap->removed_capacity) {
+    size_t newcap = (snap->removed_capacity == 0) ? 8 : snap->removed_capacity * 2;
+    uint32_t *newarr = realloc(snap->removed_offsets, newcap * sizeof(uint32_t));
+    if (!newarr) {
+      ESP_LOGE(TAG, "OOM tracking removed offset 0x%08" PRIx32 " - removal aborted", offset);
+      return false;
+    }
+    snap->removed_offsets = newarr;
+    snap->removed_capacity = newcap;
+  }
+  size_t pos;
+  if (pagecache_find_index(snap, offset, &pos)) erase_entry(snap, pos);
+  snap->removed_offsets[snap->removed_count++] = offset;
+  ESP_LOGV(TAG, "Batch removed page cache entry for offset=0x%08" PRIx32, offset);
+  return true;
 }
 
 void tsdb_pagecache_batch_sort(tsdb_page_cache_snapshot_t *snap) {
@@ -509,58 +492,70 @@ void tsdb_pagecache_batch_sort(tsdb_page_cache_snapshot_t *snap) {
         page_offset_compare);
 }
 
-/**
- * Publish a private compaction batch together with concurrent live updates.
- * Serialize the in-memory merge with snapshot publication, not flash I/O.
- * This avoids retry copies and, crucially, never force-publishes a partial
- * merge after OOM. Both success and failure consume the caller's batch.
- */
+bool tsdb_pagecache_is_placeholder(const timeseries_page_header_t *hdr) {
+  return hdr && hdr->page_type == TSDB_PLACEHOLDER_PAGE_TYPE;
+}
+
+bool tsdb_pagecache_remove_placeholder(timeseries_db_t *db, uint32_t offset) {
+  tsdb_page_cache_snapshot_t *live = tsdb_snapshot_acquire_current(db);
+  size_t pos;
+  bool placeholder = live && pagecache_find_index(live, offset, &pos) &&
+                     tsdb_pagecache_is_placeholder(&live->entries[pos].header);
+  tsdb_snapshot_release(live);
+  return placeholder && tsdb_pagecache_remove_entry(db, offset);
+}
+
+tsdb_page_cache_snapshot_t *tsdb_pagecache_prepare_batch(const tsdb_page_cache_snapshot_t *base,
+                                                         const tsdb_page_cache_snapshot_t *batch,
+                                                         const uint32_t *also_remove, size_t also_remove_count,
+                                                         size_t spare) {
+  if (!batch) return NULL;
+  size_t maximum = SIZE_MAX / sizeof(timeseries_cached_page_t);
+  if (batch->count > maximum || spare > maximum - batch->count) return NULL;
+  tsdb_page_cache_snapshot_t *next = tsdb_snapshot_clone_with_room(base, batch->count + spare);
+  if (!next) return NULL;
+  size_t pos;
+  // A region the journal gave up is live, if at all, only as the journal's
+  // own reservation placeholder (its pages are published by this replay). If
+  // live lists anything else there, the region was released earlier and has
+  // since been allocated and published by another writer: leave that alone.
+  for (size_t r = 0; r < batch->removed_count; r++)
+    if (pagecache_find_index(next, batch->removed_offsets[r], &pos) &&
+        tsdb_pagecache_is_placeholder(&next->entries[pos].header))
+      erase_entry(next, pos);
+  for (size_t r = 0; r < also_remove_count; r++)
+    if (pagecache_find_index(next, also_remove[r], &pos)) erase_entry(next, pos);
+  for (size_t i = 0; i < batch->count; i++) {
+    // Room was reserved above, so this cannot allocate or fail.
+    (void)tsdb_pagecache_batch_add(next, batch->entries[i].offset, &batch->entries[i].header);
+  }
+  return next;
+}
+
+bool tsdb_pagecache_restore_entry(tsdb_page_cache_snapshot_t *next, const tsdb_page_cache_snapshot_t *base,
+                                  uint32_t offset) {
+  size_t pos;
+  if (!next || !base || !pagecache_find_index(base, offset, &pos)) return false;
+  return tsdb_pagecache_batch_add(next, offset, &base->entries[pos].header);
+}
+
 bool tsdb_pagecache_commit_batch(timeseries_db_t *db, tsdb_page_cache_snapshot_t *batch) {
   if (!db || !db->snapshot_mutex || !batch) return false;
-
-  xSemaphoreTake(db->snapshot_mutex, portMAX_DELAY);
-  tsdb_page_cache_snapshot_t *live = db->current_snapshot;
-  if (live) {
-    // Pages removed from the live cache while the batch was open (for example
-    // a metadata page retired by an insert's metadata compaction) are still in
-    // the batch's copy. Drop them, or the commit would list them ACTIVE again
-    // while their flash region is already free for reuse.
-    size_t kept = 0;
-    for (size_t i = 0; i < batch->count; i++) {
-      uint32_t offset = batch->entries[i].offset;
-      size_t pos;
-      if (batch_base_contains(batch, offset) && !pagecache_find_index(live, offset, &pos)) {
-        continue;
-      }
-      batch->entries[kept++] = batch->entries[i];
+  bool ok = false;
+  // Replay onto whatever is live; if it changed meanwhile, replay again. The
+  // allocation stays outside snapshot_mutex.
+  for (int attempt = 0; attempt < 10 && !ok; attempt++) {
+    tsdb_page_cache_snapshot_t *base = tsdb_snapshot_acquire_current(db);
+    tsdb_page_cache_snapshot_t *next = tsdb_pagecache_prepare_batch(base, batch, NULL, 0, 0);
+    if (!next) {
+      tsdb_snapshot_release(base);
+      ESP_LOGE(TAG, "OOM publishing compaction batch; keeping the live snapshot");
+      break;
     }
-    batch->count = kept;
-
-    for (size_t i = 0; i < live->count; i++) {
-      uint32_t offset = live->entries[i].offset;
-      bool removed = false;
-      for (size_t r = 0; r < batch->removed_count; r++) {
-        if (batch->removed_offsets[r] == offset) {
-          removed = true;
-          break;
-        }
-      }
-      if (removed) continue;
-
-      size_t pos;
-      if (pagecache_find_index(batch, offset, &pos)) {
-        if (live->entries[i].header.sequence_num > batch->entries[pos].header.sequence_num)
-          batch->entries[pos].header = live->entries[i].header;
-      } else if (!tsdb_pagecache_batch_add(batch, offset, &live->entries[i].header)) {
-        xSemaphoreGive(db->snapshot_mutex);
-        tsdb_snapshot_release(batch);
-        ESP_LOGE(TAG, "OOM merging compaction batch; keeping the live snapshot");
-        return false;
-      }
-    }
+    ok = tsdb_snapshot_compare_and_swap(db, base, next);
+    if (!ok) tsdb_snapshot_release(next);
+    tsdb_snapshot_release(base);
   }
-  db->current_snapshot = batch;
-  xSemaphoreGive(db->snapshot_mutex);
-  tsdb_snapshot_release(live);
-  return true;
+  tsdb_snapshot_release(batch);
+  return ok;
 }

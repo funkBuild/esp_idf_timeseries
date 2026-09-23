@@ -65,6 +65,19 @@ bool tsdb_lookup_series_type_cached(timeseries_db_t *db,
                                      const unsigned char series_id[16],
                                      timeseries_field_type_e *out_type);
 
+typedef enum {
+  TSDB_SERIES_TYPE_FOUND,   // *out_type is set
+  TSDB_SERIES_TYPE_ABSENT,  // every metadata page was read: the series has no type (deleted)
+  TSDB_SERIES_TYPE_UNKNOWN, // a metadata page could not be read or listed
+} tsdb_series_type_status_t;
+
+/**
+ * @brief As tsdb_lookup_series_type_cached, but tells "no such series" apart
+ *        from "could not read the metadata".
+ */
+tsdb_series_type_status_t tsdb_lookup_series_type_status(timeseries_db_t *db, const unsigned char series_id[16],
+                                                         timeseries_field_type_e *out_type);
+
 /**
  * @brief Clear the series type cache
  */
@@ -179,15 +192,6 @@ bool tsdb_find_all_series_ids_for_measurement(
  */
 bool tsdb_soft_delete_entry(timeseries_db_t *db, uint32_t page_offset,
                             uint32_t current_entry_offset);
-
-/**
- * @brief Drop the cached list of active metadata page offsets.
- *
- * Call after the page cache has been updated (a metadata page added, retired
- * or removed), never before: a scan that started earlier is then refused
- * when it tries to publish its list.
- */
-void tsdb_metadata_cache_invalidate(timeseries_db_t *db);
 
 bool tsdb_replace_seriesid_list_entry(timeseries_db_t *db,
                                       uint32_t old_page_offset,

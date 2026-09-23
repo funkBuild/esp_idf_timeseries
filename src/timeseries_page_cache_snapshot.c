@@ -1,4 +1,5 @@
 #include "timeseries_page_cache_snapshot.h"
+#include "timeseries_epoch.h"
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -97,7 +98,6 @@ void tsdb_snapshot_release(tsdb_page_cache_snapshot_t *snap) {
         // Refcount dropped to 0 -- free everything
         free(snap->entries);
         free(snap->removed_offsets);
-        free(snap->base_offsets);
         free(snap);
     }
 }
@@ -118,6 +118,7 @@ void tsdb_snapshot_swap(timeseries_db_t *db, tsdb_page_cache_snapshot_t *new_sna
     }
     xSemaphoreTake(db->snapshot_mutex, portMAX_DELAY);
     tsdb_page_cache_snapshot_t *old = db->current_snapshot;
+    tsdb_retire_diff_locked(db, old, new_snap);
     db->current_snapshot = new_snap;
     xSemaphoreGive(db->snapshot_mutex);
     tsdb_snapshot_release(old);
@@ -133,6 +134,7 @@ bool tsdb_snapshot_compare_and_swap(timeseries_db_t *db,
         return false;  // Someone else swapped - caller should retry
     }
     tsdb_page_cache_snapshot_t *old = db->current_snapshot;
+    tsdb_retire_diff_locked(db, old, new_snap);
     db->current_snapshot = new_snap;
     xSemaphoreGive(db->snapshot_mutex);
     tsdb_snapshot_release(old);

@@ -6,8 +6,12 @@
 #include "timeseries_points_iterator.h"
 #include "alp/alp_encoder.h"
 #include "alp/alp_int_codec.h"
+#include "esp_log.h"
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+
+static const char* TAG = "TimeseriesCompactionMerge";
 
 /* Descriptors scale with records; decoded storage is needed only for records
  * whose timestamp ranges overlap the current merge position. Raw records use
@@ -422,7 +426,16 @@ bool tsdb_compact_stream_records(timeseries_db_t* db, const tsdb_level_page_t* p
       }
       merge_record_t* r = &records[used];
       memcpy(r->series, h.series_id, 16);
-      if (!tsdb_lookup_series_type_cached(db, r->series, &r->type)) {
+      tsdb_series_type_status_t type_status = tsdb_lookup_series_type_status(db, r->series, &r->type);
+      if (type_status == TSDB_SERIES_TYPE_ABSENT) {
+        // No metadata describes this series any more (it was deleted while a
+        // record of it was in flight, before deletes were ordered against
+        // inserts and compaction). No query can reach it and it cannot be
+        // decoded; leave it out of the output instead of failing the level.
+        ESP_LOGW(TAG, "Dropping a record of a series with no metadata from page @0x%08" PRIx32, pages[p].offset);
+        continue;
+      }
+      if (type_status != TSDB_SERIES_TYPE_FOUND) {
         read_ok = false;
         break;
       }

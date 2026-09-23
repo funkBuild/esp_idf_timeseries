@@ -28,6 +28,14 @@ bool tsdb_append_ordered_points(timeseries_db_t *db, const unsigned char series_
                                 const uint64_t *timestamps, const timeseries_field_value_t *values,
                                 const tsdb_point_order_t *order);
 
+/* As tsdb_append_ordered_points, but when schema_gen is non-NULL, every time
+ * flash_write_mutex is taken the database schema generation must still equal
+ * *schema_gen; otherwise nothing more is written, *stale is set and false is
+ * returned (the caller restarts from its metadata lookups). */
+bool tsdb_append_ordered_points_checked(timeseries_db_t *db, const unsigned char series_id[16],
+                                        const uint64_t *timestamps, const timeseries_field_value_t *values,
+                                        const tsdb_point_order_t *order, const uint32_t *schema_gen,
+                                        bool *stale);
 bool tsdb_append_multiple_points(timeseries_db_t *db,
                                  const unsigned char series_id[16],
                                  const uint64_t *timestamps,
@@ -36,6 +44,11 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
 
 /**
  * @brief Reserve a blank region under the region_alloc_mutex.
+ *
+ * region_alloc_mutex is a leaf lock that serializes only the allocator (blank
+ * scan, erase, placeholder publication); callers may or may not hold
+ * flash_write_mutex. A region is blank only if it is neither live nor retired
+ * and still readable by an active operation (timeseries_epoch.h).
  *
  * Finds a blank region, erases it, and registers a placeholder header
  * in both the live and batch snapshots to prevent double-allocation.

@@ -112,6 +112,7 @@ bool timeseries_entity_iterator_init(timeseries_db_t* db, uint32_t page_offset, 
   // We do NOT set current_entry_offset here; we do it in next()
   ent_iter->current_entry_offset = 0;
   ent_iter->valid = true;
+  ent_iter->read_error = false;
 
   // Use esp_partition_read for all flash access (no mmap).
   // mmap creates a persistent flash cache mapping that can conflict with
@@ -159,6 +160,7 @@ bool timeseries_entity_iterator_next(timeseries_entity_iterator_t* ent_iter, tim
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed to read entity header @0x%08" PRIx32 " (err=0x%x)", curr_offset, err);
       ent_iter->valid = false;
+      ent_iter->read_error = true;
       return false;
     }
   }

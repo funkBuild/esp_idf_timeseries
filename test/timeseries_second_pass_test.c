@@ -154,18 +154,35 @@ bool tsdb_audit_decode_progress(void);
 
 void tsdb_audit_fail_malloc(size_t size);
 void tsdb_audit_fail_realloc(size_t size);
-static void check_commit_oom(bool fail_backup) {
+// The batch is a journal replayed onto the live cache at commit; building the
+// published snapshot (live + journal) is the commit's one allocation. When it
+// fails, the live cache, including the insert made while the batch was open,
+// must stay exactly as it was, with no journal entry half-applied.
+static void check_commit_oom(bool with_journal_entry) {
     reset_second();
     timeseries_db_t *db = timeseries_get_db_handle();
     tsdb_page_cache_snapshot_t *batch = tsdb_pagecache_begin_batch(db);
     TEST_ASSERT_NOT_NULL(batch);
+    uint32_t journal_offset = db->partition->size - 4096;
+    if (with_journal_entry) {
+        timeseries_page_header_t h; memset(&h, 0xFF, sizeof h);
+        h.magic_number = TIMESERIES_MAGIC_NUM; h.page_state = TIMESERIES_PAGE_STATE_ACTIVE; h.page_size = 4096;
+        TEST_ASSERT_TRUE(tsdb_pagecache_batch_add(batch, journal_offset, &h));
+    }
     uint64_t ts=1;
     timeseries_field_value_t val = {.type=TIMESERIES_FIELD_TYPE_INT, .data.int_val=42};
     TEST_ASSERT_TRUE(insert_second(&ts, &val, 1));
-    if (fail_backup) tsdb_audit_fail_malloc(batch->count * sizeof(timeseries_cached_page_t));
-    else tsdb_audit_fail_realloc(batch->capacity * 2 * sizeof(timeseries_cached_page_t));
-    tsdb_pagecache_commit_batch(db, batch);
+    tsdb_page_cache_snapshot_t *live = tsdb_snapshot_acquire_current(db);
+    size_t live_count = live->count;
+    tsdb_snapshot_release(live);
+    tsdb_audit_fail_malloc((live_count + batch->count) * sizeof(timeseries_cached_page_t));
+    bool committed = tsdb_pagecache_commit_batch(db, batch);
     tsdb_audit_fail_malloc(0); tsdb_audit_fail_realloc(0);
+    live = tsdb_snapshot_acquire_current(db);
+    bool unchanged = live->count == live_count;
+    tsdb_snapshot_release(live);
+    TEST_ASSERT_FALSE(committed); TEST_ASSERT_TRUE(unchanged);
+    (void)journal_offset;
     timeseries_query_t q = {.measurement_name="second"};
     timeseries_query_result_t r = {0};
     bool ok = timeseries_query(&q, &r);
@@ -175,11 +192,41 @@ static void check_commit_oom(bool fail_backup) {
     timeseries_deinit();
     TEST_ASSERT_TRUE(ok); TEST_ASSERT_EQUAL(1, points); TEST_ASSERT_EQUAL_INT64(42, value);
 }
+// A compaction that gives a region back (released reservation) records that
+// in its journal. If another writer is then given the same region and
+// publishes a page there before the compaction publishes, publication must
+// leave that page alone: the journal's removal was of its own placeholder.
+TEST_CASE("second: a region the compaction gave up and another writer reused survives publication",
+          "[second][second_reused_region]") {
+    reset_second();
+    timeseries_db_t *db = timeseries_get_db_handle();
+    tsdb_page_cache_snapshot_t *batch = tsdb_pagecache_begin_batch(db);
+    TEST_ASSERT_NOT_NULL(batch);
+    uint32_t given_up, reused, size;
+    TEST_ASSERT_TRUE(tsdb_reserve_blank_region(db, 4096, batch, &given_up, &size));
+    tsdb_release_reserved_region(db, given_up, batch);
+    TEST_ASSERT_TRUE(tsdb_reserve_blank_region(db, 4096, NULL, &reused, &size));
+    timeseries_page_header_t h; memset(&h, 0xFF, sizeof h);
+    h.magic_number = TIMESERIES_MAGIC_NUM; h.page_type = TIMESERIES_PAGE_TYPE_FIELD_DATA;
+    h.page_state = TIMESERIES_PAGE_STATE_ACTIVE; h.field_data_level = 0; h.sequence_num = 7; h.page_size = 4096;
+    TEST_ASSERT_TRUE(tsdb_finalize_reserved_region(db, reused, &h, NULL));
+    TEST_ASSERT_TRUE(tsdb_pagecache_commit_batch(db, batch));
+    tsdb_page_cache_snapshot_t *live = tsdb_snapshot_acquire_current(db);
+    bool kept = false;
+    for (size_t i = 0; i < live->count; i++)
+        kept |= live->entries[i].offset == reused && live->entries[i].header.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA;
+    tsdb_snapshot_release(live);
+    tsdb_release_reserved_region(db, reused, NULL);
+    timeseries_deinit();
+    TEST_ASSERT_EQUAL_HEX32(given_up, reused);  // the scenario needs the same region
+    TEST_ASSERT_TRUE(kept);
+}
+
 TEST_CASE("second: compaction commit backup OOM preserves concurrent inserts", "[second][second_commit_backup]") {
-    check_commit_oom(true);
+    check_commit_oom(false);
 }
 TEST_CASE("second: compaction commit merge OOM preserves concurrent inserts", "[second][second_commit_merge]") {
-    check_commit_oom(false);
+    check_commit_oom(true);
 }
 
 typedef struct { SemaphoreHandle_t done; bool ok; bool compact; } progress_t;
@@ -250,9 +297,16 @@ TEST_CASE("second: compaction allocation failure leaves sources writable", "[sec
         TEST_ASSERT_TRUE(insert_second(ts, vals, 500));
     }
     free(ts); free(vals);
-    tsdb_audit_fail_realloc(4 * sizeof(uint32_t)); // four source-page removal slots
+    // Publication builds the next snapshot (live + the journal's one output +
+    // room to put back all four sources) in one allocation, before any source
+    // changes on flash. Live then holds the pages above plus the output's
+    // placeholder.
+    tsdb_page_cache_snapshot_t *live = tsdb_snapshot_acquire_current(db);
+    size_t live_pages = live->count;
+    tsdb_snapshot_release(live);
+    tsdb_audit_fail_malloc((live_pages + 1 + 1 + 4) * sizeof(timeseries_cached_page_t));
     bool compacted = timeseries_compact_level0_pages(db);
-    tsdb_audit_fail_realloc(0);
+    tsdb_audit_fail_malloc(0);
     atomic_store(&db->compaction_in_progress, false);
     uint64_t next=10000;
     timeseries_field_value_t val = {.type=TIMESERIES_FIELD_TYPE_INT, .data.int_val=99};

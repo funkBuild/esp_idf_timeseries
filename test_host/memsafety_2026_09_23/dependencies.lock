@@ -1,0 +1,17 @@
+dependencies:
+  espressif/zlib:
+    dependencies: []
+    source:
+      path: /home/matt/Desktop/source/esp_node_firmware/tools/host_test/esp_idf_timeseries_test_app/managed_components/espressif__zlib
+      type: local
+    version: 1.3.2~1
+  idf:
+    source:
+      type: idf
+    version: 5.5.5
+direct_dependencies:
+- espressif/zlib
+- idf
+manifest_hash: 564f9f9d9430bbd801fdcde7f2e32c7a630ae62625cc19ff6ff2f1093f0efda0
+target: linux
+version: 2.0.0

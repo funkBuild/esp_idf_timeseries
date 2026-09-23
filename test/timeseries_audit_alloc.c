@@ -71,6 +71,9 @@ void tsdb_audit_fail_calloc(size_t count, size_t size) {
     did_fail = false;
 }
 bool tsdb_audit_calloc_failed(void) { return did_fail; }
+// Allocations run with all signals blocked (timeseries_host_sim_guards.c).
+#include <signal.h>
+void tsdb_host_sim_block_signals(sigset_t *old);
 void *__real_calloc(size_t, size_t);
 void *__wrap_calloc(size_t count, size_t size) {
     if (size && count <= SIZE_MAX / size && allocation_probe(count * size)) return NULL;
@@ -79,7 +82,11 @@ void *__wrap_calloc(size_t count, size_t size) {
         did_fail = true;
         return NULL;
     }
-    return __real_calloc(count, size);
+    sigset_t old;
+    tsdb_host_sim_block_signals(&old);
+    void *p = __real_calloc(count, size);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    return p;
 }
 
 static _Thread_local size_t fail_malloc_size, fail_realloc_size;
@@ -89,13 +96,21 @@ void *__real_malloc(size_t);
 void *__wrap_malloc(size_t size) {
     if (allocation_probe(size)) return NULL;
     if (size && size == fail_malloc_size) { fail_malloc_size = 0; return NULL; }
-    return __real_malloc(size);
+    sigset_t old;
+    tsdb_host_sim_block_signals(&old);
+    void *p = __real_malloc(size);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    return p;
 }
 void *__real_realloc(void *, size_t);
 void *__wrap_realloc(void *ptr, size_t size) {
     if (allocation_probe(size)) return NULL;
     if (size && size == fail_realloc_size) { fail_realloc_size = 0; return NULL; }
-    return __real_realloc(ptr, size);
+    sigset_t old;
+    tsdb_host_sim_block_signals(&old);
+    void *p = __real_realloc(ptr, size);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    return p;
 }
 
 static _Thread_local size_t read_bytes, read_calls;

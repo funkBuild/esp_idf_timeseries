@@ -1,5 +1,6 @@
 // timeseries_page_stream_writer.c
 
+#include "timeseries_epoch.h"
 #include "timeseries_page_stream_writer.h"
 #include "timeseries_revision.h"
 #include "timeseries_flash_utils.h"
@@ -221,7 +222,7 @@ static bool prepare_revisions(timeseries_page_stream_writer_t *writer, size_t co
   if (writer->point_revisions) {
     if (writer->point_revision_count != count && writer->point_revision_count != 1) return false;
   } else {
-    if (writer->db->flash_write_mutex) xSemaphoreTake(writer->db->flash_write_mutex, portMAX_DELAY);
+    if (writer->db->flash_write_mutex) tsdb_write_lock(writer->db);
     bool ok = tsdb_revision_next_locked(writer->db, &revision);
     if (writer->db->flash_write_mutex) xSemaphoreGive(writer->db->flash_write_mutex);
     if (!ok) return false;

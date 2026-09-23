@@ -1,4 +1,5 @@
 #include "timeseries_data.h"
+#include "timeseries_epoch.h"
 #include "timeseries_revision.h"
 #include "timeseries_flash_utils.h"
 #include "esp_log.h"
@@ -23,6 +24,8 @@ static const char *TAG = "TimeseriesData";
 // ---------------------------------------------------------------------------
 // Centralized blank-region allocation (serialized by region_alloc_mutex)
 // ---------------------------------------------------------------------------
+// Longest wait for retired space still read by another operation.
+#define TSDB_RETIRED_WAIT_MS 5000
 bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
                                 tsdb_page_cache_snapshot_t *batch_snapshot,
                                 uint32_t *out_offset, uint32_t *out_size) {
@@ -40,18 +43,29 @@ bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
         xSemaphoreGive(db->region_alloc_mutex);
         return false;
     }
-    if (!timeseries_blank_iterator_init(db, &blank_iter, reserve_size)) {
-        xSemaphoreGive(db->region_alloc_mutex);
-        return false;
-    }
-
+    // Free = neither live nor retired-and-still-readable (timeseries_epoch.h).
+    // When only retired space would fit, wait (bounded) for the operations
+    // that may still read it instead of failing: they are short readers or
+    // are about to leave, and space retired a moment ago is not "full".
     uint32_t region_ofs = 0, region_size = 0;
-    if (!timeseries_blank_iterator_next(&blank_iter, &region_ofs, &region_size)) {
-        timeseries_blank_iterator_deinit(&blank_iter);
+    TickType_t wait_start = xTaskGetTickCount();
+    for (;;) {
+        tsdb_page_cache_snapshot_t *occupied = tsdb_occupied_snapshot(db);
+        bool scanning = occupied &&
+                        timeseries_blank_iterator_init_with_snapshot(db, &blank_iter, reserve_size, occupied);
+        bool found = scanning && timeseries_blank_iterator_next(&blank_iter, &region_ofs, &region_size);
+        if (scanning) timeseries_blank_iterator_deinit(&blank_iter);
+        tsdb_snapshot_release(occupied);
+        if (found) break;
+        if (!occupied || !tsdb_retired_pinned_by_others(db) ||
+            (TickType_t)(xTaskGetTickCount() - wait_start) > pdMS_TO_TICKS(TSDB_RETIRED_WAIT_MS)) {
+            xSemaphoreGive(db->region_alloc_mutex);
+            return false;
+        }
         xSemaphoreGive(db->region_alloc_mutex);
-        return false;
+        vTaskDelay(1);
+        xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
     }
-    timeseries_blank_iterator_deinit(&blank_iter);
 
     // Erase only the reserved portion
     if (esp_partition_erase_range(db->partition, region_ofs, reserve_size) != ESP_OK) {
@@ -278,6 +292,22 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
 bool tsdb_append_ordered_points(timeseries_db_t *db, const unsigned char series_id[16],
                                 const uint64_t *timestamps, const timeseries_field_value_t *values,
                                 const tsdb_point_order_t *order) {
+  return tsdb_append_ordered_points_checked(db, series_id, timestamps, values, order, NULL, NULL);
+}
+
+// flash_write_mutex is held. On a schema change, release it and report stale.
+static bool schema_changed(timeseries_db_t *db, const uint32_t *schema_gen, bool *stale) {
+  if (!schema_gen || atomic_load(&db->schema_gen) == *schema_gen) return false;
+  if (db->flash_write_mutex) xSemaphoreGive(db->flash_write_mutex);
+  if (stale) *stale = true;
+  return true;
+}
+
+bool tsdb_append_ordered_points_checked(timeseries_db_t *db, const unsigned char series_id[16],
+                                        const uint64_t *timestamps, const timeseries_field_value_t *values,
+                                        const tsdb_point_order_t *order, const uint32_t *schema_gen,
+                                        bool *stale) {
+  if (stale) *stale = false;
   if (!db || !series_id || !timestamps || !values || !order || !order->count || !db->chunk_size ||
       order->count > order->source_count ||
       (!order->indices && order->count != order->source_count) ||
@@ -314,8 +344,9 @@ bool tsdb_append_ordered_points(timeseries_db_t *db, const unsigned char series_
 
     // Take flash write mutex to protect L0 page finding/creation/writing
     if (db->flash_write_mutex) {
-      xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+      tsdb_write_lock(db);
     }
+    if (schema_changed(db, schema_gen, stale)) return false;
 
     while (npoints_possible > 0) {
       bool any_l0_exists = false;
@@ -356,13 +387,16 @@ bool tsdb_append_ordered_points(timeseries_db_t *db, const unsigned char series_
             tsdb_launch_compaction(db);
             // Wait for compaction to finish (already running or just launched)
             int wait = 10000;
+            tsdb_epoch_idle(db, true);  // waits holding no page offsets
             while (atomic_load(&db->compaction_in_progress) && wait > 0) {
               vTaskDelay(pdMS_TO_TICKS(10));
               wait -= 10;
             }
+            tsdb_epoch_idle(db, false);
             if (db->flash_write_mutex) {
-              xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+              tsdb_write_lock(db);
             }
+            if (schema_changed(db, schema_gen, stale)) return false;
             if (!create_level0_field_page(db, &new_page_offset)) {
               ESP_LOGE(TAG, "Failed to create L0 page even after compaction.");
               if (db->flash_write_mutex) {
@@ -390,13 +424,16 @@ bool tsdb_append_ordered_points(timeseries_db_t *db, const unsigned char series_
               tsdb_launch_compaction(db);
               // Wait for compaction to finish (already running or just launched)
               int wait = 10000;
+              tsdb_epoch_idle(db, true);  // waits holding no page offsets
               while (atomic_load(&db->compaction_in_progress) && wait > 0) {
                 vTaskDelay(pdMS_TO_TICKS(10));
                 wait -= 10;
               }
+              tsdb_epoch_idle(db, false);
               if (db->flash_write_mutex) {
-                xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+                tsdb_write_lock(db);
               }
+              if (schema_changed(db, schema_gen, stale)) return false;
               if (!create_level0_field_page(db, &new_page_offset)) {
                 ESP_LOGE(TAG, "Failed to create new L0 page even after compaction.");
                 if (db->flash_write_mutex) {
@@ -626,6 +663,7 @@ static bool create_level0_field_page(timeseries_db_t *db,
 
   if (blank_offset + l0_size > db->partition->size) {
     ESP_LOGW(TAG, "Blank region extends beyond partition boundary!");
+    tsdb_release_reserved_region(db, blank_offset, NULL);
     return false;
   }
 
@@ -644,6 +682,9 @@ static bool create_level0_field_page(timeseries_db_t *db,
                             sizeof(new_hdr));
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to write L0 header (err=0x%x)", err);
+    // Give the reservation back (marks it OBSOLETE on flash, drops the
+    // placeholder), or the region stays unusable until restart.
+    tsdb_release_reserved_region(db, blank_offset, NULL);
     return false;
   }
 
@@ -651,6 +692,7 @@ static bool create_level0_field_page(timeseries_db_t *db,
   // (replaces the placeholder registered by tsdb_reserve_blank_region)
   if (!tsdb_pagecache_add_entry(db, blank_offset, &new_hdr)) {
     ESP_LOGE(TAG, "OOM updating page cache with L0 header @0x%08" PRIx32, blank_offset);
+    tsdb_release_reserved_region(db, blank_offset, NULL);
     return false;
   }
 

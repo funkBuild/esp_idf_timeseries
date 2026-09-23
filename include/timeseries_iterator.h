@@ -36,6 +36,7 @@ typedef struct {
   uint32_t offset;
   uint32_t current_entry_offset;
   bool valid;
+  bool read_error;         /* iteration stopped on a flash read error */
   const uint8_t* page_ptr; /* mmap’d view, NULL if mmap failed   */
   esp_partition_mmap_handle_t mmap_hdl;
 } timeseries_entity_iterator_t;

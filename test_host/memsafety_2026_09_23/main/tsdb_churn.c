@@ -12,6 +12,7 @@
  */
 #include <inttypes.h>
 #include <pthread.h>
+#include <sys/types.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -28,6 +29,7 @@
 #include "timeseries_internal.h"
 #include "timeseries_iterator.h"
 #include "timeseries_page_cache.h"
+#include "mbedtls/md.h"
 
 /* Flash-integrity oracle (PROTO-TS-1). The linux esp_partition_write returns
  * ESP_ERR_FLASH_OP_FAIL when a write needs a 0->1 bit transition (a write over
@@ -37,7 +39,15 @@
 static atomic_uint s_bad_writes;
 static atomic_uint s_writes;
 esp_err_t __real_esp_partition_write(const esp_partition_t* p, size_t off, const void* src, size_t len);
+TaskHandle_t _Atomic review_fail_write_task;  // TSDB_REVIEW fault injection (tsdb_review_phases.c)
+_Atomic uint32_t review_fail_write_len, review_fail_write_offset;
 esp_err_t __wrap_esp_partition_write(const esp_partition_t* p, size_t off, const void* src, size_t len) {
+  TaskHandle_t t = atomic_load(&review_fail_write_task);
+  if (t && t == xTaskGetCurrentTaskHandle() && len == atomic_load(&review_fail_write_len) &&
+      (atomic_load(&review_fail_write_offset) == UINT32_MAX || off == atomic_load(&review_fail_write_offset))) {
+    atomic_store(&review_fail_write_task, (TaskHandle_t)NULL);
+    return ESP_FAIL;
+  }
   esp_err_t r = __real_esp_partition_write(p, off, src, len);
   atomic_fetch_add(&s_writes, 1);
   if (r == ESP_ERR_FLASH_OP_FAIL) atomic_fetch_add(&s_bad_writes, 1);
@@ -46,9 +56,9 @@ esp_err_t __wrap_esp_partition_write(const esp_partition_t* p, size_t off, const
 
 /* PROTO-TS-1b hooks. tsdb_snapshot_acquire_current() hands us the db pointer;
  * timeseries_page_cache_iterator_deinit() is where tsdb_find_metadata_pages()
- * finishes scanning a page-cache snapshot, just before it publishes the scan
- * as db->cached_metadata_offsets. When armed for one task, that task is
- * parked there until the test lets it go. */
+ * finishes scanning a page-cache snapshot (it used to publish the scan as a
+ * cached page list, removed by TSDB_REVIEW S3). When armed for one task, that
+ * task is parked there until the test lets it go. */
 static timeseries_db_t* _Atomic s_db;
 static TaskHandle_t _Atomic s_race_reader;
 static atomic_bool s_race_armed;
@@ -95,8 +105,17 @@ int __wrap_pthread_join(pthread_t thread, void** retval) {
   SIG_GUARD_END;
   return rc;
 }
+// TSDB_REVIEW R6: fail the next malloc/calloc/realloc made by this task.
+TaskHandle_t _Atomic review_fail_alloc_task;
+static bool review_fail_this_alloc(void) {
+  TaskHandle_t t = atomic_load(&review_fail_alloc_task);
+  if (!t || t != xTaskGetCurrentTaskHandle()) return false;
+  atomic_store(&review_fail_alloc_task, (TaskHandle_t)NULL);
+  return true;
+}
 void* __real_malloc(size_t n);
 void* __wrap_malloc(size_t n) {
+  if (review_fail_this_alloc()) return NULL;
   SIG_GUARD_BEGIN;
   void* p = __real_malloc(n);
   SIG_GUARD_END;
@@ -104,6 +123,7 @@ void* __wrap_malloc(size_t n) {
 }
 void* __real_calloc(size_t n, size_t sz);
 void* __wrap_calloc(size_t n, size_t sz) {
+  if (review_fail_this_alloc()) return NULL;
   SIG_GUARD_BEGIN;
   void* p = __real_calloc(n, sz);
   SIG_GUARD_END;
@@ -111,6 +131,7 @@ void* __wrap_calloc(size_t n, size_t sz) {
 }
 void* __real_realloc(void* ptr, size_t n);
 void* __wrap_realloc(void* ptr, size_t n) {
+  if (review_fail_this_alloc()) return NULL;
   SIG_GUARD_BEGIN;
   void* p = __real_realloc(ptr, n);
   SIG_GUARD_END;
@@ -128,6 +149,39 @@ void __wrap_free(void* ptr) {
   SIG_GUARD_BEGIN;
   __real_free(ptr);
   SIG_GUARD_END;
+}
+/* PROTO-TS-1d (simulator artifact, not product code). ESP-IDF's linux log lock
+ * (components/log/src/linux/log_lock.c) is a plain pthread mutex, taken by
+ * every ESP_LOGx call even at level NONE (esp_log_is_tag_loggable). A task
+ * switched out while holding it stalls the next logger in the kernel, and the
+ * scheduler with it. Caught with gdb: seeds hung with one task in
+ * esp_log_impl_lock -> futex_wait on mutex1 and every other task suspended.
+ * Hold the lock with all signals blocked, as above; the mask is restored when
+ * the outermost lock is released. */
+static _Thread_local sigset_t s_log_mask;
+static _Thread_local int s_log_depth;
+static void log_guard_enter(void) {
+  sigset_t all, old;
+  sigfillset(&all);
+  pthread_sigmask(SIG_BLOCK, &all, &old);
+  if (s_log_depth++ == 0) s_log_mask = old;
+}
+void __real_esp_log_impl_lock(void);
+void __wrap_esp_log_impl_lock(void) {
+  log_guard_enter();
+  __real_esp_log_impl_lock();
+}
+bool __real_esp_log_impl_lock_timeout(void);
+bool __wrap_esp_log_impl_lock_timeout(void) {
+  log_guard_enter();
+  bool locked = __real_esp_log_impl_lock_timeout();
+  if (!locked && --s_log_depth == 0) pthread_sigmask(SIG_SETMASK, &s_log_mask, NULL);
+  return locked;
+}
+void __real_esp_log_impl_unlock(void);
+void __wrap_esp_log_impl_unlock(void) {
+  __real_esp_log_impl_unlock();
+  if (s_log_depth > 0 && --s_log_depth == 0) pthread_sigmask(SIG_SETMASK, &s_log_mask, NULL);
 }
 char* __real_strdup(const char* str);
 char* __wrap_strdup(const char* str) {
@@ -160,9 +214,24 @@ static uint32_t rnd(uint32_t* s) {
 static const char* hb_names[HB_FIELDS];
 static char hb_name_buf[HB_FIELDS][16];
 
+/* Data-correctness oracle: stat_00 of node_stats is the insert's sequence
+ * number k at timestamp HB_TS0 + k*1000; node_stats is never deleted through
+ * the API, only by expiration. After the churn every point the query returns
+ * must be distinct and carry its own k, and every point whose insert returned
+ * true must either be returned or lie inside a node_stats.stat_00 record that
+ * expiration soft-deleted while the churn ran (recorded as it happens, below,
+ * because expiration then rewrites the page without the record).
+ * Expiration works on whole records ordered by their start time, and
+ * compaction merges pages chosen by offset, so an expired record can cover
+ * points newer than a surviving one: "records, oldest start first" is the
+ * contract, not "the oldest points only". */
+#define HB_TS0 1700000000000ULL
+static uint8_t* s_hb_ok;  // per k: 1 = timeseries_insert returned true
+static size_t s_hb_count, s_hb_cap;
+
 static void hb_task(void* arg) {
   (void)arg;
-  uint64_t ts = 1700000000000ULL;
+  uint64_t ts = HB_TS0;
   uint32_t s = s_seed * 2654435761u + 1;
   timeseries_field_value_t fv[HB_FIELDS];
   while (!atomic_load(&s_stop)) {
@@ -175,14 +244,24 @@ static void hb_task(void* arg) {
         fv[i].data.int_val = (int64_t)rnd(&s);
       }
     }
-    ts += 1000;
+    size_t k = s_hb_count;
+    fv[0].type = TIMESERIES_FIELD_TYPE_INT;
+    fv[0].data.int_val = (int64_t)k;
+    ts = HB_TS0 + (uint64_t)k * 1000;
     timeseries_insert_data_t d = {.measurement_name = "node_stats",
                                   .field_names = hb_names,
                                   .field_values = fv,
                                   .num_fields = HB_FIELDS,
                                   .timestamps_ms = &ts,
                                   .num_points = 1};
-    timeseries_insert(&d);
+    bool ok = timeseries_insert(&d);
+    if (k == s_hb_cap) {
+      s_hb_cap = s_hb_cap ? s_hb_cap * 2 : 4096;
+      s_hb_ok = realloc(s_hb_ok, s_hb_cap);
+      if (!s_hb_ok) abort();
+    }
+    s_hb_ok[k] = ok;
+    s_hb_count = k + 1;
     atomic_fetch_add(&s_ops[0], 1);
     if ((rnd(&s) & 7) == 0) vTaskDelay(1);
   }
@@ -564,22 +643,136 @@ static int race_phase(void) {
     printf("race: FAIL reader did not finish\n");
     return bad + 1;
   }
-  if (db->cached_metadata_valid) {
-    for (size_t k = 0; k < db->cached_metadata_count; k++) {
-      timeseries_page_header_t h;
-      uint32_t off = db->cached_metadata_offsets[k];
-      if (esp_partition_read(db->partition, off, &h, sizeof h) != ESP_OK ||
-          h.magic_number != TIMESERIES_MAGIC_NUM || h.page_type != TIMESERIES_PAGE_TYPE_METADATA ||
-          h.page_state != TIMESERIES_PAGE_STATE_ACTIVE) {
-        printf("race: FAIL metadata page cache names page @0x%05" PRIx32 " (state=%u), not an active metadata page\n",
-               off, (unsigned)h.page_state);
+  // Every metadata page the page cache lists (the only source of the page
+  // list since TSDB_REVIEW S3) must be an ACTIVE metadata page on flash.
+  timeseries_page_cache_iterator_t it;
+  if (timeseries_page_cache_iterator_init(db, &it)) {
+    timeseries_page_header_t ch, h;
+    uint32_t off, sz;
+    while (timeseries_page_cache_iterator_next(&it, &ch, &off, &sz)) {
+      if (ch.page_type != TIMESERIES_PAGE_TYPE_METADATA) continue;
+      if (esp_partition_read(db->partition, off, &h, sizeof h) != ESP_OK || h.magic_number != TIMESERIES_MAGIC_NUM ||
+          h.page_type != TIMESERIES_PAGE_TYPE_METADATA || h.page_state != TIMESERIES_PAGE_STATE_ACTIVE) {
+        printf("race: FAIL page cache lists page @0x%05" PRIx32 " (state=%u), not an active metadata page\n", off,
+               (unsigned)h.page_state);
         bad++;
       }
     }
+    timeseries_page_cache_iterator_deinit(&it);
   }
   printf("race: inserts=%u compaction_gen %" PRIu32 "->%" PRIu32 " failed=%d\n", i, gen0, db->metadata_page_gen, bad);
   return bad;
 }
+
+// On a data-check failure, keep what is needed to find out where the points
+// went: the whole partition image and the live page cache (run_tests.sh keeps
+// both with KEEP_FAILED_LOGS). Analyse offline with the page/record layout.
+static void dump_forensics(void) {
+  timeseries_db_t* db = atomic_load(&s_db);
+  if (!db || !db->partition) return;
+  FILE* f = fopen("tsdb_flash.bin", "wb");
+  if (f) {
+    static uint8_t chunk[4096];
+    for (uint32_t off = 0; off < db->partition->size; off += sizeof chunk) {
+      if (esp_partition_read(db->partition, off, chunk, sizeof chunk) != ESP_OK) break;
+      fwrite(chunk, 1, sizeof chunk, f);
+    }
+    fclose(f);
+  }
+  f = fopen("tsdb_cache.txt", "w");
+  if (!f) return;
+  tsdb_page_cache_snapshot_t* snap = tsdb_snapshot_acquire_current(db);
+  for (size_t i = 0; snap && i < snap->count; i++) {
+    const timeseries_page_header_t* h = &snap->entries[i].header;
+    fprintf(f, "0x%06" PRIx32 " type=%u state=%u level=%u seq=%" PRIu32 " size=%" PRIu32 "\n", snap->entries[i].offset,
+            h->page_type, h->page_state, h->field_data_level, h->sequence_num, h->page_size);
+  }
+  tsdb_snapshot_release(snap);
+  fclose(f);
+  printf("data: wrote tsdb_flash.bin and tsdb_cache.txt\n");
+}
+
+// Expiration and deletes clear a record's DELETED bit with
+// tsdb_flash_write_byte() on the header's flags byte. Record the time range of
+// every node_stats.stat_00 record that gets deleted this way.
+static unsigned char s_hb_sid[16];
+static struct {
+  uint64_t start, end;
+} s_hb_expired[4096];
+static atomic_size_t s_hb_expired_n;
+esp_err_t __real_tsdb_flash_write_byte(const esp_partition_t* part, uint32_t offset, uint8_t value);
+esp_err_t __wrap_tsdb_flash_write_byte(const esp_partition_t* part, uint32_t offset, uint8_t value) {
+  timeseries_field_data_header_t fh;
+  bool track = !(value & TSDB_FIELDDATA_FLAG_DELETED) &&
+               esp_partition_read(part, offset, &fh, sizeof fh) == ESP_OK && !memcmp(fh.series_id, s_hb_sid, 16) &&
+               (fh.flags & TSDB_FIELDDATA_FLAG_DELETED) && fh.start_time <= fh.end_time;
+  esp_err_t err = __real_tsdb_flash_write_byte(part, offset, value);
+  if (track && err == ESP_OK) {
+    size_t i = atomic_fetch_add(&s_hb_expired_n, 1);
+    if (i < sizeof s_hb_expired / sizeof s_hb_expired[0]) {
+      s_hb_expired[i].start = fh.start_time;
+      s_hb_expired[i].end = fh.end_time;
+    }
+  }
+  return err;
+}
+static bool hb_point_expired(uint64_t ts) {
+  size_t n = atomic_load(&s_hb_expired_n);
+  if (n > sizeof s_hb_expired / sizeof s_hb_expired[0]) return true;  // log overflowed: cannot tell
+  for (size_t i = 0; i < n; i++)
+    if (ts >= s_hb_expired[i].start && ts <= s_hb_expired[i].end) return true;
+  return false;
+}
+
+static int hb_oracle(void) {
+  const char* fn[1] = {"stat_00"};
+  timeseries_query_t q = {.measurement_name = "node_stats", .field_names = fn, .num_fields = 1};
+  timeseries_query_result_t r;
+  memset(&r, 0, sizeof r);
+  if (!timeseries_query(&q, &r)) {
+    printf("data: FAIL query of node_stats.stat_00 failed (%zu inserts)\n", s_hb_count);
+    return 1;
+  }
+  int bad = 0;
+  size_t got = r.num_points, first = SIZE_MAX, succeeded = 0, missing = 0;
+  uint8_t* seen = calloc(s_hb_count + 1, 1);
+  for (size_t i = 0; i < got; i++) {
+    uint64_t t = r.timestamps[i];
+    size_t k = (size_t)((t - HB_TS0) / 1000);
+    const timeseries_field_value_t* v = &r.columns[0].values[i];
+    if (t < HB_TS0 || (t - HB_TS0) % 1000 || k >= s_hb_count || v->type != TIMESERIES_FIELD_TYPE_INT ||
+        v->data.int_val != (int64_t)k || seen[k]) {
+      if (bad++ < 5)
+        printf("data: FAIL point %zu ts=%" PRIu64 " type=%d value=%" PRId64 " dup=%d\n", i, t, (int)v->type,
+               v->data.int_val, k < s_hb_count ? seen[k] : 0);
+      continue;
+    }
+    seen[k] = 1;
+    if (k < first) first = k;
+  }
+  size_t expired = 0;
+  for (size_t k = 0; k < s_hb_count; k++) {
+    succeeded += s_hb_ok[k];
+    if (!s_hb_ok[k] || seen[k]) continue;
+    if (hb_point_expired(HB_TS0 + (uint64_t)k * 1000)) {
+      expired++;
+    } else if (missing++ < 5) {
+      printf("data: FAIL successful insert k=%zu missing (no expired record covered it)\n", k);
+    }
+  }
+  if (!got && succeeded && bad++ < 5) printf("data: FAIL no node_stats points stored\n");
+  printf("data: node_stats inserts=%zu succeeded=%zu stored=%zu expired=%zu (records %zu) oldest_k=%zd bad=%d "
+         "missing=%zu\n",
+         s_hb_count, succeeded, got, expired, atomic_load(&s_hb_expired_n),
+         first == SIZE_MAX ? (ssize_t)-1 : (ssize_t)first, bad, missing);
+  free(seen);
+  timeseries_query_free_result(&r);
+  if (bad || missing) dump_forensics();
+  return bad + (int)missing;
+}
+
+timeseries_db_t* review_db(void) { return atomic_load(&s_db); }
+int review_main(const char* which);
 
 void app_main(void) {
   const char* e = getenv("CHURN_SEED");
@@ -589,6 +782,8 @@ void app_main(void) {
   e = getenv("CHURN_SECONDS");
   if (e) secs = atoi(e);
   if (!getenv("CHURN_LOG")) esp_log_level_set("*", ESP_LOG_NONE);
+  mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_MD5), (const unsigned char*)"node_stats:stat_00",
+             strlen("node_stats:stat_00"), s_hb_sid);
   for (int i = 0; i < HB_FIELDS; i++) {
     snprintf(hb_name_buf[i], sizeof hb_name_buf[i], "stat_%02d", i);
     hb_names[i] = hb_name_buf[i];
@@ -598,6 +793,21 @@ void app_main(void) {
     exit(2);
   }
   timeseries_clear_all();
+  if (getenv("REVIEW")) {  // one TSDB_REVIEW phase (or "all"), then exit
+    int b = review_main(getenv("REVIEW"));
+    printf("review: %d failed\n", b);
+    fflush(stdout);
+    exit(b ? 7 : 0);
+  }
+  if (!getenv("CHURN_NO_REVIEW")) {
+    int b = review_main("all");
+    if (b) {
+      printf("FAIL TSDB_REVIEW phases: %d failed checks\n", b);
+      exit(7);
+    }
+    printf("PASS review phases\n");
+    timeseries_clear_all();
+  }
   if (!getenv("CHURN_NO_RACE")) {
     int batch_bad = batch_phase();
     if (batch_bad) {
@@ -653,6 +863,10 @@ void app_main(void) {
   printf("churn ops: hb=%" PRIu64 " lua=%" PRIu64 " query=%" PRIu64 " meta=%" PRIu64 " admin=%" PRIu64 "\n",
          (uint64_t)s_ops[0], (uint64_t)s_ops[1], (uint64_t)s_ops[2], (uint64_t)s_ops[3], (uint64_t)s_ops[4]);
   printf("flash writes=%u over-non-erased=%u\n", atomic_load(&s_writes), atomic_load(&s_bad_writes));
+  if ((mask & 1u) && hb_oracle()) {
+    printf("FAIL churn data check (node_stats.stat_00)\n");
+    exit(8);
+  }
   if (atomic_load(&s_bad_writes)) {
     printf("FAIL PROTO-TS-1: %u esp_partition_write calls needed a 0->1 bit transition (write over non-erased flash)\n",
            atomic_load(&s_bad_writes));

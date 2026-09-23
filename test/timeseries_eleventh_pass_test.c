@@ -214,7 +214,9 @@ TEST_CASE("eleventh: batch abort releases the live allocation reservation", "[el
   bool started=timeseries_page_rewriter_start(db,1,4096,&w);
   timeseries_page_rewriter_abort(&w);
   live=tsdb_snapshot_acquire_current(db); TEST_ASSERT_NOT_NULL(live);
-  bool released=live->count==before && batch->count==before;
+  // The batch is the compaction's journal: the abandoned reservation must
+  // leave no pending entry in it and no entry in the live cache.
+  bool released=live->count==before && batch->count==0;
   tsdb_snapshot_release(live); tsdb_snapshot_release(batch);
   bool queried=matches(1); cleanup(db);
   TEST_ASSERT_TRUE(started); TEST_ASSERT_TRUE(released); TEST_ASSERT_TRUE(queried);

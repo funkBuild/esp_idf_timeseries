@@ -1,3 +1,4 @@
+#include "timeseries_epoch.h"
 #include "timeseries_compaction.h"
 #include "timeseries_compaction_merge.h"
 
@@ -11,6 +12,8 @@
 #include "timeseries_page_cache.h"
 #include "timeseries_page_cache_snapshot.h"
 #include "timeseries_page_rewriter.h"
+#include "timeseries_flash_utils.h"
+#include <stddef.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -45,9 +48,10 @@ static bool compact_level_pages(timeseries_db_t* db, uint8_t from_level,
 static bool tsdb_find_level_pages(timeseries_db_t* db, uint8_t source_level, tsdb_level_page_t** out_pages,
                                   size_t* out_count);
 
-static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t source_level,
+static void tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t source_level,
                                                const tsdb_level_page_t* pages, size_t page_count,
-                                               tsdb_page_cache_snapshot_t* batch);
+                                               const tsdb_page_cache_snapshot_t* base,
+                                               tsdb_page_cache_snapshot_t* next);
 
 // -----------------------------------------------------------------------------
 // Public API
@@ -157,50 +161,65 @@ bool timeseries_compact_all_levels_force(timeseries_db_t* db) {
   return true;
 }
 
+// A failed compaction gives back everything it reserved: the pages it wrote
+// (journal entries) are marked OBSOLETE on flash, so a restart cannot load
+// them next to their still-ACTIVE sources, and every region it held is
+// removed from the live cache. Caller holds flash_write_mutex.
+static void abandon_compaction_outputs(timeseries_db_t *db, const tsdb_page_cache_snapshot_t *batch) {
+  for (size_t i = 0; i < batch->count; i++) {
+    uint32_t off = batch->entries[i].offset;
+    (void)tsdb_flash_write_byte(db->partition, off + offsetof(timeseries_page_header_t, page_state),
+                                TIMESERIES_PAGE_STATE_OBSOLETE);
+    (void)tsdb_pagecache_remove_entry(db, off);
+  }
+  // Regions it gave up while running (relocated or released) are OBSOLETE
+  // on flash already; drop its placeholder if still listed live. A region
+  // released earlier may already belong to another writer: leave that alone.
+  for (size_t r = 0; r < batch->removed_count; r++)
+    (void)tsdb_pagecache_remove_placeholder(db, batch->removed_offsets[r]);
+}
+
 // Retire source pages and publish replacements as one operation for inserts.
-// Reserve merge/removal storage before changing flash, so OOM leaves sources
-// writable and visible. Encoding and output writes happen outside these locks.
+// Holding flash_write_mutex keeps the live cache unchanged throughout. Everything
+// publication needs is allocated before any source changes on flash, so OOM
+// leaves the sources ACTIVE and visible; flash writes cannot fail publication.
+// Encoding and output writes happen before, outside these locks.
 static bool finish_compaction_batch(timeseries_db_t *db, uint8_t from_level,
     const tsdb_level_page_t *pages, size_t page_count,
     tsdb_page_cache_snapshot_t *batch, bool success) {
-  if (db->flash_write_mutex) xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
-  if (db->region_alloc_mutex) xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
+  if (db->flash_write_mutex) tsdb_write_lock(db);
 
+  tsdb_page_cache_snapshot_t *base = NULL, *next = NULL;
   if (success) {
-    tsdb_page_cache_snapshot_t *live = tsdb_snapshot_acquire_current(db);
-    size_t live_count = live ? live->count : 0;
-    tsdb_snapshot_release(live);
-    if (live_count > SIZE_MAX / sizeof(*batch->entries) - batch->count ||
-        page_count > SIZE_MAX / sizeof(*batch->removed_offsets) - batch->removed_count) {
-      success = false;
+    uint32_t sources[MAX_PAGES_PER_LEVEL];
+    for (size_t i = 0; i < page_count; i++) sources[i] = pages[i].offset;
+    base = tsdb_snapshot_acquire_current(db);
+    // Room for every source to be put back if its flash state cannot change.
+    next = tsdb_pagecache_prepare_batch(base, batch, sources, page_count, page_count);
+    success = base && next;
+  }
+  if (success) {
+    tsdb_mark_old_level_pages_obsolete(db, from_level, pages, page_count, base, next);
+    db->active_batch = NULL;
+    tsdb_pagecache_batch_sort(next);
+    // Cannot fail: every other live-cache writer holds flash_write_mutex
+    // (inserts, metadata writers, deletes, clear_all); this compaction's own
+    // reservations are finished.
+    success = tsdb_snapshot_compare_and_swap(db, base, next);
+    if (success) {
+      next = NULL;
     } else {
-      size_t capacity = batch->count + live_count;
-      if (capacity > batch->capacity) {
-        timeseries_cached_page_t *entries = realloc(batch->entries, capacity * sizeof(*entries));
-        if (!entries) success = false;
-        else { batch->entries = entries; batch->capacity = capacity; }
-      }
-      size_t removed_capacity = batch->removed_count + page_count;
-      if (success && removed_capacity > batch->removed_capacity) {
-        uint32_t *removed = realloc(batch->removed_offsets, removed_capacity * sizeof(*removed));
-        if (!removed) success = false;
-        else { batch->removed_offsets = removed; batch->removed_capacity = removed_capacity; }
-      }
+      ESP_LOGE(TAG, "Live page cache changed during compaction publication");
     }
-  }
-
-  if (success)
-    success = tsdb_mark_old_level_pages_obsolete(db, from_level, pages, page_count, batch);
-  db->active_batch = NULL;
-  if (success) {
-    tsdb_pagecache_batch_sort(batch);
-    success = tsdb_pagecache_commit_batch(db, batch);
   } else {
-    tsdb_snapshot_release(batch);
+    db->active_batch = NULL;
+    abandon_compaction_outputs(db, batch);
   }
+  tsdb_snapshot_release(next);
+  tsdb_snapshot_release(base);
+  tsdb_snapshot_release(batch);
   db->compaction_claimed_count = 0;
   db->last_l0_cache_valid = false;
-  if (db->region_alloc_mutex) xSemaphoreGive(db->region_alloc_mutex);
   if (db->flash_write_mutex) xSemaphoreGive(db->flash_write_mutex);
   return success;
 }
@@ -216,6 +235,10 @@ static bool compact_level_pages(timeseries_db_t* db, uint8_t from_level,
     return false;
   }
   ESP_LOGV(TAG, "Starting compaction from level=%u to level=%u ...", from_level, to_level);
+
+  // Quiescent point: nothing read before this call is used below, so pages
+  // retired by earlier levels of this run can be reused.
+  tsdb_epoch_quiesce(db);
 
   // 1) Find all active pages at `from_level`.
   tsdb_level_page_t* pages = NULL;
@@ -239,14 +262,6 @@ static bool compact_level_pages(timeseries_db_t* db, uint8_t from_level,
     free(pages);
     return false;
   }
-  // Set active_batch under region_alloc_mutex to synchronize with insert path
-  if (db->region_alloc_mutex) {
-    xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
-  }
-  db->active_batch = batch;
-  if (db->region_alloc_mutex) {
-    xSemaphoreGive(db->region_alloc_mutex);
-  }
 
   // Claim pages so inserts won't write to them during compaction.
   // page_count is guaranteed <= MAX_PAGES_PER_LEVEL (32) by tsdb_find_level_pages,
@@ -255,8 +270,9 @@ static bool compact_level_pages(timeseries_db_t* db, uint8_t from_level,
   static_assert(TSDB_MAX_COMPACTION_CLAIMED_PAGES >= MAX_PAGES_PER_LEVEL,
       "compaction_claimed_pages[] must be at least as large as MAX_PAGES_PER_LEVEL");
   if (db->flash_write_mutex) {
-    xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+    tsdb_write_lock(db);
   }
+  db->active_batch = batch;  // cleared when publication starts
   for (size_t i = 0; i < page_count; i++) {
     db->compaction_claimed_pages[i] = pages[i].offset;
   }
@@ -350,17 +366,17 @@ static bool tsdb_find_level_pages(timeseries_db_t* db, uint8_t source_level, tsd
 // Step 4) Mark old pages as obsolete
 // -----------------------------------------------------------------------------
 
-static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t source_level,
+// `next` is the snapshot about to be published, prepared without the source
+// pages. A source that cannot be retired on flash is put back from `base`.
+static void tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t source_level,
                                                const tsdb_level_page_t* pages, size_t page_count,
-                                               tsdb_page_cache_snapshot_t* batch) {
-  if (!db || !pages) {
-    return false;
-  }
+                                               const tsdb_page_cache_snapshot_t* base,
+                                               tsdb_page_cache_snapshot_t* next) {
 
   ESP_LOGI(TAG, "Marking %zu old level-%u pages as obsolete",
            page_count, source_level);
 
-  // Caller holds flash_write_mutex and region_alloc_mutex until publication.
+  // Caller holds flash_write_mutex until publication.
   for (size_t i = 0; i < page_count; i++) {
     uint32_t pofs = pages[i].offset;
     ESP_LOGI(TAG, "Marking level-%u page @0x%08" PRIx32 " as obsolete.", source_level, pofs);
@@ -370,6 +386,7 @@ static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t sour
     esp_err_t err = esp_partition_read(db->partition, pofs, &hdr, sizeof(hdr));
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed to read page header @0x%08" PRIx32 " (err=0x%x)", pofs, err);
+      tsdb_pagecache_restore_entry(next, base, pofs);
       continue;
     }
 
@@ -383,14 +400,8 @@ static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t sour
       err = esp_partition_write(db->partition, pofs, &hdr, sizeof(hdr));
       if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed marking page @0x%08" PRIx32 " obsolete (err=0x%x)", pofs, err);
+        tsdb_pagecache_restore_entry(next, base, pofs);
         continue;
-      }
-
-      // Remove from cache (batch or live)
-      if (batch) {
-        tsdb_pagecache_batch_remove(batch, pofs);
-      } else {
-        tsdb_pagecache_remove_entry(db, pofs);
       }
 
       // Decrement tracked L0 page count
@@ -401,10 +412,10 @@ static bool tsdb_mark_old_level_pages_obsolete(timeseries_db_t* db, uint8_t sour
       ESP_LOGI(TAG, "Removed page @0x%08" PRIx32 " from cache", pofs);
     } else {
       ESP_LOGW(TAG, "Skipping page @0x%08" PRIx32 " (not an active level-%u field-data page).", pofs, source_level);
+      tsdb_pagecache_restore_entry(next, base, pofs);
     }
   }
 
-  return true;
 }
 
 size_t timeseries_field_value_serialize_size(const timeseries_field_value_t* val) {
@@ -611,7 +622,7 @@ bool timeseries_compact_page_list(timeseries_db_t* db, const uint32_t* page_offs
   for (size_t i = 0; i < page_count; i++) {
     uint32_t old_page_ofs = page_offsets[i];
     // Use our new helper function
-    if (db->flash_write_mutex) xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY);
+    if (db->flash_write_mutex) tsdb_write_lock(db);
     bool rewritten = tsdb_rewrite_page_without_deleted(db, old_page_ofs, window);
     if (db->flash_write_mutex) xSemaphoreGive(db->flash_write_mutex);
     if (!rewritten) {

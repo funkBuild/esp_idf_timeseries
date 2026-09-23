@@ -1,3 +1,4 @@
+#include "timeseries_epoch.h"
 #include "timeseries.h"
 #include "timeseries_revision.h"
 #include "esp_log.h"
@@ -59,9 +60,30 @@ static void tsdb_operation_release(bool *held) {
 
 // ESP-IDF's C compiler runs cleanup on every return, including error paths.
 // This reference protects resource lifetime; it does not serialize operations.
+// It also owns an epoch slot for the operation (timeseries_epoch.h): no flash
+// region the operation could have seen is erased or reused before it ends.
+typedef struct {
+    bool held;
+    int slot;
+} tsdb_operation_t;
+
+static tsdb_operation_t tsdb_operation_begin(void) {
+    tsdb_operation_t op = {tsdb_operation_acquire(), -1};
+    if (op.held) op.slot = tsdb_epoch_enter(&s_tsdb);
+    return op;
+}
+
+static void tsdb_operation_end(tsdb_operation_t *op) {
+    if (op->slot >= 0) tsdb_epoch_exit(&s_tsdb, op->slot);
+    tsdb_operation_release(&op->held);
+}
+
 #define TSDB_OPERATION_GUARD(failure) \
-    bool operation_held __attribute__((cleanup(tsdb_operation_release))) = tsdb_operation_acquire(); \
-    if (!operation_held) return failure
+    tsdb_operation_t operation __attribute__((cleanup(tsdb_operation_end))) = tsdb_operation_begin(); \
+    if (!operation.held) return failure
+
+// clear_all waits this long for operations that may still read a page.
+#define TSDB_CLEAR_READER_WAIT_MS 60000
 
 void timeseries_set_compaction_hooks(timeseries_compaction_hook_t pre_compact,
                                      timeseries_compaction_hook_t post_compact) {
@@ -94,7 +116,9 @@ static void tsdb_compaction_oneshot_task(void *param) {
 
     for (;;) {
         ESP_LOGI(TAG, "Compaction task started");
+        int slot = tsdb_epoch_enter(db);
         bool success = timeseries_compact_all_levels(db);
+        tsdb_epoch_exit(db, slot);
         atomic_fetch_add(&db->compaction_generation, 1);
         ESP_LOGI(TAG, "Compaction task finished");
 
@@ -197,6 +221,10 @@ bool timeseries_init(void) {
   }
   s_tsdb.active_batch = NULL;
   s_tsdb.compaction_claimed_count = 0;
+  if (!tsdb_epoch_init(&s_tsdb)) {
+    ESP_LOGE(TAG, "Failed to allocate the retired-region table");
+    goto init_fail;
+  }
 
   // Create initial empty snapshot (tsdb_load_pages_into_memory will swap in the real one)
   s_tsdb.current_snapshot = tsdb_snapshot_create(8);
@@ -290,6 +318,7 @@ bool timeseries_init(void) {
 init_fail:
   free(s_tsdb.l0_usage_cache);
   s_tsdb.l0_usage_cache = NULL;
+  tsdb_epoch_deinit(&s_tsdb);
   // Clean up any resources allocated during partial init
   if (s_tsdb.write_buffer) {
     free(s_tsdb.write_buffer);
@@ -371,7 +400,36 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
   return ok;
 }
 
+static bool insert_ordered_once(const timeseries_insert_data_t *data, const tsdb_point_order_t *order,
+                                size_t *resume, bool *any_field_failed);
+
+// The measurement id, series ids and types used below come partly from caches
+// read without flash_write_mutex. A delete that completes in between removes
+// that metadata; the append then reports the schema change and the whole
+// insert is redone, so it is ordered entirely after the delete (it re-creates
+// the metadata it needs) instead of writing records no metadata describes.
+// Fields handled before the restart point are written again only if the
+// delete removed them (their series has no type metadata any more); the hot
+// path (no race) does no extra work and no allocation.
 static bool insert_ordered(const timeseries_insert_data_t *data, const tsdb_point_order_t *order) {
+  size_t resume = 0;  // fields [0, resume) were handled by an earlier attempt
+  bool any_field_failed = false;
+  for (int attempt = 0; attempt < 4; attempt++) {
+    if (insert_ordered_once(data, order, &resume, &any_field_failed)) return !any_field_failed;
+    if (resume == SIZE_MAX) return false;  // failed, not stale
+  }
+  ESP_LOGW(TAG, "Insert into '%s' kept racing deletes; giving up", data->measurement_name);
+  return false;
+}
+
+// Returns true when the insert ran to the end (per-field failures are
+// reported through *any_field_failed). Returns false with *resume set to the
+// field to restart from after a racing delete, or to SIZE_MAX on failure.
+static bool insert_ordered_once(const timeseries_insert_data_t *data, const tsdb_point_order_t *order,
+                                size_t *resume, bool *any_field_failed_out) {
+  const size_t handled = *resume;
+  *resume = SIZE_MAX;
+  const uint32_t schema_gen = atomic_load(&s_tsdb.schema_gen);
   // Pre-compute the common prefix (measurement + tags) using memcpy.
   char prefix_buffer[256];
   size_t meas_len = strlen(data->measurement_name);
@@ -409,7 +467,7 @@ static bool insert_ordered(const timeseries_insert_data_t *data, const tsdb_poin
   bool meas_cached = false;
 
   if (s_tsdb.flash_write_mutex) {
-    xSemaphoreTake(s_tsdb.flash_write_mutex, portMAX_DELAY);
+    tsdb_write_lock(&s_tsdb);
   }
 
   if (s_tsdb.meas_cache) {
@@ -455,7 +513,7 @@ static bool insert_ordered(const timeseries_insert_data_t *data, const tsdb_poin
   }
 
   // For each field i => build the series_id => store all points in one shot
-  bool any_field_failed = false;
+  bool any_field_failed = *any_field_failed_out;
   for (size_t i = 0; i < data->num_fields; i++) {
     // Build the cache key string using memcpy
     char cache_key[256];
@@ -483,11 +541,26 @@ static bool insert_ordered(const timeseries_insert_data_t *data, const tsdb_poin
       ESP_LOGD(TAG, "Cache MISS for field '%s' - performing metadata operations", data->field_names[i]);
     }
 
+    if (i < handled) {
+      // Handled by an earlier attempt. Still described by metadata means the
+      // delete that restarted this insert did not remove it.
+      timeseries_field_type_e kept;
+      if (tsdb_lookup_series_type_cached(&s_tsdb, series_id, &kept)) continue;
+      found_in_cache = false;
+    }
+
     // Only do metadata operations if not found in cache
     if (!found_in_cache) {
       // Protect metadata flash writes from concurrent compaction
       if (s_tsdb.flash_write_mutex) {
-        xSemaphoreTake(s_tsdb.flash_write_mutex, portMAX_DELAY);
+        tsdb_write_lock(&s_tsdb);
+      }
+      // measurement_id was resolved before; a delete since then removed it.
+      if (atomic_load(&s_tsdb.schema_gen) != schema_gen) {
+        if (s_tsdb.flash_write_mutex) xSemaphoreGive(s_tsdb.flash_write_mutex);
+        *resume = i;
+        *any_field_failed_out = any_field_failed;
+        return false;
       }
 
       // Ensure the field name to series_id mapping is in metadata
@@ -568,9 +641,15 @@ static bool insert_ordered(const timeseries_insert_data_t *data, const tsdb_poin
     // 2) Insert multi data points in one entry
     ESP_LOGD(TAG, "Inserting field %zu/%zu: '%s' (%zu points)",
              i + 1, data->num_fields, data->field_names[i], data->num_points);
-    bool appended = tsdb_append_ordered_points(&s_tsdb, series_id, data->timestamps_ms,
-                                               field_array, order);
-    if (!appended) {
+    bool field_stale = false;
+    bool field_ok = tsdb_append_ordered_points_checked(&s_tsdb, series_id, data->timestamps_ms, field_array, order,
+                                                       &schema_gen, &field_stale);
+    if (field_stale) {
+      *resume = i;
+      *any_field_failed_out = any_field_failed;
+      return false;
+    }
+    if (!field_ok) {
       ESP_LOGE(TAG, "Failed to insert multi points for field '%s'", data->field_names[i]);
       any_field_failed = true;
       continue;  // best-effort: try remaining fields to minimize inconsistency
@@ -592,7 +671,8 @@ static bool insert_ordered(const timeseries_insert_data_t *data, const tsdb_poin
     }
   }
 
-  return !any_field_failed;
+  *any_field_failed_out = any_field_failed;
+  return true;
 }
 
 bool timeseries_compact(void) {
@@ -605,10 +685,12 @@ bool timeseries_compact_sync(void) {
   TSDB_OPERATION_GUARD(false);
   // Wait for any in-progress compaction to finish
   int timeout_ms = 60000;
+  tsdb_epoch_idle(&s_tsdb, true);  // waits holding no page offsets
   while (atomic_load(&s_tsdb.compaction_in_progress) && timeout_ms > 0) {
     vTaskDelay(pdMS_TO_TICKS(10));
     timeout_ms -= 10;
   }
+  tsdb_epoch_idle(&s_tsdb, false);
   if (timeout_ms <= 0) {
     return false;
   }
@@ -616,10 +698,12 @@ bool timeseries_compact_sync(void) {
   bool expected = false;
   if (!atomic_compare_exchange_strong(&s_tsdb.compaction_in_progress, &expected, true)) {
     // Race: someone else claimed it. Wait for them.
+    tsdb_epoch_idle(&s_tsdb, true);
     while (atomic_load(&s_tsdb.compaction_in_progress) && timeout_ms > 0) {
       vTaskDelay(pdMS_TO_TICKS(10));
       timeout_ms -= 10;
     }
+    tsdb_epoch_idle(&s_tsdb, false);
     return timeout_ms > 0;
   }
   bool ok = timeseries_compact_all_levels(&s_tsdb);
@@ -631,19 +715,23 @@ bool timeseries_compact_sync(void) {
 bool timeseries_compact_force_sync(void) {
   TSDB_OPERATION_GUARD(false);
   int timeout_ms = 60000;
+  tsdb_epoch_idle(&s_tsdb, true);  // waits holding no page offsets
   while (atomic_load(&s_tsdb.compaction_in_progress) && timeout_ms > 0) {
     vTaskDelay(pdMS_TO_TICKS(10));
     timeout_ms -= 10;
   }
+  tsdb_epoch_idle(&s_tsdb, false);
   if (timeout_ms <= 0) {
     return false;
   }
   bool expected = false;
   if (!atomic_compare_exchange_strong(&s_tsdb.compaction_in_progress, &expected, true)) {
+    tsdb_epoch_idle(&s_tsdb, true);
     while (atomic_load(&s_tsdb.compaction_in_progress) && timeout_ms > 0) {
       vTaskDelay(pdMS_TO_TICKS(10));
       timeout_ms -= 10;
     }
+    tsdb_epoch_idle(&s_tsdb, false);
     return timeout_ms > 0;
   }
   bool ok = timeseries_compact_all_levels_force(&s_tsdb);
@@ -721,6 +809,7 @@ void timeseries_deinit(void) {
 
   free(s_tsdb.l0_usage_cache);
   s_tsdb.l0_usage_cache = NULL;
+  tsdb_epoch_deinit(&s_tsdb);
 
   // Free type cache
   if (s_tsdb.type_cache) {
@@ -816,39 +905,57 @@ bool timeseries_clear_all(void) {
   // Claim the slot before erase so compaction/expiration cannot start between
   // the wait and the flash lock. Never erase under an owner that timed out.
   int timeout_ms = 60000;
+  tsdb_epoch_idle(&s_tsdb, true);  // waits holding no page offsets
   for (;;) {
     bool expected = false;
     if (atomic_compare_exchange_strong(&s_tsdb.compaction_in_progress, &expected, true)) break;
     if (timeout_ms <= 0) {
+      tsdb_epoch_idle(&s_tsdb, false);
       ESP_LOGW(TAG, "Timed out waiting for compaction before clear_all");
       return false;
     }
     vTaskDelay(pdMS_TO_TICKS(10));
     timeout_ms -= 10;
   }
+  tsdb_epoch_idle(&s_tsdb, false);
 
   // Hold flash_write_mutex to prevent concurrent inserts during erase
   if (s_tsdb.flash_write_mutex) {
-    xSemaphoreTake(s_tsdb.flash_write_mutex, portMAX_DELAY);
+    tsdb_write_lock(&s_tsdb);
   }
 
-  // Erase the entire partition
-  esp_err_t err = esp_partition_erase_range(s_tsdb.partition, 0, s_tsdb.partition->size);
+  atomic_fetch_add(&s_tsdb.schema_gen, 1);
+  // Retire every page, then wait until no operation that could still read
+  // one of them is running (operations blocked on flash_write_mutex or on the
+  // maintenance slot hold no page offsets and do not count), then erase.
+  // Readers without a lock are short, so a timeout means something is wrong:
+  // fail without erasing rather than erase under a reader.
+  tsdb_pagecache_clear(&s_tsdb);
+  esp_err_t err = ESP_ERR_TIMEOUT;
+  if (tsdb_epoch_synchronize(&s_tsdb, TSDB_CLEAR_READER_WAIT_MS)) {
+    err = esp_partition_erase_range(s_tsdb.partition, 0, s_tsdb.partition->size);
+  } else {
+    ESP_LOGW(TAG, "clear_all: readers still active after %d ms; not erasing", TSDB_CLEAR_READER_WAIT_MS);
+  }
 
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to erase partition (err=0x%x)", err);
+    // Describe flash as it is (untouched, or partly erased) again.
+    if (!tsdb_build_page_cache(&s_tsdb)) ESP_LOGE(TAG, "clear_all: page cache rebuild failed");
+    tsdb_retired_forget_live(&s_tsdb);
     if (s_tsdb.flash_write_mutex) {
       xSemaphoreGive(s_tsdb.flash_write_mutex);
     }
     atomic_store(&s_tsdb.compaction_in_progress, false);
     return false;
   }
+  // Nothing retired before the erase can be read any more.
+  tsdb_retired_clear(&s_tsdb);
 
   // The erased database has no revisions to order against.
   s_tsdb.write_revision = 0;
 
   // Clear out any cached data
-  tsdb_pagecache_clear(&s_tsdb);
   tsdb_cache_clear(&s_tsdb);      // Clear series ID cache
   tsdb_clear_type_cache(&s_tsdb); // Clear series type cache
 
@@ -861,9 +968,6 @@ bool timeseries_clear_all(void) {
   s_tsdb.last_l0_used_offset = 0;
   s_tsdb.compaction_claimed_count = 0;
   atomic_store(&s_tsdb.l0_page_count, 0);
-
-  // Reset metadata page cache
-  tsdb_metadata_cache_invalidate(&s_tsdb);
 
   // Reset measurement ID cache
   if (s_tsdb.meas_cache) {
@@ -1027,15 +1131,46 @@ bool timeseries_get_usage_summary(tsdb_usage_summary_t* summary) {
 // Public API: Delete
 // =============================================================================
 
+// Deletes own the maintenance slot for their whole run, like expiration and
+// clear_all. A level compaction reads its source records before it writes
+// them to the next level without holding flash_write_mutex; a delete in
+// between would be undone by the compaction's output (TSDB_REVIEW R1).
+static bool claim_maintenance_slot(void) {
+  tsdb_epoch_idle(&s_tsdb, true);  // waits holding no page offsets
+  bool claimed = false;
+  for (int timeout_ms = 60000;; timeout_ms -= 10) {
+    bool expected = false;
+    if (atomic_compare_exchange_strong(&s_tsdb.compaction_in_progress, &expected, true)) {
+      claimed = true;
+      break;
+    }
+    if (timeout_ms <= 0) {
+      ESP_LOGW(TAG, "Timed out waiting for compaction before delete");
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  tsdb_epoch_idle(&s_tsdb, false);
+  return claimed;
+}
+
+static bool delete_measurement_owned(const char* measurement_name);
 bool timeseries_delete_measurement(const char* measurement_name) {
   TSDB_OPERATION_GUARD(false);
   if (!measurement_name) {
     return false;
   }
+  if (!claim_maintenance_slot()) return false;
+  bool ok = delete_measurement_owned(measurement_name);
+  atomic_store(&s_tsdb.compaction_in_progress, false);
+  return ok;
+}
+
+static bool delete_measurement_owned(const char* measurement_name) {
   // Hold flash_write_mutex for the entire delete operation to prevent
   // concurrent inserts from writing to flash while we soft-delete records.
   if (s_tsdb.flash_write_mutex) {
-    xSemaphoreTake(s_tsdb.flash_write_mutex, portMAX_DELAY);
+    tsdb_write_lock(&s_tsdb);
   }
   // Invalidate measurement ID cache entry
   if (s_tsdb.meas_cache) {
@@ -1047,12 +1182,12 @@ bool timeseries_delete_measurement(const char* measurement_name) {
       }
     }
   }
+  atomic_fetch_add(&s_tsdb.schema_gen, 1);
   bool result = timeseries_delete_by_measurement(&s_tsdb, measurement_name);
   if (result) {
     // Invalidate all caches that may reference the deleted measurement's data
     tsdb_cache_clear(&s_tsdb);        // Series ID cache
     tsdb_clear_type_cache(&s_tsdb);   // Series type cache
-    tsdb_metadata_cache_invalidate(&s_tsdb);  // Metadata page offset cache
   }
   if (s_tsdb.flash_write_mutex) {
     xSemaphoreGive(s_tsdb.flash_write_mutex);
@@ -1060,22 +1195,30 @@ bool timeseries_delete_measurement(const char* measurement_name) {
   return result;
 }
 
+static bool delete_field_owned(const char* measurement_name, const char* field_name);
 bool timeseries_delete_measurement_and_field(const char* measurement_name, const char* field_name) {
   TSDB_OPERATION_GUARD(false);
   if (!measurement_name || !field_name) {
     return false;
   }
+  if (!claim_maintenance_slot()) return false;
+  bool ok = delete_field_owned(measurement_name, field_name);
+  atomic_store(&s_tsdb.compaction_in_progress, false);
+  return ok;
+}
+
+static bool delete_field_owned(const char* measurement_name, const char* field_name) {
   // Hold flash_write_mutex for the entire delete operation to prevent
   // concurrent inserts from writing to flash while we soft-delete records.
   if (s_tsdb.flash_write_mutex) {
-    xSemaphoreTake(s_tsdb.flash_write_mutex, portMAX_DELAY);
+    tsdb_write_lock(&s_tsdb);
   }
+  atomic_fetch_add(&s_tsdb.schema_gen, 1);
   bool result = timeseries_delete_by_measurement_and_field(&s_tsdb, measurement_name, field_name);
   if (result) {
     // Invalidate all caches that may reference the deleted field's data
     tsdb_cache_clear(&s_tsdb);        // Series ID cache
     tsdb_clear_type_cache(&s_tsdb);   // Series type cache
-    tsdb_metadata_cache_invalidate(&s_tsdb);  // Metadata page offset cache
     // Invalidate measurement ID cache for this measurement
     if (s_tsdb.meas_cache) {
       for (int mc = 0; mc < MEAS_ID_CACHE_SIZE; mc++) {

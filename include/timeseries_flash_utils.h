@@ -18,6 +18,10 @@ uint32_t tsdb_round_up_4k(uint32_t x);
  * bits set that are clear in the old page_size, a plain write would silently
  * corrupt the value (hardware ANDs old & new). This function detects that case
  * and falls back to erase-and-rewrite of the first 4K sector.
+ *
+ * The erase makes the page's first sector transiently blank, so only use this
+ * on a page that is not yet published (page_state FREE), and abort that page
+ * on failure: the write-back is not retried.
  */
 bool tsdb_safe_rewrite_page_header(const esp_partition_t *part,
                                    uint32_t page_offset,

@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_partition.h"
 #include <inttypes.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -132,6 +133,8 @@ static bool ensure_capacity(timeseries_page_stream_writer_t* writer, size_t need
   ESP_LOGV(TAG, "After relocation: type=%u state=%u level=%u",
            verify_hdr.page_type, verify_hdr.page_state, verify_hdr.field_data_level);
   verify_hdr.page_size = new_size;
+  // The copy stays FREE on flash until finalize; only the cache sees it live.
+  verify_hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
 
   if (writer->batch_snapshot) {
     if (!tsdb_pagecache_batch_add(writer->batch_snapshot, new_offset, &verify_hdr)) {
@@ -270,7 +273,11 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
   memset(&hdr, 0xFF, sizeof(hdr));
   hdr.magic_number = TIMESERIES_MAGIC_NUM;
   hdr.page_type = TIMESERIES_PAGE_TYPE_FIELD_DATA;
-  hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
+  // FREE on flash until finalize: a reset mid-compaction must leave no
+  // partially written page for startup (or 1.0.19, which also skips FREE
+  // pages) to read. The live cache keeps the reservation's ACTIVE placeholder,
+  // which excludes other allocators meanwhile.
+  hdr.page_state = TIMESERIES_PAGE_STATE_FREE;
   // Reserve a unique physical page sequence across concurrent allocations.
   hdr.sequence_num = atomic_fetch_add(&db->sequence_num, 1) + 1;
   hdr.field_data_level = to_level;
@@ -708,8 +715,15 @@ bool timeseries_page_stream_writer_finalize(timeseries_page_stream_writer_t* wri
     ESP_LOGE(TAG, "Failed reading existing page header");
     return false;
   }
+  if (hdr.magic_number != TIMESERIES_MAGIC_NUM || hdr.page_state != TIMESERIES_PAGE_STATE_FREE) {
+    ESP_LOGE(TAG, "Page @0x%08" PRIx32 " is not an unpublished output page", writer->base_offset);
+    return false;
+  }
 
-  // Patch page_size using NOR-flash-safe rewrite
+  // 1) Final size while the page is still FREE: if the shrink needs a sector
+  //    erase, a reset in the middle loses only this invisible page (the
+  //    sources are retired after finalize). Any failure aborts (the caller
+  //    releases the page); nothing is retried over partly programmed bytes.
   uint32_t old_page_size = hdr.page_size;
   hdr.page_size = final_size;
 
@@ -717,6 +731,16 @@ bool timeseries_page_stream_writer_finalize(timeseries_page_stream_writer_t* wri
     ESP_LOGE(TAG, "Failed patching final page header");
     return false;
   }
+
+  // 2) Every record is complete: publish on flash. FREE (0xFF) -> ACTIVE
+  //    (0x01) only clears bits.
+  if (tsdb_flash_write_byte(writer->db->partition,
+                            writer->base_offset + offsetof(timeseries_page_header_t, page_state),
+                            TIMESERIES_PAGE_STATE_ACTIVE) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed activating page @0x%08" PRIx32, writer->base_offset);
+    return false;
+  }
+  hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
 
   ESP_LOGI(TAG, "Finalize: Page @0x%08" PRIx32 " size=%" PRIu32 " type=%u state=%u level=%u",
            writer->base_offset, final_size, hdr.page_type, hdr.page_state, hdr.field_data_level);

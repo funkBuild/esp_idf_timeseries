@@ -252,3 +252,67 @@ TEST_CASE("torn: intact records survive the startup repair untouched", "[torn][t
   const uint64_t survivors[] = {1, 2};
   torn_check_recovered(survivors, 2);
 }
+
+/* TS-2 / TS-5: a compaction output page stays FREE on flash (invisible to
+ * startup and to 1.0.19) until finalize has written its final size and every
+ * record; only then is it flipped to ACTIVE. */
+#include "timeseries_page_stream_writer.h"
+
+TEST_CASE("torn: stream-writer output page is FREE until finalize", "[torn][ts2]") {
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_TRUE(timeseries_clear_all());
+  TEST_ASSERT_TRUE(torn_insert(1));
+  timeseries_db_t *db = timeseries_get_db_handle();
+  const esp_partition_t *part = db->partition;
+  uint8_t series_id[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+  timeseries_field_value_t val = {.type = TIMESERIES_FIELD_TYPE_FLOAT, .data.float_val = 1.5f};
+
+  // A finished page: ACTIVE, size shrunk from the 16 KiB reservation.
+  timeseries_page_stream_writer_t done = {0};
+  TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &done, 1, 16384));
+  TEST_ASSERT_TRUE(timeseries_page_stream_writer_begin_series(&done, series_id, TIMESERIES_FIELD_TYPE_FLOAT));
+  TEST_ASSERT_TRUE(timeseries_page_stream_writer_write_timestamp(&done, 1000));
+  TEST_ASSERT_TRUE(timeseries_page_stream_writer_finalize_timestamp(&done));
+  TEST_ASSERT_TRUE(timeseries_page_stream_writer_write_value(&done, &val));
+  TEST_ASSERT_TRUE(timeseries_page_stream_writer_end_series(&done));
+  timeseries_page_header_t h;
+  TEST_ASSERT_EQUAL(ESP_OK, esp_partition_read(part, done.base_offset, &h, sizeof(h)));
+  TEST_ASSERT_EQUAL_HEX8(TIMESERIES_PAGE_STATE_FREE, h.page_state);
+  TEST_ASSERT_TRUE(timeseries_page_stream_writer_finalize(&done));
+  TEST_ASSERT_EQUAL(ESP_OK, esp_partition_read(part, done.base_offset, &h, sizeof(h)));
+  TEST_ASSERT_EQUAL_HEX8(TIMESERIES_PAGE_STATE_ACTIVE, h.page_state);
+  TEST_ASSERT_EQUAL_UINT32(4096, h.page_size);
+  TEST_ASSERT_EQUAL_UINT32(TIMESERIES_MAGIC_NUM, h.magic_number);
+
+  // An unfinished page, as a reset mid-compaction leaves it.
+  timeseries_page_stream_writer_t cut = {0};
+  TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &cut, 1, 8192));
+  TEST_ASSERT_TRUE(timeseries_page_stream_writer_begin_series(&cut, series_id, TIMESERIES_FIELD_TYPE_FLOAT));
+  TEST_ASSERT_TRUE(timeseries_page_stream_writer_write_timestamp(&cut, 2000));
+  TEST_ASSERT_TRUE(timeseries_page_stream_writer_finalize_timestamp(&cut));
+  TEST_ASSERT_TRUE(timeseries_page_stream_writer_write_value(&cut, &val));
+  TEST_ASSERT_TRUE(timeseries_page_stream_writer_end_series(&cut));
+  uint32_t cut_offset = cut.base_offset;
+  TEST_ASSERT_EQUAL(ESP_OK, esp_partition_read(part, cut_offset, &h, sizeof(h)));
+  TEST_ASSERT_EQUAL_HEX8(TIMESERIES_PAGE_STATE_FREE, h.page_state);
+  timeseries_deinit();  // "reset" before finalize
+
+  TEST_ASSERT_TRUE(timeseries_init());
+  db = timeseries_get_db_handle();
+  timeseries_page_cache_iterator_t it;
+  TEST_ASSERT_TRUE(timeseries_page_cache_iterator_init(db, &it));
+  uint32_t off, size;
+  bool cut_live = false, done_live = false;
+  while (timeseries_page_cache_iterator_next(&it, &h, &off, &size)) {
+    cut_live |= off == cut_offset;
+    done_live |= off == done.base_offset;
+  }
+  timeseries_page_cache_iterator_deinit(&it);
+  TEST_ASSERT_FALSE(cut_live);
+  TEST_ASSERT_TRUE(done_live);
+  const uint64_t survivors[] = {1};
+  TEST_ASSERT_TRUE(torn_matches(survivors, 1));
+  TEST_ASSERT_TRUE(torn_insert(3));
+  TEST_ASSERT_TRUE(timeseries_clear_all());
+  timeseries_deinit();
+}

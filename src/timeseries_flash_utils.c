@@ -93,18 +93,13 @@ bool tsdb_safe_rewrite_page_header(const esp_partition_t *part,
     return false;
   }
 
-  // Write the sector back -- retry on failure since data is lost if we don't
-  esp_err_t err = ESP_FAIL;
-  for (int retry = 0; retry < 3; retry++) {
-    err = esp_partition_write(part, page_offset, sector_buf, 4096);
-    if (err == ESP_OK) {
-      break;
-    }
-    ESP_LOGE(TAG, "Failed rewriting sector after erase (attempt %d/3)", retry + 1);
-  }
+  // Write the sector back once. A failed program has already cleared some
+  // bits; writing again would AND stale data into it. Callers rewrite only
+  // unpublished (FREE) pages and abort them on failure.
+  esp_err_t err = esp_partition_write(part, page_offset, sector_buf, 4096);
   free(sector_buf);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "CRITICAL: sector data lost after erase @0x%" PRIx32, page_offset);
+    ESP_LOGE(TAG, "Failed rewriting sector after erase @0x%" PRIx32, page_offset);
     return false;
   }
 

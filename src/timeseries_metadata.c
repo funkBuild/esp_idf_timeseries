@@ -13,6 +13,7 @@
 #include "mbedtls/md.h"
 
 #include <inttypes.h>
+#include <stddef.h>
 #include <string.h>
 
 #include "timeseries_data.h"
@@ -852,12 +853,14 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
     return 0;
   }
 
-  // Phase 1c: Build and write the new page header (ACTIVE)
+  // Phase 1c: Build and write the new page header, FREE until every entry is
+  // on flash: a reset before activation leaves a page startup (and 1.0.19)
+  // ignores, never a second, partially written ACTIVE metadata page.
   timeseries_page_header_t new_hdr;
   memset(&new_hdr, 0xFF, sizeof(new_hdr));
   new_hdr.magic_number = TIMESERIES_MAGIC_NUM;
   new_hdr.page_type = TIMESERIES_PAGE_TYPE_METADATA;
-  new_hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
+  new_hdr.page_state = TIMESERIES_PAGE_STATE_FREE;
   // Atomic increment to avoid duplicate sequence numbers across concurrent
   // page allocations (the field is _Atomic but ++ is a non-atomic RMW).
   new_hdr.sequence_num = atomic_fetch_add(&db->sequence_num, 1) + 1;
@@ -884,6 +887,15 @@ static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_of
 
   free(live_buf);
   live_buf = NULL;
+
+  // Phase 1e: Activate (FREE 0xFF -> ACTIVE 0x01 only clears bits).
+  if (tsdb_flash_write_byte(db->partition, new_page_offset + offsetof(timeseries_page_header_t, page_state),
+                            TIMESERIES_PAGE_STATE_ACTIVE) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed activating new metadata page @0x%08" PRIx32, new_page_offset);
+    tsdb_release_reserved_region(db, new_page_offset, NULL);
+    return 0;
+  }
+  new_hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
 
   if (!tsdb_finalize_reserved_region(db, new_page_offset, &new_hdr, NULL)) {
     ESP_LOGE(TAG, "Failed finalizing metadata reservation @0x%08" PRIx32,

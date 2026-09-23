@@ -1,8 +1,13 @@
 #include "timeseries_revision.h"
 #include "timeseries_iterator.h"
+#include "timeseries_data.h"
+#include "esp_log.h"
+#include <inttypes.h>
 #include "alp/alp_int_codec.h"
 #include <stdlib.h>
 #include <string.h>
+
+static const char *TAG = "TSDB_REVISION";
 
 bool tsdb_revision_next_locked(timeseries_db_t *db, uint64_t *revision) {
   if (!db || !revision || db->write_revision == UINT64_MAX) return false;
@@ -165,6 +170,61 @@ bool tsdb_revision_encode(const uint64_t *values, size_t count, uint64_t scalar,
   return true;
 }
 
+typedef enum { REVISION_FOUND, REVISION_NONE, REVISION_IO_ERROR } record_revision_t;
+
+/* Largest plausible revision a record carries. The trailer's final eight
+ * bytes are the record maximum; if they are implausible (torn, or a maximum
+ * poisoned by a torn source in an older build) a vector is decoded and only
+ * its plausible members count. REVISION_NONE: the stored content yields no
+ * usable revision (the record contributes nothing). REVISION_IO_ERROR: flash
+ * could not be read, so the maximum is unknown. */
+static record_revision_t record_maximum(timeseries_db_t *db, timeseries_fielddata_iterator_t *fields,
+                                        uint32_t page_offset, const timeseries_field_data_header_t *header,
+                                        uint64_t *out) {
+  uint32_t data_offset = page_offset + fields->current_record_offset + sizeof(*header);
+  uint64_t trailer;
+  if (header->record_length < sizeof(trailer)) return REVISION_NONE;
+  if (!timeseries_fielddata_iterator_read_at(fields, data_offset - page_offset + header->record_length -
+                                                         sizeof(trailer), &trailer, sizeof(trailer)))
+    return REVISION_IO_ERROR;
+  if (tsdb_revision_plausible(db, trailer)) { *out = trailer; return REVISION_FOUND; }
+  if (header->flags & TSDB_FIELDDATA_FLAG_REVISION_VECTOR) return REVISION_NONE;  // scalar: nothing else
+  timeseries_col_data_header_t columns;
+  if (header->record_length < sizeof(columns)) return REVISION_NONE;
+  if (esp_partition_read(db->partition, data_offset, &columns, sizeof(columns)) != ESP_OK) return REVISION_IO_ERROR;
+  if (columns.ts_len > header->record_length - sizeof(columns) ||
+      columns.val_len > header->record_length - sizeof(columns) - columns.ts_len) return REVISION_NONE;
+  tsdb_revision_t revision;
+  if (!tsdb_revision_read(db, data_offset, header->record_length,
+                          sizeof(columns) + columns.ts_len + columns.val_len, header->record_count, header->flags,
+                          &revision)) return REVISION_NONE;
+  uint64_t maximum = 0;
+  bool any = false;
+  for (size_t i = 0; revision.values && i < header->record_count; i++)
+    if (tsdb_revision_plausible(db, revision.values[i]) && revision.values[i] >= maximum) {
+      maximum = revision.values[i]; any = true;
+    }
+  free(revision.values);
+  if (any) *out = maximum;
+  return any ? REVISION_FOUND : REVISION_NONE;
+}
+
+/* The iterator stopped with read_error: a malformed record (stored content)
+ * or a flash read failure? Re-read the header it stopped at. */
+static bool stopped_at_malformed(timeseries_db_t *db, uint32_t page_offset, uint32_t page_size, uint32_t record) {
+  timeseries_field_data_header_t header;
+  return record <= page_size && page_size - record >= sizeof(header) &&
+         esp_partition_read(db->partition, page_offset + record, &header, sizeof(header)) == ESP_OK &&
+         sizeof(header) + (uint32_t)header.record_length > page_size - record;
+}
+
+/* Recover the write counter from stored records. Stored content never fails
+ * startup: a malformed record ends that page's scan (the maxima read so far
+ * are kept) and implausible trailers are ignored rather than adopted, which
+ * would otherwise exhaust the counter and disable every insert. Only an
+ * allocation failure or a flash read failure (the maximum would be unknown,
+ * and a low guess would order new writes before stored ones) is fatal; the
+ * counter is then left unchanged. */
 bool tsdb_revision_recover(timeseries_db_t *db) {
   if (!db || !db->partition) return false;
   timeseries_page_cache_iterator_t pages;
@@ -181,20 +241,29 @@ bool tsdb_revision_recover(timeseries_db_t *db) {
       if (!buffer) { ok = false; break; }
     }
     timeseries_fielddata_iterator_t fields;
-    if (!timeseries_fielddata_iterator_init_window(db, offset, size, buffer, 4096, &fields)) { ok = false; break; }
+    if (!timeseries_fielddata_iterator_init_window(db, offset, size, buffer, 4096, &fields)) continue;
     timeseries_field_data_header_t header;
-    while (timeseries_fielddata_iterator_next(&fields, &header)) {
+    while (ok && timeseries_fielddata_iterator_next(&fields, &header)) {
       if (!(header.flags & TSDB_FIELDDATA_FLAG_DELETED)) continue;
       uint32_t data_offset = offset + fields.current_record_offset + sizeof(header);
       uint64_t revision = tsdb_legacy_revision(page.sequence_num, data_offset);
       if (!(header.flags & TSDB_FIELDDATA_FLAG_REVISION)) {
-        if (header.record_length < sizeof(uint64_t) ||
-            !timeseries_fielddata_iterator_read_at(&fields,
-                data_offset - offset + header.record_length - sizeof(uint64_t), &revision, sizeof(revision))) { ok = false; break; }
+        record_revision_t found = record_maximum(db, &fields, offset, &header, &revision);
+        if (found == REVISION_IO_ERROR) { ok = false; break; }
+        if (found == REVISION_NONE) {
+          ESP_LOGW(TAG, "Ignoring implausible revision of record @0x%08" PRIx32, data_offset);
+          continue;
+        }
       }
       if (revision > maximum) maximum = revision;
     }
-    ok = ok && !fields.read_error;
+    if (ok && fields.read_error) {
+      if (stopped_at_malformed(db, offset, size, fields.current_record_offset))
+        ESP_LOGW(TAG, "Revision scan of page @0x%08" PRIx32 " stopped at malformed record +0x%" PRIx32, offset,
+                 fields.current_record_offset);
+      else
+        ok = false;
+    }
     timeseries_fielddata_iterator_deinit(&fields);
   }
   free(buffer);

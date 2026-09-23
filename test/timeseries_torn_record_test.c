@@ -1,0 +1,254 @@
+/* TS-1: a field-data record torn by an interrupted write (reset between the
+ * flash program operations of one esp_partition_write) must never fail
+ * startup. Each test writes real records, tears the last one on flash the way
+ * an ascending, chunked program leaves it (a programmed prefix, erased rest),
+ * restarts the database and checks that init, inserts, queries and compaction
+ * all proceed. */
+#include "unity.h"
+#include "timeseries.h"
+#include "timeseries_data.h"
+#include "timeseries_internal.h"
+#include "timeseries_iterator.h"
+#include "timeseries_page_cache.h"
+#include <stdlib.h>
+#include <string.h>
+
+extern timeseries_db_t *timeseries_get_db_handle(void);
+
+static const char *s_field = "v";
+
+static bool torn_insert(uint64_t ts) {
+  timeseries_field_value_t value = {.type = TIMESERIES_FIELD_TYPE_INT, .data.int_val = (int64_t)ts * 10};
+  timeseries_insert_data_t in = {.measurement_name = "torn", .field_names = &s_field, .field_values = &value,
+                                 .num_fields = 1, .timestamps_ms = &ts, .num_points = 1};
+  return timeseries_insert(&in);
+}
+
+/* True when the query returns exactly these timestamps, each with value ts*10. */
+static bool torn_matches(const uint64_t *expected, size_t n) {
+  timeseries_query_t q = {.measurement_name = "torn"};
+  timeseries_query_result_t r = {0};
+  bool ok = timeseries_query(&q, &r) && r.num_points == n;
+  for (size_t i = 0; ok && i < n; i++)
+    ok = r.timestamps[i] == expected[i] && r.columns[0].values[i].data.int_val == (int64_t)expected[i] * 10;
+  timeseries_query_free_result(&r);
+  return ok;
+}
+
+typedef struct {
+  const esp_partition_t *part;
+  uint32_t page;       // L0 page offset
+  uint32_t page_size;
+  uint32_t record[2];  // absolute offsets of the two records written
+  uint16_t length[2];
+} torn_layout_t;
+
+/* Fresh database holding two single-point L0 records (ts 1 and 2). */
+static torn_layout_t torn_prepare(void) {
+  torn_layout_t l = {0};
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_TRUE(timeseries_clear_all());
+  TEST_ASSERT_TRUE(torn_insert(1));
+  TEST_ASSERT_TRUE(torn_insert(2));
+  timeseries_db_t *db = timeseries_get_db_handle();
+  l.part = db->partition;
+  timeseries_page_cache_iterator_t it;
+  TEST_ASSERT_TRUE(timeseries_page_cache_iterator_init(db, &it));
+  timeseries_page_header_t h;
+  uint32_t off, size;
+  bool found = false;
+  while (!found && timeseries_page_cache_iterator_next(&it, &h, &off, &size))
+    found = h.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA && h.page_state == TIMESERIES_PAGE_STATE_ACTIVE &&
+            h.field_data_level == 0;
+  timeseries_page_cache_iterator_deinit(&it);
+  TEST_ASSERT_TRUE(found);
+  l.page = off;
+  l.page_size = size;
+  timeseries_fielddata_iterator_t f;
+  TEST_ASSERT_TRUE(timeseries_fielddata_iterator_init(db, off, size, &f));
+  timeseries_field_data_header_t fh;
+  size_t n = 0;
+  while (timeseries_fielddata_iterator_next(&f, &fh)) {
+    TEST_ASSERT_LESS_THAN(2, n);
+    l.record[n] = off + f.current_record_offset;
+    l.length[n] = fh.record_length;
+    n++;
+  }
+  timeseries_fielddata_iterator_deinit(&f);
+  TEST_ASSERT_EQUAL(2, n);
+  timeseries_deinit();
+  return l;
+}
+
+/* Replace flash bytes (bits may be set as well as cleared) by rewriting the
+ * containing sector, as a tear or a foreign firmware image would leave them. */
+static void torn_patch(const esp_partition_t *part, uint32_t offset, const void *bytes, int fill, size_t len) {
+  uint32_t sector = offset & ~0xFFFu;
+  TEST_ASSERT_LESS_OR_EQUAL(4096, offset - sector + len);
+  uint8_t *buf = malloc(4096);
+  TEST_ASSERT_NOT_NULL(buf);
+  TEST_ASSERT_EQUAL(ESP_OK, esp_partition_read(part, sector, buf, 4096));
+  if (bytes) memcpy(buf + offset - sector, bytes, len);
+  else memset(buf + offset - sector, fill, len);
+  TEST_ASSERT_EQUAL(ESP_OK, esp_partition_erase_range(part, sector, 4096));
+  TEST_ASSERT_EQUAL(ESP_OK, esp_partition_write(part, sector, buf, 4096));
+  free(buf);
+}
+
+static uint8_t torn_flags(const esp_partition_t *part, uint32_t record) {
+  uint8_t flags = 0;
+  TEST_ASSERT_EQUAL(ESP_OK, esp_partition_read(part, record, &flags, 1));
+  return flags;
+}
+
+/* After restart: startup succeeded, the counter was not taken from a torn
+ * trailer, and inserts, queries and compaction all work. */
+static void torn_check_recovered(const uint64_t *survivors, size_t n) {
+  timeseries_db_t *db = timeseries_get_db_handle();
+  // Not the erased trailer (which would exhaust the counter): at most the
+  // highest page sequence in the high word.
+  TEST_ASSERT_TRUE((db->write_revision >> 32) <= (uint64_t)db->sequence_num);
+  TEST_ASSERT_TRUE(torn_matches(survivors, n));
+  uint64_t expected[4];
+  memcpy(expected, survivors, n * sizeof(*survivors));
+  expected[n] = 3;
+  TEST_ASSERT_TRUE(torn_insert(3));
+  TEST_ASSERT_TRUE(torn_matches(expected, n + 1));
+  TEST_ASSERT_TRUE(timeseries_compact_force_sync());
+  TEST_ASSERT_TRUE(torn_matches(expected, n + 1));
+  expected[n + 1] = 4;
+  TEST_ASSERT_TRUE(torn_insert(4));
+  TEST_ASSERT_TRUE(torn_matches(expected, n + 2));
+  // A second restart finds nothing further to repair and the same data.
+  timeseries_deinit();
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_TRUE(torn_matches(expected, n + 2));
+  TEST_ASSERT_TRUE(timeseries_clear_all());
+  timeseries_deinit();
+}
+
+TEST_CASE("torn: erased revision trailer is dropped, not adopted as the maximum", "[torn][ts1]") {
+  torn_layout_t l = torn_prepare();
+  // Cut after the header/columns: the trailing 8-byte revision stays erased.
+  torn_patch(l.part, l.record[1] + sizeof(timeseries_field_data_header_t) + l.length[1] - sizeof(uint64_t), NULL,
+             0xFF, sizeof(uint64_t));
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_EQUAL_HEX8(0, torn_flags(l.part, l.record[1]) & TSDB_FIELDDATA_FLAG_DELETED);
+  TEST_ASSERT_NOT_EQUAL(0, torn_flags(l.part, l.record[0]) & TSDB_FIELDDATA_FLAG_DELETED);
+  const uint64_t survivors[] = {1};
+  torn_check_recovered(survivors, 1);
+}
+
+TEST_CASE("torn: erased column header is neutralised", "[torn][ts1]") {
+  torn_layout_t l = torn_prepare();
+  // Cut right after the 37-byte record header.
+  uint32_t data = l.record[1] + sizeof(timeseries_field_data_header_t);
+  torn_patch(l.part, data, NULL, 0xFF, l.length[1]);
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_EQUAL_HEX8(0, torn_flags(l.part, l.record[1]) & TSDB_FIELDDATA_FLAG_DELETED);
+  const uint64_t survivors[] = {1};
+  torn_check_recovered(survivors, 1);
+}
+
+TEST_CASE("torn: header with an erased length becomes a deleted filler", "[torn][ts1]") {
+  torn_layout_t l = torn_prepare();
+  // Cut inside the header: flags and count programmed, everything from
+  // record_length on still erased, so the record claims 0xFFFF bytes.
+  uint32_t from = l.record[1] + offsetof(timeseries_field_data_header_t, record_length);
+  torn_patch(l.part, from, NULL, 0xFF, sizeof(timeseries_field_data_header_t) + l.length[1] -
+                                           offsetof(timeseries_field_data_header_t, record_length));
+  TEST_ASSERT_TRUE(timeseries_init());
+  timeseries_field_data_header_t h;
+  TEST_ASSERT_EQUAL(ESP_OK, esp_partition_read(l.part, l.record[1], &h, sizeof(h)));
+  TEST_ASSERT_EQUAL_HEX8(0, h.flags & TSDB_FIELDDATA_FLAG_DELETED);
+  TEST_ASSERT_EQUAL_UINT32(l.page + l.page_size, l.record[1] + sizeof(h) + h.record_length);
+  const uint64_t survivors[] = {1};
+  torn_check_recovered(survivors, 1);
+}
+
+TEST_CASE("torn: overflowing length that cannot become a filler is salvaged", "[torn][ts1]") {
+  torn_layout_t l = torn_prepare();
+  // A length past the page end with bits the filler length needs cleared
+  // (0x2000 & fill == 0): only a copy of the intact prefix can fix the page.
+  uint16_t length = 0x2000;
+  uint32_t fill = l.page + l.page_size - l.record[1] - sizeof(timeseries_field_data_header_t);
+  TEST_ASSERT_NOT_EQUAL(fill, length & fill);
+  torn_patch(l.part, l.record[1] + offsetof(timeseries_field_data_header_t, record_length), &length, 0,
+             sizeof(length));
+  TEST_ASSERT_TRUE(timeseries_init());
+  timeseries_page_header_t old;
+  TEST_ASSERT_EQUAL(ESP_OK, esp_partition_read(l.part, l.page, &old, sizeof(old)));
+  TEST_ASSERT_EQUAL_HEX8(TIMESERIES_PAGE_STATE_OBSOLETE, old.page_state);
+  const uint64_t survivors[] = {1};
+  torn_check_recovered(survivors, 1);
+}
+
+/* 1.0.19 wrote records without a revision trailer (REVISION bit erased).
+ * Rewrite the records selected by legacy_mask in that layout, packed back to
+ * back as 1.0.19 appended them, and update the layout. */
+static void torn_make_legacy(torn_layout_t *l, unsigned legacy_mask) {
+  size_t total = 0;
+  uint8_t *records = malloc(2 * (sizeof(timeseries_field_data_header_t) + 0x800));
+  TEST_ASSERT_NOT_NULL(records);
+  uint32_t first = l->record[0];
+  for (size_t i = 0; i < 2; i++) {
+    timeseries_field_data_header_t h;
+    size_t size = sizeof(h) + l->length[i];
+    TEST_ASSERT_LESS_OR_EQUAL(sizeof(h) + 0x800, size);
+    TEST_ASSERT_EQUAL(ESP_OK, esp_partition_read(l->part, l->record[i], records + total, size));
+    memcpy(&h, records + total, sizeof(h));
+    if (legacy_mask & (1u << i)) {
+      h.flags |= TSDB_FIELDDATA_FLAG_REVISION;
+      h.record_length -= sizeof(uint64_t);
+      memcpy(records + total, &h, sizeof(h));
+      size -= sizeof(uint64_t);
+    }
+    l->record[i] = first + total;
+    l->length[i] = h.record_length;
+    total += size;
+  }
+  // Erase what the beta layout occupied beyond the packed records.
+  uint8_t *padded = malloc(total + 2 * sizeof(uint64_t));
+  TEST_ASSERT_NOT_NULL(padded);
+  memset(padded, 0xFF, total + 2 * sizeof(uint64_t));
+  memcpy(padded, records, total);
+  torn_patch(l->part, first, padded, 0, total + 2 * sizeof(uint64_t));
+  free(padded);
+  free(records);
+}
+
+TEST_CASE("torn: 1.0.19 record torn after its header is neutralised", "[torn][ts1]") {
+  torn_layout_t l = torn_prepare();
+  torn_make_legacy(&l, 3);
+  uint32_t data = l.record[1] + sizeof(timeseries_field_data_header_t);
+  // The second record's columns are erased.
+  torn_patch(l.part, data, NULL, 0xFF, sizeof(timeseries_col_data_header_t));
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_NOT_EQUAL(0, torn_flags(l.part, l.record[0]) & TSDB_FIELDDATA_FLAG_DELETED);
+  TEST_ASSERT_EQUAL_HEX8(0, torn_flags(l.part, l.record[1]) & TSDB_FIELDDATA_FLAG_DELETED);
+  const uint64_t survivors[] = {1};
+  torn_check_recovered(survivors, 1);
+}
+
+TEST_CASE("torn: 1.0.19 header overflow (appended over by 1.0.19) keeps init alive", "[torn][ts1]") {
+  torn_layout_t l = torn_prepare();
+  torn_make_legacy(&l, 3);
+  // Record length torn to a bitwise superset past the page end.
+  uint16_t length = 0xFFFF;
+  torn_patch(l.part, l.record[1] + offsetof(timeseries_field_data_header_t, record_length), &length, 0,
+             sizeof(length));
+  TEST_ASSERT_TRUE(timeseries_init());
+  const uint64_t survivors[] = {1};
+  torn_check_recovered(survivors, 1);
+}
+
+TEST_CASE("torn: intact records survive the startup repair untouched", "[torn][ts1]") {
+  torn_layout_t l = torn_prepare();
+  torn_make_legacy(&l, 1);  // a 1.0.19 record next to a current one
+  uint8_t before[2] = {torn_flags(l.part, l.record[0]), torn_flags(l.part, l.record[1])};
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_EQUAL_HEX8(before[0], torn_flags(l.part, l.record[0]));
+  TEST_ASSERT_EQUAL_HEX8(before[1], torn_flags(l.part, l.record[1]));
+  const uint64_t survivors[] = {1, 2};
+  torn_check_recovered(survivors, 2);
+}

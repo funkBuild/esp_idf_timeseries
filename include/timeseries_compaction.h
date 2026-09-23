@@ -108,6 +108,14 @@ bool timeseries_compact_level_pages(timeseries_db_t *db, uint8_t from_level,
  *
  * @return true on success (all pages processed), false on any error
  */
+/**
+ * @brief Copy the well-formed, non-deleted records of a field-data page whose
+ *        record chain ends in a malformed record into a new page, then retire
+ *        the old page. Used by startup repair when the torn record cannot be
+ *        neutralised in place.
+ */
+bool timeseries_salvage_page_prefix(timeseries_db_t *db, uint32_t page_offset);
+
 bool timeseries_compact_page_list(timeseries_db_t *db,
                                   const uint32_t *page_offsets,
                                   size_t page_count);

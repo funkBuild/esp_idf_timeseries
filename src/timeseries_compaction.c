@@ -479,7 +479,8 @@ size_t timeseries_field_value_serialize(const timeseries_field_value_t* val, uns
  * @return true on success, or if the page was skipped (not active field-data);
  *         false if there's a fatal error.
  */
-static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_page_ofs, uint8_t *window) {
+static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_page_ofs, uint8_t *window,
+                                              bool salvage) {
   // 1) Read the old page header.
   timeseries_page_header_t hdr;
   esp_err_t err = esp_partition_read(db->partition, old_page_ofs, &hdr, sizeof(hdr));
@@ -530,7 +531,10 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_
              (unsigned int)old_page_ofs, (unsigned int)fd_hdr.record_count, (unsigned int)fd_hdr.record_length,
              (unsigned int)f_iter.current_record_offset);
   }
-  bool read_ok = !f_iter.read_error;
+  // Salvage (startup repair of a torn tail) keeps the well-formed prefix; the
+  // caller has already established that the stop is a malformed record, not
+  // a flash read failure.
+  bool read_ok = salvage || !f_iter.read_error;
   timeseries_fielddata_iterator_deinit(&f_iter);
   if (!read_ok) return false;
 
@@ -577,7 +581,7 @@ static bool tsdb_rewrite_page_without_deleted(timeseries_db_t* db, uint32_t old_
         return false;
       }
     }
-    read_ok = !f_iter.read_error;
+    read_ok = salvage || !f_iter.read_error;
     timeseries_fielddata_iterator_deinit(&f_iter);
     if (!read_ok) { timeseries_page_rewriter_abort(&rewriter); return false; }
 
@@ -623,7 +627,7 @@ bool timeseries_compact_page_list(timeseries_db_t* db, const uint32_t* page_offs
     uint32_t old_page_ofs = page_offsets[i];
     // Use our new helper function
     if (db->flash_write_mutex) tsdb_write_lock(db);
-    bool rewritten = tsdb_rewrite_page_without_deleted(db, old_page_ofs, window);
+    bool rewritten = tsdb_rewrite_page_without_deleted(db, old_page_ofs, window, false);
     if (db->flash_write_mutex) xSemaphoreGive(db->flash_write_mutex);
     if (!rewritten) {
       // If there's a fatal error, stop
@@ -634,4 +638,15 @@ bool timeseries_compact_page_list(timeseries_db_t* db, const uint32_t* page_offs
 
   free(window);
   return true;
+}
+
+bool timeseries_salvage_page_prefix(timeseries_db_t* db, uint32_t page_offset) {
+  if (!db) return false;
+  uint8_t *window = malloc(4096);
+  if (!window) return false;
+  if (db->flash_write_mutex) tsdb_write_lock(db);
+  bool ok = tsdb_rewrite_page_without_deleted(db, page_offset, window, true);
+  if (db->flash_write_mutex) xSemaphoreGive(db->flash_write_mutex);
+  free(window);
+  return ok;
 }

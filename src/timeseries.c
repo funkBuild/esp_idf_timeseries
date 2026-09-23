@@ -1,6 +1,7 @@
 #include "timeseries_epoch.h"
 #include "timeseries.h"
 #include "timeseries_revision.h"
+#include "timeseries_repair.h"
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "timeseries_cache.h"
@@ -238,6 +239,13 @@ bool timeseries_init(void) {
     goto init_fail;
   }
 
+  // Stored content must never fail startup (the caller would fall back to
+  // safe mode with no way out but a factory reset). Neutralise records torn
+  // by an interrupted write first, so the revision scan, inserts, queries and
+  // compaction all see well-formed pages; both steps fail only on OOM.
+  if (!tsdb_repair_torn_records(&s_tsdb)) {
+    ESP_LOGW(TAG, "Torn-record repair skipped (out of memory)");
+  }
   if (!tsdb_revision_recover(&s_tsdb)) goto init_fail;
 
   s_tsdb.l0_usage_cache = calloc(TSDB_L0_USAGE_CACHE_SIZE, sizeof(*s_tsdb.l0_usage_cache));

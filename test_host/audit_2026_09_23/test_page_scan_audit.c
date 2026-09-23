@@ -150,9 +150,47 @@ static void test_LIBS_2_torn_page_size_infinite_scan(void) {
     CHECK(ok, "build failed");
 }
 
+// LIBS-2 (sibling): timeseries_entity_iterator_init had the same wrapping
+// `page_offset + page_size > partition size` bound. A size near 2^32 must be
+// rejected, and an exact fit to the partition end still accepted.
+static void test_LIBS_2_entity_iterator_bound(void) {
+    fresh();
+    timeseries_entity_iterator_t it;
+    CHECK(!timeseries_entity_iterator_init(&db, 0x4000, 0xFFFFFFFFu, &it),
+          "entity iterator accepted page @0x4000 with size 0xffffffff");
+    CHECK(!timeseries_entity_iterator_init(&db, 0x4000, 0xFFFFF000u, &it),
+          "entity iterator accepted page @0x4000 with size 0xfffff000");
+    CHECK(!timeseries_entity_iterator_init(&db, PART_SIZE + 0x1000, 0x1000, &it),
+          "entity iterator accepted an offset past the partition");
+    CHECK(timeseries_entity_iterator_init(&db, PART_SIZE - 0x2000, 0x2000, &it),
+          "entity iterator rejected a page ending exactly at the partition end");
+}
+
+// LIBS-2: a torn header in the middle, followed by more valid pages, with the
+// state already ACTIVE and a size that is a bit-superset of 0x2000 but still
+// past the partition end (0x7FFFF000): the scan must skip it and keep every
+// valid page after it, and never report a page extending past the end.
+static void test_LIBS_2_torn_header_pages_after_kept(void) {
+    fresh();
+    put_page(0x0000, TIMESERIES_PAGE_TYPE_METADATA,   TIMESERIES_PAGE_STATE_ACTIVE, 1, 0x2000);
+    put_page(0x2000, TIMESERIES_PAGE_TYPE_METADATA,   TIMESERIES_PAGE_STATE_ACTIVE, 2, 0x7FFFF000u); // torn
+    put_page(0x4000, TIMESERIES_PAGE_TYPE_FIELD_DATA, TIMESERIES_PAGE_STATE_OBSOLETE, 3, 0x2000);
+    put_page(0x6000, TIMESERIES_PAGE_TYPE_FIELD_DATA, TIMESERIES_PAGE_STATE_ACTIVE, 4, 0x2000);
+    put_page(PART_SIZE - 0x2000, TIMESERIES_PAGE_TYPE_FIELD_DATA, TIMESERIES_PAGE_STATE_ACTIVE, 5, 0x2000);
+    read_budget = 100000;
+    if (setjmp(hang_escape)) { CHECK(0, "tsdb_build_page_cache did not terminate"); return; }
+    CHECK(tsdb_build_page_cache(&db), "build failed");
+    const tsdb_page_cache_snapshot_t* s = db.current_snapshot;
+    CHECK(s->count == 3, "expected 3 ACTIVE pages (0x0, 0x6000, end-0x2000), got %zu", s->count);
+    CHECK(find(s, 0x0000) && find(s, 0x6000) && find(s, PART_SIZE - 0x2000), "a valid page is missing");
+    CHECK(!find(s, 0x2000), "torn page @0x2000 was cached");
+}
+
 int main(void) {
     test_LIBS_2_torn_page_size_wraps_scan();
     test_LIBS_2_torn_page_size_infinite_scan();
+    test_LIBS_2_entity_iterator_bound();
+    test_LIBS_2_torn_header_pages_after_kept();
     printf("%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? 1 : 0;
 }

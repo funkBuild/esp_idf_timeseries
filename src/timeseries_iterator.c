@@ -45,8 +45,16 @@ bool timeseries_page_iterator_next(timeseries_page_iterator_t* iter, timeseries_
     if (hdr.magic_number == TIMESERIES_MAGIC_NUM) {
       if (hdr.page_type == TIMESERIES_PAGE_TYPE_METADATA || hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA) {
         uint32_t page_size = hdr.page_size;
-        if (page_size < sizeof(hdr) || (iter->current_offset + page_size) > iter->db->partition->size) {
-          // Invalid size => skip one sector
+        // Bound the size by subtraction: current_offset < partition size here,
+        // so this cannot wrap. A header torn by power loss (or bit decay) can
+        // carry a size near 2^32; the old `offset + size > part_size` form
+        // wrapped, accepted it and moved the cursor backwards (lost pages,
+        // or an endless scan). The page's real extent is unknown, so skip one
+        // sector and keep scanning: the cursor only ever moves forward, and
+        // valid pages after the bad header are still found.
+        if (page_size < sizeof(hdr) || page_size > iter->db->partition->size - iter->current_offset) {
+          ESP_LOGW(TAG, "Invalid page_size 0x%08" PRIx32 " @0x%08" PRIx32 ", skipping sector", page_size,
+                   iter->current_offset);
           iter->current_offset += 4096;
           continue;
         }
@@ -90,7 +98,7 @@ bool timeseries_entity_iterator_init(timeseries_db_t* db, uint32_t page_offset, 
   if (!db || !ent_iter) {
     return false;
   }
-  if (page_offset + page_size > db->partition->size) {
+  if (page_offset > db->partition->size || page_size > db->partition->size - page_offset) {
     return false;
   }
 

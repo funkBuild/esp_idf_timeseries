@@ -16,7 +16,7 @@ from extract_c_functions import extract
 (out / 'iterator_funcs.inc').write_text(extract(comp / 'src/timeseries_iterator.c', [
     'timeseries_page_iterator_init', 'timeseries_page_iterator_next',
     'timeseries_blank_iterator_init', 'timeseries_blank_iterator_deinit',
-    'timeseries_blank_iterator_next']))
+    'timeseries_blank_iterator_next', 'timeseries_entity_iterator_init']))
 PY
 CFLAGS=(-std=gnu11 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-unused-variable
         -I"$OUT" -I"$HERE/stubs" -I"$COMP/include" -I"$COMP/src")

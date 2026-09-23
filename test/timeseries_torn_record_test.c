@@ -316,3 +316,82 @@ TEST_CASE("torn: stream-writer output page is FREE until finalize", "[torn][ts2]
   TEST_ASSERT_TRUE(timeseries_clear_all());
   timeseries_deinit();
 }
+
+/* TS-3: measurement IDs must be found whatever the name length, and an ID torn
+ * by an interrupted write (erased top byte) must not be adopted. */
+#include "timeseries_metadata.h"
+
+static bool torn_insert_into(const char *measurement, uint64_t ts) {
+  timeseries_field_value_t value = {.type = TIMESERIES_FIELD_TYPE_INT, .data.int_val = (int64_t)ts};
+  timeseries_insert_data_t in = {.measurement_name = measurement, .field_names = &s_field, .field_values = &value,
+                                 .num_fields = 1, .timestamps_ms = &ts, .num_points = 1};
+  return timeseries_insert(&in);
+}
+
+TEST_CASE("torn: a long measurement name keeps its ID after restart", "[torn][ts3]") {
+  char long_name[101];
+  memset(long_name, 'm', 100);
+  long_name[100] = 0;
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_TRUE(timeseries_clear_all());
+  TEST_ASSERT_TRUE(torn_insert_into("short", 1));
+  TEST_ASSERT_TRUE(torn_insert_into(long_name, 1));  // highest ID has a 100-byte name
+  timeseries_db_t *db = timeseries_get_db_handle();
+  uint32_t long_id = 0;
+  TEST_ASSERT_TRUE(tsdb_find_measurement_id(db, long_name, &long_id));
+  timeseries_deinit();
+  TEST_ASSERT_TRUE(timeseries_init());
+  db = timeseries_get_db_handle();
+  TEST_ASSERT_GREATER_THAN_UINT32(long_id, db->next_measurement_id);
+  TEST_ASSERT_TRUE(torn_insert_into("after", 1));
+  uint32_t after_id = 0;
+  TEST_ASSERT_TRUE(tsdb_find_measurement_id(db, "after", &after_id));
+  TEST_ASSERT_NOT_EQUAL(long_id, after_id);
+  TEST_ASSERT_TRUE(timeseries_clear_all());
+  timeseries_deinit();
+}
+
+TEST_CASE("torn: a torn measurement ID is not adopted", "[torn][ts3]") {
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_TRUE(timeseries_clear_all());
+  TEST_ASSERT_TRUE(torn_insert_into("first", 1));
+  TEST_ASSERT_TRUE(torn_insert_into("torn_one", 1));
+  timeseries_db_t *db = timeseries_get_db_handle();
+  const esp_partition_t *part = db->partition;
+  // Find the "torn_one" MEASUREMENT entry and erase its ID's top byte.
+  uint32_t id_offset = 0;
+  timeseries_page_cache_iterator_t it;
+  TEST_ASSERT_TRUE(timeseries_page_cache_iterator_init(db, &it));
+  timeseries_page_header_t h;
+  uint32_t off, size;
+  while (!id_offset && timeseries_page_cache_iterator_next(&it, &h, &off, &size)) {
+    if (h.page_type != TIMESERIES_PAGE_TYPE_METADATA) continue;
+    timeseries_entity_iterator_t e;
+    TEST_ASSERT_TRUE(timeseries_entity_iterator_init(db, off, TIMESERIES_METADATA_PAGE_SIZE, &e));
+    timeseries_entry_header_t eh;
+    char key[16];
+    while (timeseries_entity_iterator_next(&e, &eh)) {
+      if (eh.key_type != TIMESERIES_KEYTYPE_MEASUREMENT || eh.key_len != 8) continue;
+      uint32_t id;
+      TEST_ASSERT_TRUE(timeseries_entity_iterator_read_data(&e, &eh, key, &id));
+      if (!memcmp(key, "torn_one", 8))
+        id_offset = off + e.current_entry_offset + sizeof(eh) + eh.key_len;
+    }
+    timeseries_entity_iterator_deinit(&e);
+  }
+  timeseries_page_cache_iterator_deinit(&it);
+  TEST_ASSERT_NOT_EQUAL(0, id_offset);
+  timeseries_deinit();
+  torn_patch(part, id_offset + 3, NULL, 0xFF, 1);
+  TEST_ASSERT_TRUE(timeseries_init());
+  db = timeseries_get_db_handle();
+  TEST_ASSERT_LESS_THAN_UINT32(1u << 24, db->next_measurement_id);
+  TEST_ASSERT_NOT_EQUAL(0, db->next_measurement_id);
+  uint32_t id = 0;
+  TEST_ASSERT_FALSE(tsdb_find_measurement_id(db, "torn_one", &id));
+  TEST_ASSERT_TRUE(torn_insert_into("torn_one", 2));  // gets a fresh ID
+  TEST_ASSERT_TRUE(tsdb_find_measurement_id(db, "torn_one", &id));
+  TEST_ASSERT_LESS_THAN_UINT32(1u << 24, id);
+  TEST_ASSERT_TRUE(timeseries_clear_all());
+  timeseries_deinit();
+}

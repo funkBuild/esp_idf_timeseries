@@ -29,6 +29,11 @@
 
 static const char* TAG = "TimeseriesMetadata";
 
+// Measurement IDs count up from 1; 2^24 is far beyond any real database. An
+// entry whose ID write was cut short keeps an erased (0xFF) top byte.
+#define TSDB_MEASUREMENT_ID_LIMIT (1u << 24)
+static inline bool tsdb_measurement_id_plausible(uint32_t id) { return id < TSDB_MEASUREMENT_ID_LIMIT; }
+
 // Max linear probe distance for type cache collision resolution
 #define TYPE_CACHE_MAX_PROBE 4
 
@@ -235,8 +240,8 @@ bool tsdb_find_measurement_id(timeseries_db_t* db, const char* measurement_name,
 
           ESP_LOGV(TAG, "Read measurement entry: key='%s' val=%" PRIu32, key_buf, val);
 
-          // Compare
-          if (strcmp(key_buf, measurement_name) == 0) {
+          // Compare. A torn ID is skipped, so the name gets a fresh one.
+          if (strcmp(key_buf, measurement_name) == 0 && tsdb_measurement_id_plausible(val)) {
             *out_id = val;
             free(key_buf);
             timeseries_entity_iterator_deinit(&ent_iter);
@@ -327,14 +332,15 @@ bool tsdb_find_max_measurement_id(timeseries_db_t *db, uint32_t *out_max) {
       if (e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
         continue;
       }
-      // Read the measurement ID (stored as the value)
-      char key_buf[64];
+      // Read only the measurement ID (the value); the name may be up to 255
+      // bytes, and skipping long names made their IDs invisible here, so the
+      // next measurement reused them. An ID torn by an interrupted write
+      // (0xFF top byte) is not a real ID and must not wrap next_id to 0.
       uint32_t val = 0;
-      if (e_hdr.value_len == sizeof(uint32_t) && e_hdr.key_len < sizeof(key_buf) &&
-          timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key_buf, &val)) {
-        if (val > *out_max) {
-          *out_max = val;
-        }
+      if (e_hdr.value_len == sizeof(uint32_t) &&
+          timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, NULL, &val) &&
+          tsdb_measurement_id_plausible(val) && val > *out_max) {
+        *out_max = val;
       }
     }
     timeseries_entity_iterator_deinit(&ent_iter);

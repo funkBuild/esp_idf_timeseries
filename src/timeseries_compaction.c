@@ -350,21 +350,37 @@ static bool tsdb_find_level_pages(timeseries_db_t* db, uint8_t source_level, tsd
     return false;
   }
   size_t found = 0;
+  // The oldest pages by sequence number (allocation order), not the first by
+  // offset: pages are allocated in write order and every level is compacted
+  // oldest-first, so for in-order inserts a run merges a contiguous span of
+  // time and the records of a series at a level do not overlap. (The oldest
+  // record start in a page would need a scan of every page; for in-order data
+  // it selects the same pages.)
+  uint32_t sequence[MAX_PAGES_PER_LEVEL];
+  size_t seen = 0;
 
   while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &offset, &size)) {
     // Is it an active field-data page at the desired level?
     if (hdr.magic_number == TIMESERIES_MAGIC_NUM && hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA &&
         hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE && hdr.field_data_level == source_level) {
-      if (found < MAX_PAGES_PER_LEVEL) {
-        temp[found].offset = offset;
-        temp[found].size = size;
-        found++;
+      seen++;
+      size_t slot = found;
+      if (found == MAX_PAGES_PER_LEVEL) {
+        // Replace the newest selected page if this one is older.
+        slot = 0;
+        for (size_t i = 1; i < found; i++)
+          if (sequence[i] > sequence[slot]) slot = i;
+        if (hdr.sequence_num >= sequence[slot]) continue;
       } else {
-        ESP_LOGW(TAG, "Too many pages found at level=%u (> %d).", source_level, MAX_PAGES_PER_LEVEL);
-        break;
+        found++;
       }
+      temp[slot].offset = offset;
+      temp[slot].size = size;
+      sequence[slot] = hdr.sequence_num;
     }
   }
+  if (seen > found)
+    ESP_LOGI(TAG, "Level %u has %zu pages; compacting the %zu oldest.", source_level, seen, found);
   timeseries_page_cache_iterator_deinit(&page_iter);
 
   if (found == 0) {

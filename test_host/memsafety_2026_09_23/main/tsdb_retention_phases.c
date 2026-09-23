@@ -244,11 +244,36 @@ static size_t rs_record_ranges(uint8_t level, uint64_t (*out)[2], size_t cap) {
   return n;
 }
 
+/* ---- R15: compaction merges in time order ------------------------------ */
+// In-order inserts whose L0 pages are not in offset order: after the L0->L1
+// compactions, the level-1 records of a series must not overlap in time.
+static int t_compaction_time_contiguous(void) {
+  int bad = 0;
+  rs_build_interleaved("R15");
+  uint64_t ranges[64][2];
+  size_t n = rs_record_ranges(1, ranges, 64);
+  for (size_t i = 0; i < n; i++) {
+    printf("R15: L1 record of ret.a: k[%" PRIu64 "..%" PRIu64 "]\n", (ranges[i][0] - RS_TS0) / RS_STEP,
+           (ranges[i][1] - RS_TS0) / RS_STEP);
+    if (i && ranges[i][0] <= ranges[i - 1][1]) {
+      printf("R15: FAIL L1 records k[..%" PRIu64 "] and k[%" PRIu64 "..] of ret.a overlap in time\n",
+             (ranges[i - 1][1] - RS_TS0) / RS_STEP, (ranges[i][0] - RS_TS0) / RS_STEP);
+      bad++;
+    }
+  }
+  if (!n) {
+    printf("R15: FAIL no level-1 records\n");
+    bad++;
+  }
+  rs_reset();
+  return bad;
+}
+
 int retention_main(const char* which) {
   struct {
     const char* name;
     int (*fn)(void);
-  } t[] = {{"R14", t_expiration_horizon_interleaved}};
+  } t[] = {{"R14", t_expiration_horizon_interleaved}, {"R15", t_compaction_time_contiguous}};
   int bad = 0;
   for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
     if (strcmp(which, "all") && strcmp(which, t[i].name)) continue;

@@ -186,11 +186,36 @@ static void test_LIBS_2_torn_header_pages_after_kept(void) {
     CHECK(!find(s, 0x2000), "torn page @0x2000 was cached");
 }
 
+// TS-6: a torn/decayed page_size that stays in range but is not a whole
+// number of 4 KiB sectors (0x2000 -> 0x2010) moved the cursor off the sector
+// grid; every later page was missed and its region handed to the allocator.
+// It must be rejected like an out-of-range size, and every skip must land on
+// the next sector boundary.
+static void test_TS_6_unaligned_page_size(void) {
+    fresh();
+    put_page(0x0000, TIMESERIES_PAGE_TYPE_METADATA,   TIMESERIES_PAGE_STATE_ACTIVE, 1, 0x2000);
+    put_page(0x2000, TIMESERIES_PAGE_TYPE_FIELD_DATA, TIMESERIES_PAGE_STATE_ACTIVE, 2, 0x2010); // torn
+    put_page(0x4000, TIMESERIES_PAGE_TYPE_FIELD_DATA, TIMESERIES_PAGE_STATE_ACTIVE, 3, 0x2000);
+    put_page(0x6000, TIMESERIES_PAGE_TYPE_FIELD_DATA, TIMESERIES_PAGE_STATE_OBSOLETE, 4, 0x1010); // torn, skipped
+    put_page(0x8000, TIMESERIES_PAGE_TYPE_FIELD_DATA, TIMESERIES_PAGE_STATE_ACTIVE, 5, 0x2000);
+    read_budget = 100000;
+    if (setjmp(hang_escape)) { CHECK(0, "tsdb_build_page_cache did not terminate"); return; }
+    CHECK(tsdb_build_page_cache(&db), "build failed");
+    const tsdb_page_cache_snapshot_t* s = db.current_snapshot;
+    CHECK(!find(s, 0x2000), "page with unaligned size 0x2010 was cached");
+    CHECK(find(s, 0x4000) != NULL, "valid page @0x4000 after the unaligned header is missing");
+    CHECK(find(s, 0x8000) != NULL, "valid page @0x8000 after the second unaligned header is missing");
+    for (size_t i = 0; i < s->count; i++)
+        CHECK((s->entries[i].offset & 0xFFF) == 0, "cached page off the sector grid @0x%05x",
+              (unsigned)s->entries[i].offset);
+}
+
 int main(void) {
     test_LIBS_2_torn_page_size_wraps_scan();
     test_LIBS_2_torn_page_size_infinite_scan();
     test_LIBS_2_entity_iterator_bound();
     test_LIBS_2_torn_header_pages_after_kept();
+    test_TS_6_unaligned_page_size();
     printf("%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? 1 : 0;
 }

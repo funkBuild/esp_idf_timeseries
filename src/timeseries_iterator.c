@@ -52,10 +52,15 @@ bool timeseries_page_iterator_next(timeseries_page_iterator_t* iter, timeseries_
         // or an endless scan). The page's real extent is unknown, so skip one
         // sector and keep scanning: the cursor only ever moves forward, and
         // valid pages after the bad header are still found.
-        if (page_size < sizeof(hdr) || page_size > iter->db->partition->size - iter->current_offset) {
+        // Every writer (1.0.19 and later) sizes pages in whole 4 KiB sectors;
+        // anything else is a torn or decayed header. Accepting it would move
+        // the cursor off the sector grid and hide every later page (whose
+        // regions the allocator would then erase).
+        if (page_size < sizeof(hdr) || (page_size & 0xFFFu) ||
+            page_size > iter->db->partition->size - iter->current_offset) {
           ESP_LOGW(TAG, "Invalid page_size 0x%08" PRIx32 " @0x%08" PRIx32 ", skipping sector", page_size,
                    iter->current_offset);
-          iter->current_offset += 4096;
+          iter->current_offset = (iter->current_offset & ~0xFFFu) + 4096;
           continue;
         }
 
@@ -81,8 +86,8 @@ bool timeseries_page_iterator_next(timeseries_page_iterator_t* iter, timeseries_
       }
     }
 
-    // If no valid magic or unknown => skip one sector (4096)
-    iter->current_offset += 4096;
+    // If no valid magic or unknown => skip to the next sector boundary
+    iter->current_offset = (iter->current_offset & ~0xFFFu) + 4096;
   }
 
   iter->valid = false;

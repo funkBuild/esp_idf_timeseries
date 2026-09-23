@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "timeseries.h"
+#include "esp_timer.h"
 #include "timeseries_compaction.h"
 #include "timeseries_data.h"
 #include "timeseries_expiration.h"
@@ -424,16 +425,72 @@ static int t_trim_failure(void) {
   return bad;
 }
 
+/* ---- B1: flash wear and expiration latency (benchmark, not in "all") ---- */
+// A heartbeat-like load: 8000 inserts of 12 fields x 1 point, expiration
+// every 100 inserts (35% usage threshold, free 5% of the partition: the
+// product's 5% at a threshold this load reaches) after a synchronous
+// compaction, background compaction as in the product. Reports flash writes and
+// erases per 1000 inserts and the time spent in each expiration call.
+extern _Atomic uint64_t review_write_bytes, review_erase_bytes;
+extern atomic_uint review_erase_calls;
+extern unsigned review_write_calls(void);
+static int t_bench_wear_latency(void) {
+  timeseries_clear_all();
+  static const char* names[12] = {"f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11"};
+  timeseries_field_value_t fv[12];
+  unsigned w0 = review_write_calls(), e0 = atomic_load(&review_erase_calls);
+  uint64_t wb0 = atomic_load(&review_write_bytes), eb0 = atomic_load(&review_erase_bytes);
+  uint64_t ts = RS_TS0, exp_us = 0, exp_max = 0;
+  unsigned exp_calls = 0, failed = 0;
+  uint32_t s = 12345;
+  const unsigned N = 8000;
+  for (unsigned i = 0; i < N; i++) {
+    for (int f = 0; f < 12; f++) {
+      s ^= s << 13;
+      s ^= s >> 17;
+      s ^= s << 5;
+      fv[f].type = TIMESERIES_FIELD_TYPE_FLOAT;
+      fv[f].data.float_val = (double)(s % 100000) / 7.0;
+    }
+    ts += 1000;
+    timeseries_insert_data_t d = {.measurement_name = "bench", .field_names = names, .field_values = fv,
+                                  .num_fields = 12, .timestamps_ms = &ts, .num_points = 1};
+    if (!timeseries_insert(&d)) failed++;
+    if (i % 100 == 99) {
+      // Settle compaction first: expiration needs the maintenance slot and
+      // returns "busy" (doing nothing) while a compaction holds it.
+      timeseries_compact_sync();
+      int64_t t0 = esp_timer_get_time();
+      timeseries_expiration_run(review_db(), 0.35f, 0.05f);
+      uint64_t dt = (uint64_t)(esp_timer_get_time() - t0);
+      exp_us += dt;
+      exp_calls++;
+      if (dt > exp_max) exp_max = dt;
+    }
+  }
+  timeseries_compact_sync();
+  unsigned writes = review_write_calls() - w0, erases = atomic_load(&review_erase_calls) - e0;
+  uint64_t wbytes = atomic_load(&review_write_bytes) - wb0, ebytes = atomic_load(&review_erase_bytes) - eb0;
+  tsdb_usage_summary_t us;
+  timeseries_get_usage_summary(&us);
+  printf("B1: %u inserts (%u failed); per 1000 successful inserts: %.1f writes, %.1f KiB written, %.1f erases, %.1f KiB erased; "
+         "expire: %u calls, mean %.2f ms, max %.2f ms; final usage %" PRIu32 " KiB\n",
+         N, failed, writes * 1000.0 / (N - failed), wbytes / 1024.0 * 1000.0 / (N - failed),
+         erases * 1000.0 / (N - failed), ebytes / 1024.0 * 1000.0 / (N - failed), exp_calls, exp_us / 1000.0 / exp_calls, exp_max / 1000.0,
+         us.used_space_bytes / 1024);
+  return failed ? 1 : 0;
+}
+
 int retention_main(const char* which) {
   struct {
     const char* name;
     int (*fn)(void);
   } t[] = {{"R14", t_expiration_horizon_interleaved}, {"R15", t_compaction_time_contiguous},
            {"R16", t_backfill_before_horizon},        {"R17", t_restart_between_runs},
-           {"R18", t_trim_failure}};
+           {"R18", t_trim_failure},                   {"B1", t_bench_wear_latency}};
   int bad = 0;
   for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
-    if (strcmp(which, "all") && strcmp(which, t[i].name)) continue;
+    if (strcmp(which, "all") ? strcmp(which, t[i].name) : t[i].name[0] == 'B') continue;  // benchmarks on request
     int b = t[i].fn();
     printf("%s %s\n", b ? "FAIL" : "PASS", t[i].name);
     fflush(stdout);

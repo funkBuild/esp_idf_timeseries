@@ -38,6 +38,8 @@
  * printf and deadlock the next printer on the libc stdout lock (sim artifact). */
 static atomic_uint s_bad_writes;
 static atomic_uint s_writes;
+_Atomic uint64_t review_write_bytes, review_erase_bytes;
+atomic_uint review_erase_calls;
 esp_err_t __real_esp_partition_write(const esp_partition_t* p, size_t off, const void* src, size_t len);
 TaskHandle_t _Atomic review_fail_write_task;  // TSDB_REVIEW fault injection (tsdb_review_phases.c)
 _Atomic uint32_t review_fail_write_len, review_fail_write_offset;
@@ -50,9 +52,19 @@ esp_err_t __wrap_esp_partition_write(const esp_partition_t* p, size_t off, const
   }
   esp_err_t r = __real_esp_partition_write(p, off, src, len);
   atomic_fetch_add(&s_writes, 1);
+  atomic_fetch_add(&review_write_bytes, len);
   if (r == ESP_ERR_FLASH_OP_FAIL) atomic_fetch_add(&s_bad_writes, 1);
   return r;
 }
+
+/* Flash-wear counters for the retention benchmark (B1). */
+esp_err_t __real_esp_partition_erase_range(const esp_partition_t* p, size_t off, size_t len);
+esp_err_t __wrap_esp_partition_erase_range(const esp_partition_t* p, size_t off, size_t len) {
+  atomic_fetch_add(&review_erase_calls, 1);
+  atomic_fetch_add(&review_erase_bytes, len);
+  return __real_esp_partition_erase_range(p, off, len);
+}
+unsigned review_write_calls(void) { return atomic_load(&s_writes); }
 
 /* PROTO-TS-1b hooks. tsdb_snapshot_acquire_current() hands us the db pointer;
  * timeseries_page_cache_iterator_deinit() is where tsdb_find_metadata_pages()

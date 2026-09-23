@@ -1,5 +1,5 @@
 idf_component_register(SRCS "tsdb_churn.c" "tsdb_review_phases.c" "tsdb_retention_phases.c" PRIV_REQUIRES spi_flash esp_partition esp_idf_timeseries esp_timer mbedtls)
-target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_partition_write"
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_partition_write" "-Wl,--wrap=esp_partition_erase_range"
                       "-Wl,--wrap=tsdb_snapshot_acquire_current" "-Wl,--wrap=timeseries_page_cache_iterator_deinit"
                       "-Wl,--wrap=pthread_join" "-Wl,--wrap=malloc" "-Wl,--wrap=calloc" "-Wl,--wrap=realloc"
                       "-Wl,--wrap=aligned_alloc"

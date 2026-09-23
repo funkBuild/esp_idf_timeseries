@@ -43,6 +43,41 @@ static inline bool tsdb_measurement_id_plausible(uint32_t id) { return id < TSDB
 
 static bool tsdb_create_empty_metadata_page(timeseries_db_t* db, uint32_t page_offset);
 static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_offset, uint32_t *out_new_offset);
+
+/* Where the next metadata entry of `need` bytes goes on this page. The entry
+ * iterator stops without advancing both at the blank tail and at a header
+ * whose extent overflows the page (a torn entry header); the second is not
+ * free space, and writing there would AND a new entry into programmed bytes.
+ * So a non-blank stop means the page is sealed (treated as full), and the
+ * target range must read back erased before it is used. Returns false when
+ * the entry cannot be appended to this page. */
+static bool tsdb_meta_append_offset(timeseries_db_t* db, uint32_t page_offset, uint32_t page_size, uint32_t need,
+                                    uint32_t* out_entry_offset) {
+  timeseries_entity_iterator_t it;
+  if (!timeseries_entity_iterator_init(db, page_offset, page_size, &it)) return false;
+  uint32_t last = it.offset;
+  timeseries_entry_header_t hdr;
+  while (timeseries_entity_iterator_next(&it, &hdr)) last = it.offset;
+  bool read_error = it.read_error;
+  timeseries_entity_iterator_deinit(&it);
+  if (read_error || last > page_size || need > page_size - last) return false;
+  // Verify the tail from `last` (including the stop header) is erased.
+  uint8_t buf[64];
+  for (uint32_t done = 0; done < need;) {
+    uint32_t n = need - done < sizeof(buf) ? need - done : (uint32_t)sizeof(buf);
+    if (esp_partition_read(db->partition, page_offset + last + done, buf, n) != ESP_OK) return false;
+    for (uint32_t i = 0; i < n; i++) {
+      if (buf[i] != 0xFF) {
+        ESP_LOGW(TAG, "Metadata page @0x%08" PRIx32 " has a non-blank tail @+0x%" PRIx32 "; treating it as full",
+                 page_offset, last);
+        return false;
+      }
+    }
+    done += n;
+  }
+  *out_entry_offset = page_offset + last;
+  return true;
+}
 static bool tsdb_insert_measurement_entry(timeseries_db_t* db, uint32_t page_offset, const char* measurement_name,
                                           uint32_t id);
 // Every ACTIVE metadata page, in offset order. The list keeps up to four
@@ -462,20 +497,6 @@ bool tsdb_ensure_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
       uint32_t page_offset = meta_offsets[p];
       uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
 
-      timeseries_entity_iterator_t ent_iter;
-      if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-        continue;
-      }
-
-      uint32_t last_offset = ent_iter.offset;
-      timeseries_entry_header_t e_hdr;
-      while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-        last_offset = ent_iter.offset;
-      }
-      timeseries_entity_iterator_deinit(&ent_iter);
-
-      uint32_t entry_offset = page_offset + last_offset;
-
       timeseries_entry_header_t new_hdr;
       memset(&new_hdr, 0, sizeof(new_hdr));
       new_hdr.delete_marker = TIMESERIES_DELETE_MARKER_VALID;
@@ -484,25 +505,17 @@ bool tsdb_ensure_series_type_in_metadata(timeseries_db_t* db, const unsigned cha
       new_hdr.value_len = 1;
 
       uint32_t total_entry_size = sizeof(new_hdr) + new_hdr.key_len + new_hdr.value_len;
-      if (entry_offset + total_entry_size > page_offset + page_size) {
+      uint32_t entry_offset = 0;
+      if (!tsdb_meta_append_offset(db, page_offset, page_size, total_entry_size, &entry_offset)) {
         uint32_t reclaimed = tsdb_compact_metadata_page(db, page_offset, &page_offset);
-        if (reclaimed > 0) {
-          timeseries_entity_iterator_t retry_iter;
-          if (timeseries_entity_iterator_init(db, page_offset, page_size, &retry_iter)) {
-            last_offset = retry_iter.offset;
-            while (timeseries_entity_iterator_next(&retry_iter, &e_hdr)) {
-              last_offset = retry_iter.offset;
-            }
-            timeseries_entity_iterator_deinit(&retry_iter);
-            entry_offset = page_offset + last_offset;
-          }
-        }
-        if (entry_offset + total_entry_size > page_offset + page_size) {
+        if (reclaimed == 0 ||
+            !tsdb_meta_append_offset(db, page_offset, page_size, total_entry_size, &entry_offset)) {
           continue;  // Still full, try next page
         }
       }
 
-      // Build complete entry in a single buffer for atomic write (power-loss safety)
+      // Build the complete entry in one buffer: a single write (not atomic: the
+      // flash driver programs it in chunks; tsdb_meta_append_offset seals a torn tail)
       uint8_t entry_buf[sizeof(new_hdr) + 16 + 1];
       uint8_t stored_type = (uint8_t)field_type;
       memcpy(entry_buf, &new_hdr, sizeof(new_hdr));
@@ -999,22 +1012,6 @@ static bool tsdb_insert_measurement_entry(timeseries_db_t* db, uint32_t page_off
 
   uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
 
-  // find the end offset of this page
-  timeseries_entity_iterator_t ent_iter;
-  if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-    return false;
-  }
-
-  uint32_t last_offset = ent_iter.offset;
-  timeseries_entry_header_t e_hdr;
-  while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-    last_offset = ent_iter.offset;
-  }
-
-  timeseries_entity_iterator_deinit(&ent_iter);
-
-  uint32_t entry_offset = page_offset + last_offset;
-
   // build header
   timeseries_entry_header_t new_hdr;
   memset(&new_hdr, 0, sizeof(new_hdr));
@@ -1025,26 +1022,17 @@ static bool tsdb_insert_measurement_entry(timeseries_db_t* db, uint32_t page_off
 
   // Bounds check: ensure entry fits within the metadata page
   uint32_t total_entry_size = sizeof(new_hdr) + new_hdr.key_len + new_hdr.value_len;
-  if (entry_offset + total_entry_size > page_offset + page_size) {
+  uint32_t entry_offset = 0;
+  if (!tsdb_meta_append_offset(db, page_offset, page_size, total_entry_size, &entry_offset)) {
     uint32_t reclaimed = tsdb_compact_metadata_page(db, page_offset, &page_offset);
-    if (reclaimed > 0) {
-      if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-        return false;
-      }
-      last_offset = ent_iter.offset;
-      while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-        last_offset = ent_iter.offset;
-      }
-      timeseries_entity_iterator_deinit(&ent_iter);
-      entry_offset = page_offset + last_offset;
-    }
-    if (entry_offset + total_entry_size > page_offset + page_size) {
+    if (reclaimed == 0 || !tsdb_meta_append_offset(db, page_offset, page_size, total_entry_size, &entry_offset)) {
       ESP_LOGW(TAG, "Metadata page full: cannot insert measurement '%s'", measurement_name);
       return false;
     }
   }
 
-  // Build complete entry in a single buffer for atomic write (power-loss safety)
+  // Build the complete entry in one buffer: a single write (not atomic: the
+  // flash driver programs it in chunks; tsdb_meta_append_offset seals a torn tail)
   uint8_t *entry_buf = malloc(total_entry_size);
   if (!entry_buf) {
     ESP_LOGE(TAG, "Failed to allocate %u bytes for measurement entry", (unsigned)total_entry_size);
@@ -1279,23 +1267,7 @@ static bool tsdb_create_new_index_entry(timeseries_db_t* db, uint32_t page_offse
     return false;
   }
 
-  // Initialize an entity iterator to find the end of the page
   uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
-  timeseries_entity_iterator_t ent_iter;
-  if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-    return false;
-  }
-
-  // Find last offset in that page
-  uint32_t last_offset = ent_iter.offset;
-  timeseries_entry_header_t e_hdr;
-  while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-    last_offset = ent_iter.offset;
-  }
-
-  timeseries_entity_iterator_deinit(&ent_iter);
-
-  uint32_t entry_offset = page_offset + last_offset;
 
   // Build header
   timeseries_entry_header_t new_hdr;
@@ -1312,26 +1284,17 @@ static bool tsdb_create_new_index_entry(timeseries_db_t* db, uint32_t page_offse
 
   // Bounds check: ensure entry fits within the metadata page
   uint32_t total_entry_size = sizeof(new_hdr) + new_hdr.key_len + new_hdr.value_len;
-  if (entry_offset + total_entry_size > page_offset + page_size) {
+  uint32_t entry_offset = 0;
+  if (!tsdb_meta_append_offset(db, page_offset, page_size, total_entry_size, &entry_offset)) {
     uint32_t reclaimed = tsdb_compact_metadata_page(db, page_offset, &page_offset);
-    if (reclaimed > 0) {
-      if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
-        return false;
-      }
-      last_offset = ent_iter.offset;
-      while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-        last_offset = ent_iter.offset;
-      }
-      timeseries_entity_iterator_deinit(&ent_iter);
-      entry_offset = page_offset + last_offset;
-    }
-    if (entry_offset + total_entry_size > page_offset + page_size) {
+    if (reclaimed == 0 || !tsdb_meta_append_offset(db, page_offset, page_size, total_entry_size, &entry_offset)) {
       ESP_LOGW(TAG, "Metadata page full (even after compaction): cannot insert index entry for '%s'", key_str);
       return false;
     }
   }
 
-  // Build complete entry in a single buffer for atomic write (power-loss safety)
+  // Build the complete entry in one buffer: a single write (not atomic: the
+  // flash driver programs it in chunks; tsdb_meta_append_offset seals a torn tail)
   uint8_t *entry_buf = malloc(total_entry_size);
   if (!entry_buf) {
     ESP_LOGE(TAG, "Failed to allocate %u bytes for index entry", (unsigned)total_entry_size);

@@ -395,3 +395,51 @@ TEST_CASE("torn: a torn measurement ID is not adopted", "[torn][ts3]") {
   TEST_ASSERT_TRUE(timeseries_clear_all());
   timeseries_deinit();
 }
+
+/* TS-4: an entry header torn at the metadata tail (overflowing length) must
+ * seal the page, not become the next append target. */
+TEST_CASE("torn: a torn metadata tail is never written over", "[torn][ts4]") {
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_TRUE(timeseries_clear_all());
+  TEST_ASSERT_TRUE(torn_insert_into("before", 1));
+  timeseries_db_t *db = timeseries_get_db_handle();
+  const esp_partition_t *part = db->partition;
+  uint32_t tail = 0, meta = 0;
+  bool found = false;
+  timeseries_page_cache_iterator_t it;
+  TEST_ASSERT_TRUE(timeseries_page_cache_iterator_init(db, &it));
+  timeseries_page_header_t h;
+  uint32_t off, size;
+  while (!found && timeseries_page_cache_iterator_next(&it, &h, &off, &size))
+    if (h.page_type == TIMESERIES_PAGE_TYPE_METADATA) { meta = off; found = true; }
+  timeseries_page_cache_iterator_deinit(&it);
+  TEST_ASSERT_TRUE(found);
+  timeseries_entity_iterator_t e;
+  TEST_ASSERT_TRUE(timeseries_entity_iterator_init(db, meta, TIMESERIES_METADATA_PAGE_SIZE, &e));
+  timeseries_entry_header_t eh;
+  while (timeseries_entity_iterator_next(&e, &eh)) {}
+  tail = meta + e.offset;
+  timeseries_entity_iterator_deinit(&e);
+  timeseries_deinit();
+  // Torn header: marker + type programmed, lengths partly programmed.
+  const uint8_t torn[6] = {0xFF, TIMESERIES_KEYTYPE_MEASUREMENT, 0xFF, 0x7F, 0xFF, 0xFF};
+  torn_patch(part, tail, torn, 0, sizeof(torn));
+  TEST_ASSERT_TRUE(timeseries_init());
+  db = timeseries_get_db_handle();
+  TEST_ASSERT_TRUE(torn_insert_into("after", 2));
+  uint8_t now[6];
+  TEST_ASSERT_EQUAL(ESP_OK, esp_partition_read(part, tail, now, sizeof(now)));
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(torn, now, sizeof(now));
+  uint32_t id = 0;
+  TEST_ASSERT_TRUE(tsdb_find_measurement_id(db, "after", &id));
+  TEST_ASSERT_TRUE(tsdb_find_measurement_id(db, "before", &id));
+  timeseries_query_t q = {.measurement_name = "after"};
+  timeseries_query_result_t r = {0};
+  TEST_ASSERT_TRUE(timeseries_query(&q, &r));
+  TEST_ASSERT_EQUAL(1, r.num_points);
+  timeseries_query_free_result(&r);
+  timeseries_deinit();
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_TRUE(timeseries_clear_all());
+  timeseries_deinit();
+}

@@ -120,6 +120,13 @@ bool timeseries_compact_page_list(timeseries_db_t *db,
                                   const uint32_t *page_offsets,
                                   size_t page_count);
 
+/* Publish the pages a rewrite (not a level compaction: it has no source
+ * pages) wrote through the private cache batch, or give them all back when
+ * success is false or publication cannot be prepared (OOM): outputs are
+ * marked OBSOLETE and removed, nothing else changes. Consumes batch. Caller
+ * holds flash_write_mutex and the maintenance slot. */
+bool tsdb_publish_rewrite_locked(timeseries_db_t *db, tsdb_page_cache_snapshot_t *batch, bool success);
+
 #ifdef __cplusplus
 }
 #endif

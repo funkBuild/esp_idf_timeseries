@@ -712,7 +712,11 @@ TEST_CASE("expiration: storage reclamation verification", "[expiration]") {
   ESP_LOGI(TAG, "Storage reclamation test passed");
 }
 
-TEST_CASE("expiration: max heap maintains 25 oldest records", "[expiration]") {
+// Expiration removes exactly the records before one horizon (it used to
+// remove at most the 25 oldest records per run, an artifact of its candidate
+// heap). With a target smaller than the data, some but not all records go,
+// and every removed record is older than every surviving one.
+TEST_CASE("expiration: removes exactly the records before one horizon", "[expiration]") {
   TEST_ASSERT_TRUE(timeseries_init());
   timeseries_db_t *db = timeseries_get_db_handle();
   TEST_ASSERT_NOT_NULL(db);
@@ -720,9 +724,7 @@ TEST_CASE("expiration: max heap maintains 25 oldest records", "[expiration]") {
   // Clear database first
   TEST_ASSERT_TRUE(timeseries_clear_all());
 
-  // Insert more than 25 records to test heap behavior
   const size_t NUM_RECORDS = 50;
-
   for (size_t i = 0; i < NUM_RECORDS; i++) {
     uint64_t timestamp = 6000000 + i * 10000; // Well-spaced timestamps
     double value = 25.0 + i;
@@ -735,26 +737,24 @@ TEST_CASE("expiration: max heap maintains 25 oldest records", "[expiration]") {
                                       &value, 1));
   }
 
-  // Get oldest timestamp before expiration
-  uint64_t oldest_before;
-  TEST_ASSERT_TRUE(find_oldest_active_record(db, &oldest_before));
-
-  // Run expiration - should only delete up to 25 oldest
   size_t records_before = count_active_field_data_records(db);
   float usage = get_current_usage(db);
   float trigger = (usage > 0.001f) ? usage - 0.001f : 0.001f;
-  bool result = timeseries_expiration_run(db, trigger, 0.05f);
-  TEST_ASSERT_TRUE(result);
+  // Target about half of the inserted records' bytes.
+  float reduction = (float)(records_before * 70 / 2) / (float)GET_PARTITION_SIZE(db);
+  TEST_ASSERT_TRUE(timeseries_expiration_run(db, trigger, reduction));
 
   size_t records_after = count_active_field_data_records(db);
   size_t removed = records_before - records_after;
   ESP_LOGI(TAG, "Removed %zu records from %zu total", removed, records_before);
-
-  // Should delete some records but not all (limited by heap size of 25)
   TEST_ASSERT_GREATER_THAN(0, removed);
-  TEST_ASSERT_LESS_OR_EQUAL(25, removed); // At most 25 can be in the heap
+  TEST_ASSERT_LESS_THAN(records_before, removed);
 
-  ESP_LOGI(TAG, "Max heap test passed");
+  // The survivors are exactly the newest records: the oldest surviving one
+  // is the first record after the removed ones.
+  uint64_t oldest_after;
+  TEST_ASSERT_TRUE(find_oldest_active_record(db, &oldest_after));
+  TEST_ASSERT_EQUAL_UINT64(6000000 + removed * 10000, oldest_after);
 }
 
 TEST_CASE("expiration: different field types handled correctly",

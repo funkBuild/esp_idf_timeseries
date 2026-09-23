@@ -319,8 +319,10 @@ static bool chunk_put(timeseries_page_stream_writer_t* writer, const uint8_t* se
   return true;
 }
 
+// Points before min_ts are left out of the output (expiration trims records
+// that straddle its horizon); compaction passes 0.
 static bool merge_series(timeseries_db_t* db, timeseries_page_stream_writer_t* writer, merge_record_t* records,
-                         size_t n) {
+                         size_t n, uint64_t min_ts) {
   output_chunk_t out = {.capacity = TSDB_ALP_CHUNK_MAX_POINTS, .type = records[0].type};
   if (out.capacity > OUTPUT_CHUNK_POINTS) out.capacity = OUTPUT_CHUNK_POINTS;
   if (out.type == TIMESERIES_FIELD_TYPE_STRING && out.capacity > 128) out.capacity = 128;
@@ -353,21 +355,26 @@ static bool merge_series(timeseries_db_t* db, timeseries_page_stream_writer_t* w
     timeseries_field_value_t v = c->value;
     memset(&c->value, 0, sizeof(c->value));
     const merge_record_t* r = c->record;
-    if (pending && ts != timestamp) {
-      if (!chunk_put(writer, records[0].series, &out, timestamp, &value, revision)) {
-        value_free(&v);
-        goto done;
+    if (ts < min_ts) {
+      value_free(&v);  // before the expiration horizon: not kept
+    } else {
+      if (pending && ts != timestamp) {
+        if (!chunk_put(writer, records[0].series, &out, timestamp, &value, revision)) {
+          value_free(&v);
+          goto done;
+        }
+        pending = false;
       }
-      pending = false;
+      if (!pending || c->revision >= revision) {
+        value_free(&value);
+        value = v;
+        timestamp = ts;
+        revision = c->revision;
+        pending = true;
+      } else {
+        value_free(&v);
+      }
     }
-    if (!pending || c->revision >= revision) {
-      value_free(&value);
-      value = v;
-      timestamp = ts;
-      revision = c->revision;
-      pending = true;
-    } else
-      value_free(&v);
     if (c->read == r->count) {
       cursor_free(c);
       heap[0] = heap[--heap_count];
@@ -470,7 +477,7 @@ bool tsdb_compact_stream_records(timeseries_db_t* db, const tsdb_level_page_t* p
   for (size_t first = 0; first < used;) {
     size_t end = first + 1;
     while (end < used && memcmp(records[first].series, records[end].series, 16) == 0) end++;
-    if (!merge_series(db, &writer, records + first, end - first)) {
+    if (!merge_series(db, &writer, records + first, end - first, 0)) {
       ok = false;
       break;
     }
@@ -480,6 +487,56 @@ bool tsdb_compact_stream_records(timeseries_db_t* db, const tsdb_level_page_t* p
   if (!ok) timeseries_page_stream_writer_abort(&writer);
 done:
   free(scan_buffer);
+  free(records);
+  return ok;
+}
+
+bool tsdb_trim_stream_records(timeseries_db_t* db, const tsdb_record_ref_t* refs, size_t n, uint64_t horizon,
+                              uint8_t to_level, tsdb_page_cache_snapshot_t* batch) {
+  if (!db || (!refs && n) || !batch) return false;
+  if (!n) return true;
+  merge_record_t* records = calloc(n, sizeof(*records));
+  if (!records) return false;
+  size_t used = 0;
+  uint32_t source_bytes = 0;
+  bool ok = false;
+  for (size_t i = 0; i < n; i++) {
+    const timeseries_field_data_header_t* h = &refs[i].header;
+    merge_record_t* r = &records[used];
+    memcpy(r->series, h->series_id, 16);
+    tsdb_series_type_status_t type_status = tsdb_lookup_series_type_status(db, r->series, &r->type);
+    // A series with no metadata cannot be decoded or queried; its records are
+    // dropped whole by the caller.
+    if (type_status == TSDB_SERIES_TYPE_ABSENT) continue;
+    if (type_status != TSDB_SERIES_TYPE_FOUND || !h->record_count || h->start_time > h->end_time) goto done;
+    r->first = h->start_time;
+    r->last = h->end_time;
+    r->offset = refs[i].page_offset + refs[i].record_offset + sizeof(*h);
+    r->sequence = refs[i].page_sequence;
+    r->count = h->record_count;
+    r->length = h->record_length;
+    r->flags = h->flags;
+    if (h->record_length > UINT32_MAX - source_bytes) goto done;
+    source_bytes += h->record_length;
+    used++;
+  }
+  if (!used) {
+    ok = true;
+    goto done;
+  }
+  records_sort(records, used);
+  timeseries_page_stream_writer_t writer = {.batch_snapshot = batch};
+  if (!timeseries_page_stream_writer_init(db, &writer, to_level, source_bytes)) goto done;
+  ok = true;
+  for (size_t first = 0; first < used && ok;) {
+    size_t end = first + 1;
+    while (end < used && memcmp(records[first].series, records[end].series, 16) == 0) end++;
+    ok = merge_series(db, &writer, records + first, end - first, horizon);
+    first = end;
+  }
+  if (ok) ok = timeseries_page_stream_writer_finalize(&writer);
+  if (!ok) timeseries_page_stream_writer_abort(&writer);
+done:
   free(records);
   return ok;
 }

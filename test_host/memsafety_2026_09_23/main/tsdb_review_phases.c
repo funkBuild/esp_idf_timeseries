@@ -783,5 +783,7 @@ int review_main(const char* which) {
     fflush(stdout);
     bad += b;
   }
+  extern int retention_main(const char* which);
+  bad += retention_main(which);
   return bad;
 }

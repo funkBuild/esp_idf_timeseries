@@ -179,6 +179,27 @@ static void abandon_compaction_outputs(timeseries_db_t *db, const tsdb_page_cach
     (void)tsdb_pagecache_remove_placeholder(db, batch->removed_offsets[r]);
 }
 
+bool tsdb_publish_rewrite_locked(timeseries_db_t *db, tsdb_page_cache_snapshot_t *batch, bool success) {
+  if (!db || !batch) return false;
+  tsdb_page_cache_snapshot_t *base = NULL, *next = NULL;
+  if (success) {
+    base = tsdb_snapshot_acquire_current(db);
+    next = tsdb_pagecache_prepare_batch(base, batch, NULL, 0, 0);
+    success = base && next;
+  }
+  if (success) {
+    tsdb_pagecache_batch_sort(next);
+    // Cannot fail: every other live-cache writer holds flash_write_mutex.
+    success = tsdb_snapshot_compare_and_swap(db, base, next);
+    if (success) next = NULL;
+  }
+  if (!success) abandon_compaction_outputs(db, batch);
+  tsdb_snapshot_release(next);
+  tsdb_snapshot_release(base);
+  tsdb_snapshot_release(batch);
+  return success;
+}
+
 // Retire source pages and publish replacements as one operation for inserts.
 // Holding flash_write_mutex keeps the live cache unchanged throughout. Everything
 // publication needs is allocated before any source changes on flash, so OOM

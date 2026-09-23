@@ -217,14 +217,11 @@ static char hb_name_buf[HB_FIELDS][16];
 /* Data-correctness oracle: stat_00 of node_stats is the insert's sequence
  * number k at timestamp HB_TS0 + k*1000; node_stats is never deleted through
  * the API, only by expiration. After the churn every point the query returns
- * must be distinct and carry its own k, and every point whose insert returned
- * true must either be returned or lie inside a node_stats.stat_00 record that
- * expiration soft-deleted while the churn ran (recorded as it happens, below,
- * because expiration then rewrites the page without the record).
- * Expiration works on whole records ordered by their start time, and
- * compaction merges pages chosen by offset, so an expired record can cover
- * points newer than a surviving one: "records, oldest start first" is the
- * contract, not "the oldest points only". */
+ * must be distinct and carry its own k, and the stored points must be a
+ * contiguous newest suffix of the acknowledged ones: an acknowledged point may
+ * be missing only if it is older than every surviving point (the retention
+ * guarantee: each expiration run removes exactly the points before one
+ * horizon). The number of stat_00 records expiration deleted is reported. */
 #define HB_TS0 1700000000000ULL
 static uint8_t* s_hb_ok;  // per k: 1 = timeseries_insert returned true
 static size_t s_hb_count, s_hb_cap;
@@ -693,8 +690,8 @@ static void dump_forensics(void) {
 }
 
 // Expiration and deletes clear a record's DELETED bit with
-// tsdb_flash_write_byte() on the header's flags byte. Record the time range of
-// every node_stats.stat_00 record that gets deleted this way.
+// tsdb_flash_write_byte() on the header's flags byte. Count the
+// node_stats.stat_00 records deleted this way (diagnostics only).
 static unsigned char s_hb_sid[16];
 static struct {
   uint64_t start, end;
@@ -715,13 +712,6 @@ esp_err_t __wrap_tsdb_flash_write_byte(const esp_partition_t* part, uint32_t off
     }
   }
   return err;
-}
-static bool hb_point_expired(uint64_t ts) {
-  size_t n = atomic_load(&s_hb_expired_n);
-  if (n > sizeof s_hb_expired / sizeof s_hb_expired[0]) return true;  // log overflowed: cannot tell
-  for (size_t i = 0; i < n; i++)
-    if (ts >= s_hb_expired[i].start && ts <= s_hb_expired[i].end) return true;
-  return false;
 }
 
 static int hb_oracle(void) {
@@ -754,10 +744,11 @@ static int hb_oracle(void) {
   for (size_t k = 0; k < s_hb_count; k++) {
     succeeded += s_hb_ok[k];
     if (!s_hb_ok[k] || seen[k]) continue;
-    if (hb_point_expired(HB_TS0 + (uint64_t)k * 1000)) {
-      expired++;
+    if (first != SIZE_MAX && k < first) {
+      expired++;  // older than every surviving point
     } else if (missing++ < 5) {
-      printf("data: FAIL successful insert k=%zu missing (no expired record covered it)\n", k);
+      printf("data: FAIL successful insert k=%zu missing but newer than surviving k=%zd\n", k,
+             first == SIZE_MAX ? (ssize_t)-1 : (ssize_t)first);
     }
   }
   if (!got && succeeded && bad++ < 5) printf("data: FAIL no node_stats points stored\n");

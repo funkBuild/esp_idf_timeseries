@@ -10,8 +10,7 @@ CONFIG_TIMESERIES_SERIES_ID_CACHE_SIZE=32
 CONFIG_TIMESERIES_CACHE_USE_LRU=y
 CONFIG_TIMESERIES_ENABLE_CACHE_STATS=y
 
-# Chunk Buffer Configuration — reduced from 16 to 8 KiB for QEMU
-# (no SPIRAM, tight internal heap)
+# Chunk Buffer Configuration — exercise small streaming chunks
 CONFIG_TIMESERIES_CHUNK_BUFFER_SIZE=8
 
 # Flash Configuration - 16MB for QEMU
@@ -23,7 +22,15 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # PSRAM disabled for QEMU
-# CONFIG_SPIRAM is not set
+# Match the production board so large query buffers have external RAM.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=0
 
 # Heap tracing for memory leak detection
 CONFIG_HEAP_TRACING_STANDALONE=y
@@ -48,7 +55,7 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # data points per compaction run.
 CONFIG_TIMESERIES_ALP_CHUNK_MAX_POINTS=200
 
-# ---- Memory optimizations for QEMU (no SPIRAM, ~376 KiB internal RAM) ----
+# ---- Bounded test buffers ----
 # Disable IRAM placement for non-essential functions to free DRAM.
 # IRAM and DRAM share physical SRAM on ESP32-S3; less IRAM = more heap.
 # CONFIG_ESP_HW_SUPPORT_FUNC_IN_IRAM is not set

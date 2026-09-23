@@ -120,33 +120,6 @@ static bool insert_float_points(const char *measurement,
 }
 
 /**
- * @brief Insert bool points without tags
- */
-static bool insert_bool_points_ct(const char *measurement,
-                                  const char *field_name,
-                                  size_t num_points,
-                                  uint64_t start_timestamp,
-                                  uint64_t timestamp_increment) {
-    uint64_t *timestamps = malloc(num_points * sizeof(uint64_t));
-    timeseries_field_value_t *field_values = malloc(num_points * sizeof(timeseries_field_value_t));
-    if (!timestamps || !field_values) { free(timestamps); free(field_values); return false; }
-    for (size_t i = 0; i < num_points; i++) {
-        timestamps[i] = start_timestamp + i * timestamp_increment;
-        field_values[i].type = TIMESERIES_FIELD_TYPE_BOOL;
-        field_values[i].data.bool_val = (i % 2 == 0);
-    }
-    const char *field_names[] = {field_name};
-    timeseries_insert_data_t ins = {
-        .measurement_name = measurement, .tag_keys = NULL, .tag_values = NULL,
-        .num_tags = 0, .field_names = field_names, .field_values = field_values,
-        .num_fields = 1, .timestamps_ms = timestamps, .num_points = num_points,
-    };
-    bool ok = timeseries_insert(&ins);
-    free(timestamps); free(field_values);
-    return ok;
-}
-
-/**
  * @brief Scan all level-1+ pages and collect flag bytes from compressed records.
  *        Counts ALP-encoded and Gorilla-encoded records separately.
  */

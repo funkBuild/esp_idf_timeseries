@@ -16,7 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-TIMEOUT_SEC=600
+TIMEOUT_SEC=${TIMEOUT_SEC:-3600}
 SKIP_BUILD=false
 QEMU_PID=""
 OUTPUT_FILE=""
@@ -95,6 +95,7 @@ info "Running tests in QEMU (timeout: ${TIMEOUT_SEC}s)..."
 
 $QEMU_BIN \
   -M esp32s3 \
+  -m 8M \
   -drive file=build/qemu_flash.bin,if=mtd,format=raw \
   -drive file=build/qemu_efuse.bin,if=none,format=raw,id=efuse \
   -global driver=esp32s3.efuse,property=drive,value=efuse \

@@ -428,7 +428,7 @@ TEST_CASE("page_stream_writer: string values", "[psw][string]") {
     TEST_ASSERT_TRUE(timeseries_page_stream_writer_begin_series(
         &writer, series_id, TIMESERIES_FIELD_TYPE_STRING));
 
-    const char *strings[] = {"hello", "world", "test", "string", "values"};
+    char strings[][7] = {"hello", "world", "test", "string", "values"};
 
     for (int i = 0; i < 5; i++) {
         TEST_ASSERT_TRUE(timeseries_page_stream_writer_write_timestamp(&writer, i * 1000));

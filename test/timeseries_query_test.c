@@ -19,7 +19,6 @@
 #include <string.h>
 #include <limits.h>
 
-static const char *TAG = "query_test";
 
 // Flag to track if database has been initialized
 static bool db_initialized = false;

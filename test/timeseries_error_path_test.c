@@ -321,6 +321,9 @@ TEST_CASE("error: partition full graceful handling", "[error][full]") {
   const char *field_names[] = {"temp"};
   size_t total_inserted = 0;
   bool partition_full = false;
+  // Poorly compressible, deterministic samples exercise flash exhaustion
+  // without spending most of the run compressing an arithmetic progression.
+  uint32_t random_state = 0x91e10da5u;
 
   // --- Step 1: Fill the partition with insert+compact cycles ---
   while (!partition_full) {
@@ -328,7 +331,10 @@ TEST_CASE("error: partition full graceful handling", "[error][full]") {
       for (size_t i = 0; i < BATCH_SIZE; i++) {
         timestamps[i] = (total_inserted + i) * 1000ULL;
         values[i].type = TIMESERIES_FIELD_TYPE_FLOAT;
-        values[i].data.float_val = (double)(total_inserted + i) * 0.5;
+        random_state ^= random_state << 13;
+        random_state ^= random_state >> 17;
+        random_state ^= random_state << 5;
+        values[i].data.float_val = (double)random_state / 4294967295.0;
       }
 
       timeseries_insert_data_t data = {

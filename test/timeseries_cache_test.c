@@ -22,8 +22,6 @@
 #include "unity.h"
 #include <string.h>
 
-static const char *TAG = "CacheTest";
-
 // Helper function to get direct access to DB context
 extern timeseries_db_t *timeseries_get_db_handle(void);
 
@@ -842,13 +840,11 @@ TEST_CASE("cache integrates with real data insertion", "[cache][integration]") {
     setup_clean_cache();  // Ensure clean cache state
     TEST_ASSERT_TRUE(timeseries_clear_all());
 
-    timeseries_db_t *db = timeseries_get_db_handle();
-
 #ifdef CONFIG_TIMESERIES_ENABLE_CACHE_STATS
+    timeseries_db_t *db = timeseries_get_db_handle();
     // Record initial stats
     uint32_t initial_hits = db->cache_stats.hits;
     uint32_t initial_misses = db->cache_stats.misses;
-    uint32_t initial_insertions = db->cache_stats.insertions;
 #endif
 
     // Insert some real data
@@ -932,7 +928,7 @@ TEST_CASE("cache behavior under stress test", "[cache][stress]") {
     TEST_ASSERT_LESS_OR_EQUAL(SERIES_ID_CACHE_SIZE, count_valid_cache_entries(db));
 
 #ifdef CONFIG_TIMESERIES_ENABLE_CACHE_STATS
-    ESP_LOGI(TAG, "Stress test stats - Hits: %" PRIu32 ", Misses: %" PRIu32 ", Insertions: %" PRIu32 ", Evictions: %" PRIu32,
+    ESP_LOGI("CacheTest", "Stress test stats - Hits: %" PRIu32 ", Misses: %" PRIu32 ", Insertions: %" PRIu32 ", Evictions: %" PRIu32,
              db->cache_stats.hits, db->cache_stats.misses,
              db->cache_stats.insertions, db->cache_stats.evictions);
 #endif

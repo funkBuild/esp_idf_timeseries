@@ -68,6 +68,11 @@ static bool rs_put(uint64_t first, size_t n) {
   return ok;
 }
 
+static float rs_usage(void) {
+  timeseries_db_t* db = review_db();
+  return (float)tsdb_pagecache_get_total_active_size(db) / (float)db->partition->size;
+}
+
 static int cmp_u64(const void* a, const void* b) {
   uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
   return x < y ? -1 : x > y;
@@ -202,9 +207,10 @@ static int t_expiration_horizon_interleaved(void) {
   for (size_t i = 0; i < n; i++)
     printf("R14: L1 record of ret.a: k[%" PRIu64 "..%" PRIu64 "]\n", (ranges[i][0] - RS_TS0) / RS_STEP,
            (ranges[i][1] - RS_TS0) / RS_STEP);
-  // Expire a tenth of the used space: usage is over any positive threshold.
-  float used = (float)tsdb_pagecache_get_total_active_size(db) / (float)db->partition->size;
-  bool ok = timeseries_expiration_run(db, 0.001f, used / 10.0f);
+  // Expire a tenth of the used space; the threshold is just under the usage,
+  // so the run stops once that is freed.
+  float used = rs_usage();
+  bool ok = timeseries_expiration_run(db, used - 0.001f, used / 10.0f);
   size_t removed = 0;
   int bad = rs_check("R14", &removed);
   printf("R14: expiration -> %d, removed %zu points\n", ok, removed);
@@ -269,11 +275,162 @@ static int t_compaction_time_contiguous(void) {
   return bad;
 }
 
+/* Oldest surviving timestamp of ret.a (UINT64_MAX when none). */
+static uint64_t rs_oldest(void) {
+  const char* fn[1] = {"a"};
+  timeseries_query_t q = {.measurement_name = "ret", .field_names = fn, .num_fields = 1, .limit = 1};
+  timeseries_query_result_t r;
+  memset(&r, 0, sizeof r);
+  uint64_t t = UINT64_MAX;
+  if (timeseries_query(&q, &r) && r.num_points) t = r.timestamps[0];
+  timeseries_query_free_result(&r);
+  return t;
+}
+
+/* Expire about a tenth of the used space in one run. An insert may have
+ * started a background compaction; the run needs the maintenance slot, so
+ * wait for that first (a busy slot makes the run return false, retryably). */
+static bool rs_expire_tenth(void) {
+  for (int i = 0; i < 3000 && atomic_load(&review_db()->compaction_in_progress); i++) vTaskDelay(pdMS_TO_TICKS(10));
+  float used = rs_usage();
+  return timeseries_expiration_run(review_db(), used - 0.001f, used / 10.0f);
+}
+
+/* ---- R16: back-filled points older than the horizon ---------------------- */
+// Points inserted after a run with timestamps before its horizon are stored
+// (the horizon is not a write barrier) and are the first to go next run.
+static int t_backfill_before_horizon(void) {
+  int bad = 0;
+  rs_build_interleaved("R16");
+  bool e1 = rs_expire_tenth();
+  size_t removed = 0;
+  bad += rs_check("R16 run 1", &removed);
+  uint64_t horizon = rs_oldest();
+  // Back-fill 50 points per series well before the horizon.
+  uint64_t back = horizon - 1000 * RS_STEP;
+  bool put = rs_put(back, 50);
+  size_t n_before = 0;
+  {
+    const char* fn[1] = {"a"};
+    timeseries_query_t q = {.measurement_name = "ret", .field_names = fn, .num_fields = 1, .end_ms = (int64_t)horizon - 1};
+    timeseries_query_result_t r;
+    memset(&r, 0, sizeof r);
+    if (timeseries_query(&q, &r)) n_before = r.num_points;
+    timeseries_query_free_result(&r);
+  }
+  printf("R16: run 1 -> %d, horizon k=%" PRIu64 "; back-filled 50 points at k=%" PRIu64 " -> %d, stored before the horizon=%zu (want 50)\n",
+         e1, (horizon - RS_TS0) / RS_STEP, (back - RS_TS0) / RS_STEP, put, n_before);
+  if (!e1 || !put || n_before != 50) {
+    printf("R16: FAIL back-filled points were not stored\n");
+    bad++;
+  }
+  bool e2 = rs_expire_tenth();
+  bad += rs_check("R16 run 2", &removed);  // back-fill included: it must be gone with everything older
+  uint64_t horizon2 = rs_oldest();
+  printf("R16: run 2 -> %d, horizon k=%" PRIu64 "\n", e2, (horizon2 - RS_TS0) / RS_STEP);
+  if (!e2 || horizon2 <= back) {
+    printf("R16: FAIL the next run did not expire the back-filled points\n");
+    bad++;
+  }
+  rs_reset();
+  return bad;
+}
+
+/* ---- R17: restart between runs --------------------------------------------- */
+// The horizon is not stored: after a restart the next run recomputes it from
+// the records and the guarantee still holds.
+static int t_restart_between_runs(void) {
+  int bad = 0;
+  rs_build_interleaved("R17");
+  bool e1 = rs_expire_tenth();
+  size_t removed = 0;
+  bad += rs_check("R17 run 1", &removed);
+  uint64_t h1 = rs_oldest();
+  timeseries_deinit();
+  if (!timeseries_init()) {
+    printf("R17: FAIL re-init\n");
+    return bad + 1;
+  }
+  uint64_t h1_after = rs_oldest();
+  bool e2 = rs_expire_tenth();
+  bad += rs_check("R17 run 2", &removed);
+  uint64_t h2 = rs_oldest();
+  printf("R17: run 1 -> %d horizon k=%" PRIu64 "; after restart oldest k=%" PRIu64 "; run 2 -> %d horizon k=%" PRIu64 "\n",
+         e1, (h1 - RS_TS0) / RS_STEP, (h1_after - RS_TS0) / RS_STEP, e2, (h2 - RS_TS0) / RS_STEP);
+  if (!e1 || !e2 || h1_after != h1 || h2 <= h1) {
+    printf("R17: FAIL restart changed the data or the next run did not advance the horizon\n");
+    bad++;
+  }
+  rs_reset();
+  return bad;
+}
+
+/* ---- R18: a trim that fails leaves every record intact ------------------- */
+extern bool review_arm_fail_after_finalize(bool arm);
+static size_t rs_points(void) {
+  const char* fn[1] = {"a"};
+  timeseries_query_t q = {.measurement_name = "ret", .field_names = fn, .num_fields = 1};
+  timeseries_query_result_t r;
+  memset(&r, 0, sizeof r);
+  size_t n = 0;
+  if (timeseries_query(&q, &r)) n = r.num_points;
+  timeseries_query_free_result(&r);
+  return n;
+}
+static size_t rs_placeholders(void) {
+  timeseries_page_cache_iterator_t it;
+  size_t n = 0;
+  if (!timeseries_page_cache_iterator_init(review_db(), &it)) return 0;
+  timeseries_page_header_t h;
+  uint32_t o, s;
+  while (timeseries_page_cache_iterator_next(&it, &h, &o, &s))
+    if (h.page_type == 0xFF) n++;
+  timeseries_page_cache_iterator_deinit(&it);
+  return n;
+}
+static int t_trim_failure(void) {
+  int bad = 0;
+  rs_build_interleaved("R18");
+  size_t before = rs_points();
+  uint32_t used_before = tsdb_pagecache_get_total_active_size(review_db());
+  // The trim writes its page, then the allocation that publishes it fails.
+  review_arm_fail_after_finalize(true);
+  bool e1 = rs_expire_tenth();
+  bool fired = !review_arm_fail_after_finalize(false);
+  size_t after = rs_points();
+  uint32_t used_after = tsdb_pagecache_get_total_active_size(review_db());
+  size_t leaked = rs_placeholders();
+  printf("R18: run with a failing trim publication -> %d (want 0), injected=%d; points %zu -> %zu; used %" PRIu32
+         " -> %" PRIu32 " B; reserved regions left=%zu\n", e1, fired, before, after, used_before, used_after, leaked);
+  if (!fired) {
+    printf("R18: FAIL the run trimmed nothing (no straddling record)\n");
+    bad++;
+  } else if (e1 || after != before || used_after != used_before || leaked) {
+    printf("R18: FAIL a failed trim changed the data or leaked its output\n");
+    bad++;
+  }
+  timeseries_deinit();  // restart: the abandoned output must not come back
+  if (!timeseries_init()) return bad + 1;
+  size_t restarted = rs_points();
+  bool e2 = rs_expire_tenth();
+  size_t removed = 0;
+  bad += rs_check("R18 retry", &removed);
+  printf("R18: after restart points=%zu (want %zu); retry -> %d removed %zu\n", restarted, before, e2, removed);
+  if (restarted != before || !e2 || !removed) {
+    printf("R18: FAIL the abandoned trim output survived a restart, or the retry failed\n");
+    bad++;
+  }
+  rs_reset();
+  return bad;
+}
+
 int retention_main(const char* which) {
   struct {
     const char* name;
     int (*fn)(void);
-  } t[] = {{"R14", t_expiration_horizon_interleaved}, {"R15", t_compaction_time_contiguous}};
+  } t[] = {{"R14", t_expiration_horizon_interleaved}, {"R15", t_compaction_time_contiguous},
+           {"R16", t_backfill_before_horizon},        {"R17", t_restart_between_runs},
+           {"R18", t_trim_failure}};
   int bad = 0;
   for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
     if (strcmp(which, "all") && strcmp(which, t[i].name)) continue;

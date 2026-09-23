@@ -116,6 +116,18 @@ static void fail_next_write(size_t len, uint32_t offset) {
   atomic_store(&review_fail_write_task, xTaskGetCurrentTaskHandle());
 }
 static atomic_bool s_fail_after_finalize;
+// For other phase files: arm (true) the one-shot "fail the next allocation
+// after a successful stream-writer finalize"; returns whether it was still
+// armed (false once it fired).
+bool review_arm_fail_after_finalize(bool arm) {
+  if (arm) {
+    atomic_store(&s_fail_after_finalize, true);
+    return true;
+  }
+  bool still = atomic_exchange(&s_fail_after_finalize, false);
+  atomic_store(&review_fail_alloc_task, (TaskHandle_t)NULL);
+  return still;
+}
 bool __real_timeseries_page_stream_writer_finalize(timeseries_page_stream_writer_t* w);
 bool __wrap_timeseries_page_stream_writer_finalize(timeseries_page_stream_writer_t* w) {
   bool ok = __real_timeseries_page_stream_writer_finalize(w);

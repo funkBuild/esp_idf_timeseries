@@ -484,16 +484,7 @@ static bool insert_ordered_once(const timeseries_insert_data_t *data, const tsdb
     tsdb_write_lock(&s_tsdb);
   }
 
-  if (s_tsdb.meas_cache) {
-    for (int mc = 0; mc < MEAS_ID_CACHE_SIZE; mc++) {
-      if (s_tsdb.meas_cache[mc].valid &&
-          strcmp(data->measurement_name, s_tsdb.meas_cache[mc].name) == 0) {
-        measurement_id = s_tsdb.meas_cache[mc].id;
-        meas_cached = true;
-        break;
-      }
-    }
-  }
+  meas_cached = tsdb_meas_cache_lookup(&s_tsdb, data->measurement_name, &measurement_id);
   if (!meas_cached) {
     if (!tsdb_find_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
       if (!tsdb_create_measurement_id(&s_tsdb, data->measurement_name, &measurement_id)) {
@@ -503,17 +494,7 @@ static bool insert_ordered_once(const timeseries_insert_data_t *data, const tsdb
         return false;
       }
     }
-    // Cache the result (round-robin eviction)
-    if (s_tsdb.meas_cache &&
-        strlen(data->measurement_name) < sizeof(s_tsdb.meas_cache[0].name)) {
-      uint8_t slot = s_tsdb.meas_cache_next;
-      strncpy(s_tsdb.meas_cache[slot].name, data->measurement_name,
-              sizeof(s_tsdb.meas_cache[slot].name) - 1);
-      s_tsdb.meas_cache[slot].name[sizeof(s_tsdb.meas_cache[slot].name) - 1] = '\0';
-      s_tsdb.meas_cache[slot].id = measurement_id;
-      s_tsdb.meas_cache[slot].valid = true;
-      s_tsdb.meas_cache_next = (slot + 1) % MEAS_ID_CACHE_SIZE;
-    }
+    tsdb_meas_cache_store(&s_tsdb, data->measurement_name, measurement_id);
   }
 
   if (s_tsdb.flash_write_mutex) {

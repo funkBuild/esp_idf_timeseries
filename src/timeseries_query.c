@@ -171,6 +171,9 @@ bool timeseries_query_execute(timeseries_db_t *db,
   bool ok = false; /* final return value       */
   size_t actual_fields_count = 0;
   field_info_t *fields_array = NULL;
+  timeseries_series_id_list_t *tag_series = NULL;   /* one per tag filter */
+  timeseries_series_id_list_t *field_series = NULL; /* parallel to fields_to_query */
+  size_t field_series_count = 0;
 
   timeseries_series_id_list_t matched_series;
   tsdb_series_id_list_init(&matched_series);
@@ -188,11 +191,15 @@ bool timeseries_query_execute(timeseries_db_t *db,
   /* -------------------------------------------------------------------- */
   start_time = esp_timer_get_time();
 
+  /* The measurement-ID cache is guarded by flash_write_mutex, held above. */
   uint32_t measurement_id = 0;
-  if (!tsdb_find_measurement_id(db, query->measurement_name, &measurement_id)) {
-    ESP_LOGW(TAG, "Measurement '%s' not found.", query->measurement_name);
-    ok = true; /* empty result   */
-    goto cleanup;
+  if (!tsdb_meas_cache_lookup(db, query->measurement_name, &measurement_id)) {
+    if (!tsdb_find_measurement_id(db, query->measurement_name, &measurement_id)) {
+      ESP_LOGW(TAG, "Measurement '%s' not found.", query->measurement_name);
+      ok = true; /* empty result   */
+      goto cleanup;
+    }
+    tsdb_meas_cache_store(db, query->measurement_name, measurement_id);
   }
 
   end_time = esp_timer_get_time();
@@ -200,74 +207,65 @@ bool timeseries_query_execute(timeseries_db_t *db,
            (end_time - start_time) / 1000.0);
 
   /* -------------------------------------------------------------------- */
-  /*  2.  Build `matched_series`                                          */
+  /*  2.  One metadata scan: series per tag filter and per field          */
   /* -------------------------------------------------------------------- */
   start_time = esp_timer_get_time();
 
-  if (query->num_tags > 0) {
-    timeseries_series_id_list_t temp_list;
-    tsdb_series_id_list_init(&temp_list);
-
-    for (size_t i = 0; i < query->num_tags; ++i) {
-      tsdb_series_id_list_clear(&temp_list);
-      tsdb_find_series_ids_for_tag(db, measurement_id, query->tag_keys[i],
-                                   query->tag_values[i], &temp_list);
-
-      if (i == 0) {
-        tsdb_series_id_list_copy(&matched_series, &temp_list);
-      } else {
-        intersect_series_id_lists(&matched_series, &temp_list);
-      }
-    }
-    tsdb_series_id_list_free(&temp_list);
-  } else {
-    if (!tsdb_find_all_series_ids_for_measurement(db, measurement_id,
-                                                  &matched_series) ||
-        matched_series.count == 0) {
-      ESP_LOGD(TAG, "No series found for measurement '%s'.",
-               query->measurement_name);
-      ok = true; /* empty result   */
-      goto cleanup;
-    }
-  }
-
-  if (matched_series.count == 0) {
-    ESP_LOGD(TAG, "No series matched the tag filters (or none exist).");
-    ok = true; /* empty result   */
-    goto cleanup;
-  }
-
-  end_time = esp_timer_get_time();
-  ESP_LOGD(TAG, "Found %zu series for measurement '%s' in %.3f ms",
-           matched_series.count, query->measurement_name,
-           (end_time - start_time) / 1000.0);
-
-  /* -------------------------------------------------------------------- */
-  /*  3.  Build list of field names                                       */
-  /* -------------------------------------------------------------------- */
-  start_time = esp_timer_get_time();
-
-  if (query->num_fields == 0) {
-    if (!tsdb_list_fields_for_measurement(db, measurement_id,
-                                          &fields_to_query) ||
-        fields_to_query.count == 0) {
-      ESP_LOGD(TAG, "No fields found for measurement '%s'.",
-               query->measurement_name);
-      ok = true; /* empty result   */
-      goto cleanup;
-    }
-  } else {
+  if (query->num_fields > 0) {
     for (size_t i = 0; i < query->num_fields; ++i) {
       tsdb_string_list_append_unique(&fields_to_query, query->field_names[i]);
     }
   }
+  if (query->num_tags > 0) {
+    tag_series = calloc(query->num_tags, sizeof(*tag_series));
+    if (!tag_series) {
+      ESP_LOGE(TAG, "Out of memory for tag series lists");
+      goto cleanup;
+    }
+    for (size_t i = 0; i < query->num_tags; ++i) {
+      tsdb_series_id_list_init(&tag_series[i]);
+    }
+  }
+  if (!tsdb_collect_query_series(db, measurement_id, query->tag_keys,
+                                 query->tag_values, query->num_tags,
+                                 tag_series, &fields_to_query,
+                                 query->num_fields == 0, &field_series)) {
+    ESP_LOGE(TAG, "Failed to collect series for measurement '%s'",
+             query->measurement_name);
+    goto cleanup;
+  }
+  field_series_count = fields_to_query.count;
+
+  /* Tag filters intersect in query order. Without tag filters every field
+   * list is used as is; a measurement with no series ends with no fields. */
+  if (query->num_tags > 0) {
+    for (size_t i = 0; i < query->num_tags; ++i) {
+      if (i == 0) {
+        tsdb_series_id_list_copy(&matched_series, &tag_series[i]);
+      } else {
+        intersect_series_id_lists(&matched_series, &tag_series[i]);
+      }
+    }
+    if (matched_series.count == 0) {
+      ESP_LOGD(TAG, "No series matched the tag filters (or none exist).");
+      ok = true; /* empty result   */
+      goto cleanup;
+    }
+  }
 
   end_time = esp_timer_get_time();
-  ESP_LOGD(TAG, "Found fields for measurement in %.3f ms",
-           (end_time - start_time) / 1000.0);
+  ESP_LOGD(TAG, "Collected series for measurement '%s' in %.3f ms",
+           query->measurement_name, (end_time - start_time) / 1000.0);
+
+  if (fields_to_query.count == 0) {
+    ESP_LOGD(TAG, "No fields found for measurement '%s'.",
+             query->measurement_name);
+    ok = true; /* empty result   */
+    goto cleanup;
+  }
 
   /* -------------------------------------------------------------------- */
-  /*  4.  Allocate & populate `fields_array`                              */
+  /*  3.  Allocate & populate `fields_array`                              */
   /* -------------------------------------------------------------------- */
 
   start_time = esp_timer_get_time();
@@ -281,49 +279,47 @@ bool timeseries_query_execute(timeseries_db_t *db,
   for (size_t f = 0; f < fields_to_query.count; ++f) {
     const char *fname = fields_to_query.items[f];
 
-    timeseries_series_id_list_t field_series;
-    tsdb_series_id_list_init(&field_series);
-
-    bool got = tsdb_find_series_ids_for_field(db, measurement_id, fname,
-                                              &field_series);
-    ESP_LOGD(TAG, "Field '%s' (meas_id=%" PRIu32 "): found %zu series_ids (got=%d)",
-             fname, measurement_id, field_series.count, (int)got);
-    for (size_t si = 0; si < field_series.count && si < 3; si++) {
+    /* Take ownership of this field's list. */
+    timeseries_series_id_list_t field_series_f = field_series[f];
+    tsdb_series_id_list_init(&field_series[f]);
+    ESP_LOGD(TAG, "Field '%s' (meas_id=%" PRIu32 "): found %zu series_ids",
+             fname, measurement_id, field_series_f.count);
+    for (size_t si = 0; si < field_series_f.count && si < 3; si++) {
       ESP_LOGD(TAG, "  series_id[%zu]: %02X%02X%02X%02X%02X%02X%02X%02X...",
                si,
-               field_series.ids[si].bytes[0], field_series.ids[si].bytes[1],
-               field_series.ids[si].bytes[2], field_series.ids[si].bytes[3],
-               field_series.ids[si].bytes[4], field_series.ids[si].bytes[5],
-               field_series.ids[si].bytes[6], field_series.ids[si].bytes[7]);
+               field_series_f.ids[si].bytes[0], field_series_f.ids[si].bytes[1],
+               field_series_f.ids[si].bytes[2], field_series_f.ids[si].bytes[3],
+               field_series_f.ids[si].bytes[4], field_series_f.ids[si].bytes[5],
+               field_series_f.ids[si].bytes[6], field_series_f.ids[si].bytes[7]);
     }
-    if (!got || field_series.count == 0) {
-      tsdb_series_id_list_free(&field_series);
+    if (field_series_f.count == 0) {
+      tsdb_series_id_list_free(&field_series_f);
       continue;
     }
 
     if (query->num_tags > 0) {
-      intersect_series_id_lists(&field_series, &matched_series);
+      intersect_series_id_lists(&field_series_f, &matched_series);
     }
-    if (field_series.count == 0) {
-      tsdb_series_id_list_free(&field_series);
+    if (field_series_f.count == 0) {
+      tsdb_series_id_list_free(&field_series_f);
       continue;
     }
 
     field_info_t *fi = &fields_array[actual_fields_count];
 
     fi->field_name = fname;
-    fi->series_ids = field_series;
-    fi->num_series = field_series.count;
-    fi->series_lists = calloc(field_series.count, sizeof(series_record_list_t));
+    fi->series_ids = field_series_f;
+    fi->num_series = field_series_f.count;
+    fi->series_lists = calloc(field_series_f.count, sizeof(series_record_list_t));
 
     if (!fi->series_lists) {
       ESP_LOGE(TAG, "Out of memory for series_lists");
-      tsdb_series_id_list_free(&field_series);
+      tsdb_series_id_list_free(&field_series_f);
       goto cleanup; /* early error    */
     }
 
-    for (size_t s = 0; s < field_series.count; ++s) {
-      fi->series_lists[s].series_id = field_series.ids[s];
+    for (size_t s = 0; s < field_series_f.count; ++s) {
+      fi->series_lists[s].series_id = field_series_f.ids[s];
       fi->series_lists[s].records = NULL;
       fi->series_lists[s].count = 0;
       fi->series_lists[s].capacity = 0;
@@ -392,6 +388,18 @@ cleanup:
     free(fields_array);
   }
 
+  if (tag_series) {
+    for (size_t i = 0; i < query->num_tags; ++i) {
+      tsdb_series_id_list_free(&tag_series[i]);
+    }
+    free(tag_series);
+  }
+  if (field_series) {
+    for (size_t i = 0; i < field_series_count; ++i) {
+      tsdb_series_id_list_free(&field_series[i]);
+    }
+    free(field_series);
+  }
   tsdb_string_list_free(&fields_to_query);
   tsdb_series_id_list_free(&matched_series);
   if (!ok) timeseries_query_free_result(result);

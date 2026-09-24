@@ -224,6 +224,39 @@ bool timeseries_metadata_get_tags_for_measurement(
     timeseries_db_t *db, uint32_t measurement_id,
     tsdb_tag_pair_t **out_tags, size_t *out_num_tags);
 
+/**
+ * @brief Measurement-ID cache (db->meas_cache). The caller holds
+ *        db->flash_write_mutex (when it exists) across the call.
+ */
+bool tsdb_meas_cache_lookup(timeseries_db_t *db, const char *measurement_name,
+                            uint32_t *out_id);
+void tsdb_meas_cache_store(timeseries_db_t *db, const char *measurement_name,
+                           uint32_t id);
+
+/**
+ * @brief Gather, in ONE scan of the metadata pages, the series IDs a query
+ *        needs. Same matching rules as tsdb_find_series_ids_for_tag() and
+ *        tsdb_find_series_ids_for_field(), same order.
+ *
+ * @param tag_series  num_tags initialised lists; tag_series[i] receives the IDs
+ *                    of tag "<measurement_id>:tag_keys[i]:tag_values[i]".
+ * @param fields      Field names. With discover_fields, every field of the
+ *                    measurement is appended in first-seen order (as
+ *                    tsdb_list_fields_for_measurement() does).
+ * @param field_series On success, a malloc'd array of fields->count lists,
+ *                    parallel to fields->items; the caller frees each list
+ *                    and the array.
+ * @return false on OOM (outputs may then be partial; *field_series is still
+ *         owned by the caller if non-NULL). Missing metadata is not an error.
+ */
+bool tsdb_collect_query_series(timeseries_db_t *db, uint32_t measurement_id,
+                               const char **tag_keys, const char **tag_values,
+                               size_t num_tags,
+                               timeseries_series_id_list_t *tag_series,
+                               timeseries_string_list_t *fields,
+                               bool discover_fields,
+                               timeseries_series_id_list_t **field_series);
+
 #ifdef __cplusplus
 }
 #endif

@@ -2465,3 +2465,209 @@ bool timeseries_metadata_get_tags_for_measurement(timeseries_db_t* db, uint32_t 
   *out_num_tags = count;
   return true;
 }
+
+// -----------------------------------------------------------------------------
+// Measurement-ID cache
+// -----------------------------------------------------------------------------
+
+bool tsdb_meas_cache_lookup(timeseries_db_t* db, const char* measurement_name, uint32_t* out_id) {
+  if (!db || !db->meas_cache || !measurement_name || !out_id) {
+    return false;
+  }
+  for (int mc = 0; mc < MEAS_ID_CACHE_SIZE; mc++) {
+    if (db->meas_cache[mc].valid && strcmp(measurement_name, db->meas_cache[mc].name) == 0) {
+      *out_id = db->meas_cache[mc].id;
+      return true;
+    }
+  }
+  return false;
+}
+
+void tsdb_meas_cache_store(timeseries_db_t* db, const char* measurement_name, uint32_t id) {
+  if (!db || !db->meas_cache || !measurement_name ||
+      strlen(measurement_name) >= sizeof(db->meas_cache[0].name)) {
+    return;
+  }
+  // Round-robin eviction
+  uint8_t slot = db->meas_cache_next;
+  strncpy(db->meas_cache[slot].name, measurement_name, sizeof(db->meas_cache[slot].name) - 1);
+  db->meas_cache[slot].name[sizeof(db->meas_cache[slot].name) - 1] = '\0';
+  db->meas_cache[slot].id = id;
+  db->meas_cache[slot].valid = true;
+  db->meas_cache_next = (slot + 1) % MEAS_ID_CACHE_SIZE;
+}
+
+// -----------------------------------------------------------------------------
+// Query series collection (one metadata scan per query)
+// -----------------------------------------------------------------------------
+
+static bool tsdb_append_series_ids(timeseries_series_id_list_t* list, const unsigned char* ids, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    if (!tsdb_series_id_list_append(list, ids + i * 16)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool tsdb_collect_query_series(timeseries_db_t* db, uint32_t measurement_id, const char** tag_keys,
+                               const char** tag_values, size_t num_tags, timeseries_series_id_list_t* tag_series,
+                               timeseries_string_list_t* fields, bool discover_fields,
+                               timeseries_series_id_list_t** field_series) {
+  if (!db || !fields || !field_series || (num_tags && (!tag_keys || !tag_values || !tag_series))) {
+    return false;
+  }
+  *field_series = NULL;
+  TSDB_META_PAGES(meta_list);
+  const uint32_t* meta_offsets = NULL;
+  size_t meta_count = 0;
+
+  // Field list keys are "<meas_id>:<field>", tag index keys "<meas_id>:<key>:<value>".
+  char prefix[16];
+  int plen = snprintf(prefix, sizeof(prefix), "%" PRIu32 ":", measurement_id);
+  if (plen < 0 || (size_t)plen >= sizeof(prefix)) {
+    return false;
+  }
+
+  bool ok = true;
+  size_t fcap = fields->count > 4 ? fields->count : 4;
+  timeseries_series_id_list_t* fs = calloc(fcap, sizeof(*fs));
+  // tag_want[i] is NULL when the key exceeds the 128-byte key limit: it can
+  // match nothing (tsdb_find_series_ids_for_tag rejects it the same way).
+  char** tag_want = num_tags ? calloc(num_tags, sizeof(char*)) : NULL;
+  unsigned char* val = NULL;
+  size_t val_cap = 0;
+  if (!fs || (num_tags && !tag_want)) {
+    ok = false;
+    goto out;
+  }
+  for (size_t i = 0; i < fcap; i++) tsdb_series_id_list_init(&fs[i]);
+  for (size_t t = 0; t < num_tags; t++) {
+    if (!tag_keys[t] || !tag_values[t]) continue;
+    char kb[128];
+    int n = snprintf(kb, sizeof(kb), "%" PRIu32 ":%s:%s", measurement_id, tag_keys[t], tag_values[t]);
+    if (n < 0 || (size_t)n >= sizeof(kb)) continue;
+    tag_want[t] = strdup(kb);
+    if (!tag_want[t]) {
+      ok = false;
+      goto out;
+    }
+  }
+
+  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count)) {
+    meta_count = 0;  // no metadata => nothing matches (the per-lookup functions agree)
+  }
+
+  for (size_t p = 0; p < meta_count && ok; p++) {
+    timeseries_entity_iterator_t ent_iter;
+    if (!tsdb_meta_scan_open(db, meta_offsets[p], TIMESERIES_METADATA_PAGE_SIZE, &ent_iter)) {
+      continue;
+    }
+    timeseries_entry_header_t e_hdr;
+    while (ok && timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
+      if (e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID || e_hdr.key_len >= 128) {
+        continue;
+      }
+      bool is_field = e_hdr.key_type == TIMESERIES_KEYTYPE_FIELDLISTINDEX;
+      bool is_tag = e_hdr.key_type == TIMESERIES_KEYTYPE_TAGINDEX && num_tags > 0;
+      if ((!is_field && !is_tag) || e_hdr.key_len < (uint16_t)plen) {
+        continue;
+      }
+      char key[128];
+      if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key, NULL)) {
+        continue;
+      }
+      key[e_hdr.key_len] = '\0';
+      if (memcmp(key, prefix, (size_t)plen) != 0) {
+        continue;
+      }
+
+      size_t field_idx = SIZE_MAX;
+      bool tag_hit = false;
+      if (is_field) {
+        const char* fname = key + plen;
+        for (size_t f = 0; f < fields->count; f++) {
+          if (strcmp(fields->items[f], fname) == 0) {
+            field_idx = f;
+            break;
+          }
+        }
+        if (field_idx == SIZE_MAX) {
+          if (!discover_fields) continue;
+          // Discovered in scan order, before the value is validated, as
+          // tsdb_list_fields_for_measurement() lists it.
+          if (fields->count == fcap) {
+            size_t ncap = fcap * 2;
+            timeseries_series_id_list_t* nfs = realloc(fs, ncap * sizeof(*nfs));
+            if (!nfs) {
+              ok = false;
+              break;
+            }
+            fs = nfs;
+            for (size_t i = fcap; i < ncap; i++) tsdb_series_id_list_init(&fs[i]);
+            fcap = ncap;
+          }
+          if (!tsdb_string_list_append_unique(fields, fname)) {
+            ok = false;
+            break;
+          }
+          field_idx = fields->count - 1;
+        }
+      } else {
+        for (size_t t = 0; t < num_tags && !tag_hit; t++) {
+          tag_hit = tag_want[t] && strlen(tag_want[t]) == e_hdr.key_len && strcmp(tag_want[t], key) == 0;
+        }
+        if (!tag_hit) continue;
+      }
+
+      // Each series ID is 16 bytes.
+      if (e_hdr.value_len == 0 || e_hdr.value_len % 16 != 0) {
+        if (e_hdr.value_len % 16 != 0) {
+          ESP_LOGW(TAG, "Unexpected %s value_len=%" PRIu16 " (not multiple of 16).", is_field ? "fieldlist" : "tagindex",
+                   e_hdr.value_len);
+        }
+        continue;
+      }
+      if (e_hdr.value_len > val_cap) {
+        unsigned char* nb = realloc(val, e_hdr.value_len);
+        if (!nb) {
+          ok = false;
+          break;
+        }
+        val = nb;
+        val_cap = e_hdr.value_len;
+      }
+      if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, NULL, val)) {
+        continue;
+      }
+      size_t n_ids = e_hdr.value_len / 16;
+      if (is_field) {
+        ok = tsdb_append_series_ids(&fs[field_idx], val, n_ids);
+      } else {
+        for (size_t t = 0; t < num_tags && ok; t++) {
+          if (tag_want[t] && strlen(tag_want[t]) == e_hdr.key_len && strcmp(tag_want[t], key) == 0) {
+            ok = tsdb_append_series_ids(&tag_series[t], val, n_ids);
+          }
+        }
+      }
+    }
+    timeseries_entity_iterator_deinit(&ent_iter);
+  }
+  if (!ok) {
+    ESP_LOGE(TAG, "OOM collecting query series for measurement %" PRIu32, measurement_id);
+  }
+
+out:
+  if (tag_want) {
+    for (size_t t = 0; t < num_tags; t++) free(tag_want[t]);
+    free(tag_want);
+  }
+  free(val);
+  if (fs && !ok) {
+    for (size_t i = 0; i < fcap; i++) tsdb_series_id_list_free(&fs[i]);
+    free(fs);
+    fs = NULL;
+  }
+  *field_series = fs;
+  return ok;
+}

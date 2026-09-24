@@ -260,3 +260,122 @@ TEST_CASE("meta scan: read-only lookups read a metadata page in a few blocks", "
   TEST_ASSERT_EQUAL(r_find_miss, r_list_fields);
 }
 
+// -----------------------------------------------------------------------------
+// Query: one metadata scan, measurement ID from the cache
+// -----------------------------------------------------------------------------
+
+static const timeseries_query_result_column_t* find_column(const timeseries_query_result_t* r, const char* name) {
+  for (size_t c = 0; c < r->num_columns; c++) {
+    if (strcmp(r->columns[c].name, name) == 0) return &r->columns[c];
+  }
+  return NULL;
+}
+
+TEST_CASE("meta scan: query metadata phase scans the metadata pages once", "[metadata][meta_scan_reads]") {
+  setup_db();
+  timeseries_db_t* db = timeseries_get_db_handle();
+  TEST_ASSERT_NOT_NULL(db);
+  uint32_t pages[16];
+  size_t npages = metadata_pages(db, pages, 16);
+  TEST_ASSERT_GREATER_THAN(0, npages);
+
+  // Reads of one full metadata scan, for scale.
+  uint32_t meas_id = 0;
+  TEST_ASSERT_TRUE(tsdb_find_measurement_id(db, MSR_NAME, &meas_id));
+  timeseries_series_id_list_t ids;
+  tsdb_series_id_list_init(&ids);
+  reads_start();
+  TEST_ASSERT_TRUE(tsdb_find_all_series_ids_for_measurement(db, meas_id, &ids));
+  size_t r_one_scan = reads_stop();
+  tsdb_series_id_list_free(&ids);
+
+  // A field with no series: the query ends after the metadata phase, so every
+  // read counted here is a metadata read. The measurement ID comes from the
+  // cache the inserts filled; tags and fields share one scan.
+  const char* tk[] = {"site", "device"};
+  const char* tv[] = {"north", "dev3"};
+  const char* nofield[] = {"no_such_field"};
+  timeseries_query_t q = {
+      .measurement_name = MSR_NAME, .tag_keys = tk, .tag_values = tv, .num_tags = 2,
+      .field_names = nofield, .num_fields = 1,
+  };
+  timeseries_query_result_t r;
+  reads_start();
+  TEST_ASSERT_TRUE(timeseries_query(&q, &r));
+  size_t r_meta_only = reads_stop();
+  TEST_ASSERT_EQUAL(0, r.num_points);
+  TEST_ASSERT_EQUAL(0, r.num_columns);
+  timeseries_query_free_result(&r);
+
+  // Full query (all fields, two tag filters): same answer as before the change.
+  q.field_names = NULL;
+  q.num_fields = 0;
+  reads_start();
+  TEST_ASSERT_TRUE(timeseries_query(&q, &r));
+  size_t r_full = reads_stop();
+  TEST_ASSERT_EQUAL(MSR_FIELDS, r.num_columns);
+  TEST_ASSERT_EQUAL(2, r.num_points);
+  TEST_ASSERT_EQUAL_UINT64(1003, r.timestamps[0]);
+  TEST_ASSERT_EQUAL_UINT64(2003, r.timestamps[1]);
+  for (int f = 0; f < MSR_FIELDS; f++) {
+    char name[16];
+    snprintf(name, sizeof(name), "field%d", f);
+    const timeseries_query_result_column_t* col = find_column(&r, name);
+    TEST_ASSERT_NOT_NULL(col);
+    for (int p = 0; p < 2; p++) {
+      TEST_ASSERT_EQUAL(TIMESERIES_FIELD_TYPE_FLOAT, col->values[p].type);
+      TEST_ASSERT_EQUAL_DOUBLE((double)(3 * 100 + f * 2 + p), col->values[p].data.float_val);
+    }
+  }
+  timeseries_query_free_result(&r);
+
+  // No tags, two named fields: every series of those fields.
+  const char* two[] = {"field1", "field4"};
+  timeseries_query_t q2 = {.measurement_name = MSR_NAME, .field_names = two, .num_fields = 2};
+  reads_start();
+  TEST_ASSERT_TRUE(timeseries_query(&q2, &r));
+  size_t r_untagged = reads_stop();
+  TEST_ASSERT_EQUAL(2, r.num_columns);
+  TEST_ASSERT_EQUAL(2 * MSR_TAGVALS, r.num_points);
+  TEST_ASSERT_NOT_NULL(find_column(&r, "field1"));
+  TEST_ASSERT_NOT_NULL(find_column(&r, "field4"));
+  timeseries_query_free_result(&r);
+
+  printf("META_SCAN_QUERY_READS pages=%zu one_scan=%zu meta_only=%zu full=%zu untagged=%zu\n", npages, r_one_scan,
+         r_meta_only, r_full, r_untagged);
+  // Cached measurement ID + one scan for both tag filters and the field
+  // (separately that is a measurement scan, two tag scans and a field scan).
+  TEST_ASSERT_EQUAL(r_one_scan, r_meta_only);
+}
+
+TEST_CASE("meta scan: query sees a re-created measurement, not a stale cached ID", "[metadata][meta_scan_reads]") {
+  setup_db();
+  const char* fields[] = {"v"};
+  uint64_t ts[1] = {5000};
+  timeseries_field_value_t val = {.type = TIMESERIES_FIELD_TYPE_FLOAT, .data.float_val = 1.0};
+  timeseries_insert_data_t d = {
+      .measurement_name = "msr_recreate", .field_names = fields, .field_values = &val, .num_fields = 1,
+      .timestamps_ms = ts, .num_points = 1,
+  };
+  TEST_ASSERT_TRUE(timeseries_insert(&d));
+
+  timeseries_query_t q = {.measurement_name = "msr_recreate"};
+  timeseries_query_result_t r;
+  TEST_ASSERT_TRUE(timeseries_query(&q, &r));  // caches the ID
+  TEST_ASSERT_EQUAL(1, r.num_points);
+  timeseries_query_free_result(&r);
+
+  TEST_ASSERT_TRUE(timeseries_delete_measurement("msr_recreate"));
+  TEST_ASSERT_TRUE(timeseries_query(&q, &r));
+  TEST_ASSERT_EQUAL(0, r.num_points);
+  timeseries_query_free_result(&r);
+
+  ts[0] = 6000;
+  val.data.float_val = 2.0;
+  TEST_ASSERT_TRUE(timeseries_insert(&d));  // new measurement ID
+  TEST_ASSERT_TRUE(timeseries_query(&q, &r));
+  TEST_ASSERT_EQUAL(1, r.num_points);
+  TEST_ASSERT_EQUAL_UINT64(6000, r.timestamps[0]);
+  TEST_ASSERT_EQUAL_DOUBLE(2.0, r.columns[0].values[0].data.float_val);
+  timeseries_query_free_result(&r);
+}

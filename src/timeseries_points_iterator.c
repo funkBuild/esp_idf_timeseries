@@ -68,33 +68,27 @@ static bool points_iterator_init_impl(
   iter->is_compressed = compressed;
   iter->current_idx = 0;
 
+  /* Every failure below leaves through `fail`: whatever the iterator already
+   * owns is released by timeseries_points_iterator_deinit() (which leaves it
+   * zeroed, i.e. invalid), and record_buf is freed until the iterator takes
+   * it over. */
+  uint8_t *record_buf = NULL;
+  uint8_t *val_buf = NULL;
+
   // Boundary check
   if (record_data_offset > db->partition->size ||
       record_length > db->partition->size - record_data_offset) {
     ESP_LOGE(TAG, "Record end out of bounds: 0x%08X + %u > 0x%08X",
              (unsigned)record_data_offset, (unsigned)record_length,
              (unsigned)db->partition->size);
-    iter->valid = false;
-    return false;
+    goto fail;
   }
-
-#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
-  // Profiling for Phase 3 investigation
-  uint64_t prof_start, prof_end;
-  uint64_t prof_hdr_read = 0;
-  uint64_t prof_ts_malloc = 0;
-  uint64_t prof_ts_read = 0;
-  uint64_t prof_val_malloc = 0;
-  uint64_t prof_val_read = 0;
-  uint64_t prof_decoder_init = 0;
-#endif
 
   // 1) Read col_data_header
   if (record_length < sizeof(timeseries_col_data_header_t)) {
     ESP_LOGE(TAG, "record_length too small for col_header: %u < %zu",
              (unsigned)record_length, sizeof(timeseries_col_data_header_t));
-    iter->valid = false;
-    return false;
+    goto fail;
   }
 
   // 1) Read col_data_header — for compressed path, read entire record in one go
@@ -102,38 +96,19 @@ static bool points_iterator_init_impl(
 
   // 2) If compressed => single flash read for header + ts + val blocks
   if (compressed) {
-#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
-    prof_start = esp_timer_get_time();
-#endif
-    uint8_t *record_buf = (uint8_t *)malloc(record_length);
-#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
-    prof_end = esp_timer_get_time();
-    prof_ts_malloc = prof_end - prof_start;
-#endif
-
+    record_buf = (uint8_t *)malloc(record_length);
     if (!record_buf) {
       ESP_LOGE(TAG, "OOM for record buffer of size %u",
                (unsigned)record_length);
-      iter->valid = false;
-      return false;
+      goto fail;
     }
 
-#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
-    prof_start = esp_timer_get_time();
-#endif
     esp_err_t err = esp_partition_read(db->partition, record_data_offset,
                                        record_buf, record_length);
-#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
-    prof_end = esp_timer_get_time();
-    prof_hdr_read = prof_end - prof_start;
-#endif
-
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed reading record at 0x%08X (err=0x%x)",
                (unsigned)record_data_offset, err);
-      free(record_buf);
-      iter->valid = false;
-      return false;
+      goto fail;
     }
 
     memcpy(&col_hdr, record_buf, sizeof(col_hdr));
@@ -148,15 +123,13 @@ static bool points_iterator_init_impl(
         col_hdr.ts_len > record_length - (uint32_t)sizeof(col_hdr) ||
         col_hdr.val_len > record_length - (uint32_t)sizeof(col_hdr) - col_hdr.ts_len) {
       ESP_LOGE(TAG, "Column data extends out of record buffer");
-      free(record_buf);
-      iter->valid = false;
-      return false;
+      goto fail;
     }
 
     size_t columns_length = sizeof(col_hdr) + col_hdr.ts_len + col_hdr.val_len;
     if (!tsdb_revision_decode(data_flags, record_buf + columns_length, record_length - columns_length,
                                record_count, &iter->revisions)) {
-      free(record_buf); iter->valid = false; return false;
+      goto fail;
     }
 
     // Pointers into the single buffer
@@ -176,18 +149,12 @@ static bool points_iterator_init_impl(
       iter->alp_ts = (int64_t *)malloc(record_count * sizeof(int64_t));
       if (!iter->alp_ts) {
         ESP_LOGE(TAG, "OOM for ALP timestamp array of size %u", record_count);
-        free(record_buf);
-        iter->valid = false;
-        return false;
+        goto fail;
       }
       if (!alp_decode_int(ts_data, col_hdr.ts_len,
                           iter->alp_ts, record_count)) {
         ESP_LOGE(TAG, "ALP timestamp decode failed");
-        free(iter->alp_ts);
-        free(record_buf);
-        iter->alp_ts = NULL;
-        iter->valid = false;
-        return false;
+        goto fail;
       }
 
       /*
@@ -202,23 +169,12 @@ static bool points_iterator_init_impl(
         iter->alp_val_dec = (alp_stream_decoder_t *)malloc(sizeof(alp_stream_decoder_t));
         if (!iter->alp_val_dec) {
           ESP_LOGE(TAG, "OOM for ALP stream decoder");
-          free(iter->alp_ts);
-          free(record_buf);
-          iter->alp_ts = NULL;
-          iter->valid = false;
-          return false;
+          goto fail;
         }
         if (!alp_stream_decoder_init(iter->alp_val_dec, val_data,
                                       col_hdr.val_len, is_float)) {
           ESP_LOGE(TAG, "ALP stream decoder init failed");
-          alp_stream_decoder_deinit(iter->alp_val_dec);
-          free(iter->alp_val_dec);
-          free(iter->alp_ts);
-          free(record_buf);
-          iter->alp_val_dec = NULL;
-          iter->alp_ts = NULL;
-          iter->valid = false;
-          return false;
+          goto fail;
         }
         /* Keep record_buf alive — decoder reads from it */
         iter->alp_comp_buf = record_buf;
@@ -232,43 +188,23 @@ static bool points_iterator_init_impl(
         iter->alp_float = (double *)malloc(record_count * sizeof(double));
         if (!iter->alp_float) {
           ESP_LOGE(TAG, "OOM for ALP float array of size %u", record_count);
-          free(iter->alp_ts);
-          free(record_buf);
-          iter->alp_ts = NULL;
-          iter->valid = false;
-          return false;
+          goto fail;
         }
         if (!alp_decode(val_data, col_hdr.val_len,
                         iter->alp_float, record_count)) {
           ESP_LOGE(TAG, "ALP float value decode failed");
-          free(iter->alp_ts);
-          free(iter->alp_float);
-          free(record_buf);
-          iter->alp_ts = NULL;
-          iter->alp_float = NULL;
-          iter->valid = false;
-          return false;
+          goto fail;
         }
       } else { /* INT */
         iter->alp_int = (int64_t *)malloc(record_count * sizeof(int64_t));
         if (!iter->alp_int) {
           ESP_LOGE(TAG, "OOM for ALP int array of size %u", record_count);
-          free(iter->alp_ts);
-          free(record_buf);
-          iter->alp_ts = NULL;
-          iter->valid = false;
-          return false;
+          goto fail;
         }
         if (!alp_decode_int(val_data, col_hdr.val_len,
                             iter->alp_int, record_count)) {
           ESP_LOGE(TAG, "ALP int value decode failed");
-          free(iter->alp_ts);
-          free(iter->alp_int);
-          free(record_buf);
-          iter->alp_ts = NULL;
-          iter->alp_int = NULL;
-          iter->valid = false;
-          return false;
+          goto fail;
         }
       }
 
@@ -282,19 +218,13 @@ static bool points_iterator_init_impl(
     // Gorilla path: keep record_buf alive; ts_comp_buf owns the allocation
     iter->ts_comp_buf = record_buf;   // base allocation (includes col_hdr prefix)
     iter->val_comp_buf = NULL;        // val data is inside record_buf
+    record_buf = NULL;
 
     // Now initialize Gorilla decoders (timestamps + values) in zero-copy mode
-#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
-    prof_start = esp_timer_get_time();
-#endif
-
     if (!gorilla_decoder_init_direct(&iter->ts_decoder, GORILLA_STREAM_INT,
                                      ts_data, col_hdr.ts_len)) {
       ESP_LOGE(TAG, "Failed to init Gorilla ts_decoder.");
-      free(iter->ts_comp_buf);
-      iter->ts_comp_buf = NULL;
-      iter->valid = false;
-      return false;
+      goto fail;
     }
 
     gorilla_stream_type_t val_mode;
@@ -331,61 +261,29 @@ static bool points_iterator_init_impl(
 
     if (!val_init_ok) {
       ESP_LOGE(TAG, "Failed to init Gorilla val_decoder.");
-      gorilla_decoder_deinit(&iter->ts_decoder);
-      free(iter->ts_comp_buf);  // frees the single record_buf allocation
-      iter->ts_comp_buf = NULL;
-      iter->valid = false;
-      return false;
+      goto fail;
     }
 
     // Batch-decode all Gorilla timestamps into an array so we can
     // random-access them (enables time-range pruning via binary search).
-    iter->gorilla_batch_ts = (int64_t *)malloc(record_count * sizeof(int64_t));
-    if (!iter->gorilla_batch_ts) {
+    int64_t *batch_ts = (int64_t *)malloc(record_count * sizeof(int64_t));
+    if (!batch_ts) {
       ESP_LOGE(TAG, "OOM for gorilla_batch_ts of size %u", record_count);
-      gorilla_decoder_deinit(&iter->ts_decoder);
-      gorilla_decoder_deinit(&iter->val_decoder);
-      free(iter->ts_comp_buf);
-      iter->ts_comp_buf = NULL;
-      iter->valid = false;
-      return false;
+      goto fail;
     }
     for (uint16_t i = 0; i < record_count; i++) {
       uint64_t ts;
       if (!gorilla_decoder_get_timestamp(&iter->ts_decoder, &ts)) {
         ESP_LOGE(TAG, "Gorilla batch ts decode failed at i=%u", i);
-        free(iter->gorilla_batch_ts);
-        iter->gorilla_batch_ts = NULL;
-        gorilla_decoder_deinit(&iter->ts_decoder);
-        gorilla_decoder_deinit(&iter->val_decoder);
-        free(iter->ts_comp_buf);
-        iter->ts_comp_buf = NULL;
-        iter->valid = false;
-        return false;
+        free(batch_ts);
+        goto fail;
       }
-      iter->gorilla_batch_ts[i] = (int64_t)ts;
+      batch_ts[i] = (int64_t)ts;
     }
-    // ts_decoder is fully consumed — deinit it
+    // ts_decoder is fully consumed — deinit it (deinit skips it once
+    // gorilla_batch_ts is set)
     gorilla_decoder_deinit(&iter->ts_decoder);
-
-#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG
-    prof_end = esp_timer_get_time();
-    prof_decoder_init = prof_end - prof_start;
-
-    // Log detailed profiling breakdown
-    uint64_t total_time = prof_hdr_read + prof_ts_malloc + prof_ts_read +
-                          prof_val_malloc + prof_val_read + prof_decoder_init;
-    ESP_LOGD(TAG, "[ITER INIT] Total: %.3f ms (hdr: %.3f, ts_malloc: %.3f, ts_read: %.3f, val_malloc: %.3f, val_read: %.3f, decoder: %.3f) [ts_len=%u, val_len=%u]",
-             total_time / 1000.0,
-             prof_hdr_read / 1000.0,
-             prof_ts_malloc / 1000.0,
-             prof_ts_read / 1000.0,
-             prof_val_malloc / 1000.0,
-             prof_val_read / 1000.0,
-             prof_decoder_init / 1000.0,
-             (unsigned)col_hdr.ts_len,
-             (unsigned)col_hdr.val_len);
-#endif
+    iter->gorilla_batch_ts = batch_ts;
 
     ESP_LOGV(TAG, "Iterator init: compressed, record_count=%u", record_count);
   } else {
@@ -402,8 +300,7 @@ static bool points_iterator_init_impl(
                                           &uc_hdr, sizeof(uc_hdr));
     if (uc_err != ESP_OK) {
       ESP_LOGE(TAG, "Failed reading uncompressed header (err=0x%x)", uc_err);
-      iter->valid = false;
-      return false;
+      goto fail;
     }
 
     // Same subtraction-based bound as the compressed path: ts_len/val_len are
@@ -413,25 +310,23 @@ static bool points_iterator_init_impl(
         uc_hdr.ts_len > record_length - (uint32_t)sizeof(uc_hdr) ||
         uc_hdr.val_len > record_length - (uint32_t)sizeof(uc_hdr) - uc_hdr.ts_len) {
       ESP_LOGE(TAG, "Uncompressed column data extends out of record");
-      iter->valid = false;
-      return false;
+      goto fail;
     }
 
     uint32_t columns_length = sizeof(uc_hdr) + uc_hdr.ts_len + uc_hdr.val_len;
     if (cached_revision && iter->has_revision && (data_flags & TSDB_FIELDDATA_FLAG_REVISION_VECTOR)) {
-      if (record_length - columns_length != sizeof(uint64_t)) { iter->valid = false; return false; }
+      if (record_length - columns_length != sizeof(uint64_t)) goto fail;
       iter->revisions.value = *cached_revision;
     } else if (!tsdb_revision_read(db, record_data_offset, record_length, columns_length,
                                     record_count, data_flags, &iter->revisions)) {
-      iter->valid = false; return false;
+      goto fail;
     }
     uint32_t ts_size = record_count * sizeof(uint64_t);
     if (uc_hdr.ts_len != ts_size ||
         uc_hdr.ts_len > record_length - (uint32_t)sizeof(uc_hdr) ||
         uc_hdr.val_len > record_length - (uint32_t)sizeof(uc_hdr) - uc_hdr.ts_len) {
       ESP_LOGE(TAG, "Uncompressed column lengths exceed record bounds");
-      iter->valid = false;
-      return false;
+      goto fail;
     }
     uint32_t ts_offset = record_data_offset + sizeof(uc_hdr);
     uint32_t val_offset = ts_offset + uc_hdr.ts_len;
@@ -440,17 +335,13 @@ static bool points_iterator_init_impl(
     iter->ts_array = (uint64_t *)malloc(ts_size);
     if (!iter->ts_array) {
       ESP_LOGE(TAG, "OOM for uncompressed ts array");
-      iter->valid = false;
-      return false;
+      goto fail;
     }
     uc_err = esp_partition_read(db->partition, ts_offset,
                                 iter->ts_array, ts_size);
     if (uc_err != ESP_OK) {
       ESP_LOGE(TAG, "Failed reading uncompressed timestamps (err=0x%x)", uc_err);
-      free(iter->ts_array);
-      iter->ts_array = NULL;
-      iter->valid = false;
-      return false;
+      goto fail;
     }
 
     // Use decoded timestamps to trim fixed-width columns before reading
@@ -461,14 +352,9 @@ static bool points_iterator_init_impl(
         case TIMESERIES_FIELD_TYPE_INT:
         case TIMESERIES_FIELD_TYPE_FLOAT: width = 8; break;
         case TIMESERIES_FIELD_TYPE_BOOL: width = 1; break;
-        default:
-          timeseries_points_iterator_deinit(iter);
-          return false;
+        default: goto fail;
       }
-      if (uc_hdr.val_len < (uint32_t)record_count * width) {
-        timeseries_points_iterator_deinit(iter);
-        return false;
-      }
+      if (uc_hdr.val_len < (uint32_t)record_count * width) goto fail;
       timeseries_points_iterator_set_time_range(iter, start_ms, end_ms);
       uint16_t first = iter->current_idx;
       iter->revision_first = first;
@@ -482,121 +368,75 @@ static bool points_iterator_init_impl(
     }
 
     // B) Allocate and read values directly from flash
-    uint8_t *val_buf = (uint8_t *)malloc(uc_hdr.val_len);
+    val_buf = (uint8_t *)malloc(uc_hdr.val_len);
     if (!val_buf) {
       ESP_LOGE(TAG, "OOM for uncompressed values buffer of size %u",
                (unsigned)uc_hdr.val_len);
-      free(iter->ts_array);
-      iter->ts_array = NULL;
-      iter->valid = false;
-      return false;
+      goto fail;
     }
     uc_err = esp_partition_read(db->partition, val_offset,
                                 val_buf, uc_hdr.val_len);
     if (uc_err != ESP_OK) {
       ESP_LOGE(TAG, "Failed reading uncompressed values (err=0x%x)", uc_err);
-      free(val_buf);
-      free(iter->ts_array);
-      iter->ts_array = NULL;
-      iter->valid = false;
-      return false;
+      goto fail;
     }
 
-    // Parse val_buf according to series_type
-    // We'll assume each sample has a fixed size for demonstration:
-    //   Float => 8 bytes (double)
-    //   Int   => 8 bytes (int64_t)
-    //   Bool  => 1 byte
-    // If your code also has strings or variable lengths, you'd do more complex
-    // parsing.
-
+    // Parse val_buf according to series_type: float and int values are
+    // already in native 8-byte layout, bools one byte each, strings are
+    // [u32 length][bytes] each.
     switch (series_type) {
-    case TIMESERIES_FIELD_TYPE_FLOAT: {
-      if (uc_hdr.val_len < record_count * sizeof(double)) {
-        ESP_LOGE(TAG, "Value buffer too small for %u doubles", record_count);
-        free(iter->ts_array);
-        free(val_buf);
-        iter->ts_array = NULL;
-        iter->valid = false;
-        return false;
-      }
-      // val_buf is already in native double[] layout — adopt it directly
-      iter->float_array = (double *)val_buf;
-      val_buf = NULL; // deinit will free float_array
-      break;
-    }
+    case TIMESERIES_FIELD_TYPE_FLOAT:
     case TIMESERIES_FIELD_TYPE_INT: {
       if (uc_hdr.val_len < record_count * sizeof(int64_t)) {
-        ESP_LOGE(TAG, "Value buffer too small for %u int64s", record_count);
-        free(iter->ts_array);
-        free(val_buf);
-        iter->ts_array = NULL;
-        iter->valid = false;
-        return false;
+        ESP_LOGE(TAG, "Value buffer too small for %u 8-byte values", record_count);
+        goto fail;
       }
-      // val_buf is already in native int64_t[] layout — adopt it directly
-      iter->int_array = (int64_t *)val_buf;
-      val_buf = NULL; // deinit will free int_array
+      // Adopt val_buf directly (float_array / int_array share storage);
+      // deinit frees it
+      iter->float_array = (double *)val_buf;
+      val_buf = NULL;
       break;
     }
     case TIMESERIES_FIELD_TYPE_BOOL: {
       iter->bool_array = (bool *)malloc(record_count * sizeof(bool));
       if (!iter->bool_array) {
         ESP_LOGE(TAG, "OOM for bool_array of size=%u", record_count);
-        free(iter->ts_array);
-        free(val_buf);
-        iter->ts_array = NULL;
-        iter->valid = false;
-        return false;
+        goto fail;
       }
-
-      size_t offset = 0;
       for (size_t i = 0; i < record_count; i++) {
-        if (offset + 1 > uc_hdr.val_len) {
+        if (i + 1 > uc_hdr.val_len) {
           ESP_LOGE(TAG, "Value buffer too small for bool at i=%zu", i);
-          free(iter->ts_array);
-          free(iter->bool_array);
-          iter->ts_array = NULL;
-          iter->bool_array = NULL;
-          iter->valid = false;
-          break;
+          goto fail;
         }
-        bool b = (val_buf[offset] != 0);
-        offset += 1;
-        iter->bool_array[i] = b;
+        iter->bool_array[i] = (val_buf[i] != 0);
       }
       break;
     }
     case TIMESERIES_FIELD_TYPE_STRING: {
-      // Allocate array for string values
+      // Allocate array for string values; string_array_count only counts
+      // entries already filled, so deinit frees exactly those.
       iter->string_array =
           (string_array_t *)malloc(record_count * sizeof(string_array_t));
-      iter->string_array_count = record_count;
-
       if (!iter->string_array) {
         ESP_LOGE(TAG, "OOM for string_array of size=%u", record_count);
-        free(iter->ts_array);
-        free(val_buf);
-        iter->ts_array = NULL;
-        iter->valid = false;
-        return false;
+        goto fail;
       }
+      iter->string_array_count = 0;
 
       size_t offset = 0;
-      size_t i; // Move i declaration outside the loop for later use in cleanup
-      for (i = 0; i < record_count; i++) {
+      for (size_t i = 0; i < record_count; i++) {
         // Read string length (4 bytes)
         uint32_t str_len = 0;
         if (offset + 4 > uc_hdr.val_len) {
           ESP_LOGE(TAG, "Value buffer too small for string length at i=%zu", i);
-          iter->valid = false;
-          break;
+          goto fail;
         }
         memcpy(&str_len, val_buf + offset, 4);
         offset += 4;
 
         // Store the length
         iter->string_array[i].length = str_len;
+        iter->string_array[i].str = NULL;
 
         // Allocate and copy the string data
         if (str_len > 0) {
@@ -606,8 +446,7 @@ static bool points_iterator_init_impl(
           if (str_len > uc_hdr.val_len - offset ||
               str_len > TSDB_STRING_MAX_LEN) {
             ESP_LOGE(TAG, "Value buffer too small for string data at i=%zu", i);
-            iter->valid = false;
-            break;
+            goto fail;
           }
 
           iter->string_array[i].str =
@@ -615,54 +454,35 @@ static bool points_iterator_init_impl(
           if (!iter->string_array[i].str) {
             ESP_LOGE(TAG, "OOM for string data of length=%u",
                      (unsigned)str_len);
-            iter->valid = false;
-            break;
+            goto fail;
           }
 
           memcpy(iter->string_array[i].str, val_buf + offset, str_len);
           iter->string_array[i].str[str_len] = '\0'; // Null-terminate
           offset += str_len;
-        } else {
-          iter->string_array[i].str = NULL;
         }
+        iter->string_array_count = i + 1;
       }
-
-      // Handle any error that occurred in the loop
-      if (!iter->valid) {
-        // Clean up previously allocated strings
-        for (size_t j = 0; j < i; j++) {
-          if (iter->string_array[j].str) {
-            free(iter->string_array[j].str);
-          }
-        }
-        free(iter->string_array);
-        free(iter->ts_array);
-        free(val_buf);
-        iter->string_array = NULL;
-        iter->ts_array = NULL;
-        return false;
-      }
+      iter->string_array_count = record_count;
       break;
     }
     default: {
       ESP_LOGE(TAG, "Unsupported uncompressed type=%d", (int)series_type);
-      free(iter->ts_array);
-      iter->ts_array = NULL;
-      iter->valid = false;
-      break;
+      goto fail;
     }
     }
 
     free(val_buf);
-    if (!iter->valid) {
-      // error paths above already freed ts_array and type-specific arrays
-      return false;
-    }
-
     ESP_LOGD(TAG, "Iterator init: uncompressed, record_count=%u", record_count);
   }
 
   return iter->valid;
+
+fail:
+  free(val_buf);
+  free(record_buf);
+  timeseries_points_iterator_deinit(iter);
+  return false;
 }
 
 bool timeseries_points_iterator_init_range_with_revision(

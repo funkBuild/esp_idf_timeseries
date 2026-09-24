@@ -363,7 +363,11 @@ static void check_decode_progress(bool compact, bool rollup) {
     atomic_store(&db->compaction_in_progress, false);
     timeseries_deinit();
     TEST_ASSERT_TRUE(done); TEST_ASSERT_TRUE(p.ok); TEST_ASSERT_TRUE(ok);
-    TEST_ASSERT_EQUAL(rollup ? 20 : 2000, points);
+    // This checks decode progress; the count only confirms the query ran to
+    // completion. Without start_ms, rollup windows sit on the 0-origin grid
+    // (timeseries_multi_series_iterator_align), so points 1..2000 at 100 ms
+    // fill 21 windows: [0,100) holds 1..99 and [2000,2100) holds 2000.
+    TEST_ASSERT_EQUAL(rollup ? 21 : 2000, points);
     TEST_ASSERT_TRUE(values_ok);
     TEST_ASSERT_TRUE_MESSAGE(progress, "writer blocked while query only needs RAM");
 }

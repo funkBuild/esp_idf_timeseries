@@ -41,6 +41,15 @@ bool tsdb_test_read_fault(size_t offset, size_t size) {
   return s_fault.armed && offset < s_fault.end && s_fault.start < offset + size;
 }
 
+/* Other suites (the read-path goldens) inject the same kind of fault. */
+void tsdb_test_arm_read_fault(size_t start, size_t end) {
+  s_fault.start = start;
+  s_fault.end = end;
+  s_fault.clear = CLEAR_NEVER;
+  s_fault.armed = true;
+}
+void tsdb_test_disarm_read_fault(void) { s_fault.armed = false; }
+
 /* Called by the esp_partition_erase_range wrap: false fails the erase. */
 bool tsdb_test_on_erase(const esp_partition_t *part, size_t offset, size_t length) {
   if (s_fail_erases) return false;

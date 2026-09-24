@@ -2,6 +2,7 @@
 #include "timeseries.h"
 #include "timeseries_revision.h"
 #include "timeseries_repair.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "timeseries_cache.h"
@@ -31,12 +32,10 @@
 
 static const char* TAG = "TimeseriesDB";
 
-// Global/Static DB Context (single instance by design)
-static timeseries_db_t s_tsdb = {
-    .initialized = false,
-    .next_measurement_id = 1,
-    .partition = NULL,
-};
+// Global/Static DB Context (single instance by design). Zero-initialised and
+// in PSRAM (~300 B off the internal .data segment); init_locked() sets the
+// only non-zero default, next_measurement_id, before anything reads it.
+static EXT_RAM_BSS_ATTR timeseries_db_t s_tsdb;
 static _Atomic bool s_lifecycle_busy = false;
 
 // Admission and active-operation count share one atomic word, so teardown
@@ -212,6 +211,7 @@ typedef enum { TSDB_INIT_OPENED, TSDB_INIT_NO_PARTITION, TSDB_INIT_FAILED } tsdb
 static tsdb_init_outcome_t init_locked(void) {
   if (s_tsdb.initialized) return TSDB_INIT_OPENED;
   tsdb_init_faults_reset(&s_tsdb);
+  s_tsdb.next_measurement_id = 1;  // restored from metadata below
 
   ESP_LOGV(TAG, "Initializing Timeseries DB...");
 

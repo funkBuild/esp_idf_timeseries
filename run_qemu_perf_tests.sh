@@ -55,8 +55,9 @@ if command -v pytest &> /dev/null && python3 -c "import pytest_embedded" 2>/dev/
     TEST_FILTER="${1:--k perf}"
 
     pytest pytest_perf_tests.py \
-        --target esp32 \
+        --target esp32s3 \
         --embedded-services qemu \
+        --qemu-extra-args "-m 8M" \
         --qemu-image-path build/unit_test_test.bin \
         ${TEST_FILTER} \
         -v \
@@ -70,10 +71,10 @@ else
 
         # Create QEMU flash image
         echo "Creating flash image..."
-        esptool.py --chip esp32 merge_bin -o build/flash_image.bin \
+        esptool.py --chip esp32s3 merge_bin -o build/flash_image.bin \
             --flash_mode dio \
-            --flash_size 4MB \
-            0x1000 build/bootloader/bootloader.bin \
+            --flash_size 4MB --fill-flash-size 4MB \
+            0x0 build/bootloader/bootloader.bin \
             0x8000 build/partition_table/partition-table.bin \
             0x10000 build/unit_test_test.bin
 
@@ -81,7 +82,8 @@ else
         echo "Starting QEMU (timeout: 300s)..."
         timeout 300 qemu-system-xtensa \
             -nographic \
-            -machine esp32 \
+            -machine esp32s3 \
+            -m 8M \
             -drive file=build/flash_image.bin,if=mtd,format=raw \
             -serial mon:stdio \
             2>&1 | tee "${LOG_FILE}" &

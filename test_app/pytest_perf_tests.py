@@ -41,7 +41,7 @@ def parse_perf_metrics(output: str) -> Dict[str, Dict[str, str]]:
     return metrics
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_database_init(app: QemuApp, dut: QemuDut) -> None:
@@ -49,7 +49,7 @@ def test_perf_database_init(app: QemuApp, dut: QemuDut) -> None:
     dut.expect(r'Database initialized for performance testing', timeout=30)
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_clear_database(app: QemuApp, dut: QemuDut) -> None:
@@ -57,7 +57,7 @@ def test_perf_clear_database(app: QemuApp, dut: QemuDut) -> None:
     dut.expect(r'Database cleared to empty state', timeout=30)
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_single_point_insert(app: QemuApp, dut: QemuDut) -> None:
@@ -68,7 +68,7 @@ def test_perf_single_point_insert(app: QemuApp, dut: QemuDut) -> None:
     assert throughput > 0, "Throughput should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_bulk_insert_100(app: QemuApp, dut: QemuDut) -> None:
@@ -79,7 +79,7 @@ def test_perf_bulk_insert_100(app: QemuApp, dut: QemuDut) -> None:
     assert throughput > 0, "Throughput should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_bulk_insert_1000(app: QemuApp, dut: QemuDut) -> None:
@@ -90,7 +90,7 @@ def test_perf_bulk_insert_1000(app: QemuApp, dut: QemuDut) -> None:
     assert throughput > 0, "Throughput should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_multi_field_insert(app: QemuApp, dut: QemuDut) -> None:
@@ -101,7 +101,7 @@ def test_perf_multi_field_insert(app: QemuApp, dut: QemuDut) -> None:
     assert throughput > 0, "Throughput should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_query_100_1field(app: QemuApp, dut: QemuDut) -> None:
@@ -112,7 +112,7 @@ def test_perf_query_100_1field(app: QemuApp, dut: QemuDut) -> None:
     assert throughput > 0, "Throughput should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_query_1000_1field(app: QemuApp, dut: QemuDut) -> None:
@@ -123,7 +123,7 @@ def test_perf_query_1000_1field(app: QemuApp, dut: QemuDut) -> None:
     assert throughput > 0, "Throughput should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_query_500_6fields(app: QemuApp, dut: QemuDut) -> None:
@@ -134,7 +134,7 @@ def test_perf_query_500_6fields(app: QemuApp, dut: QemuDut) -> None:
     assert throughput > 0, "Throughput should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_compaction_500(app: QemuApp, dut: QemuDut) -> None:
@@ -145,7 +145,7 @@ def test_perf_compaction_500(app: QemuApp, dut: QemuDut) -> None:
     assert throughput > 0, "Throughput should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_compaction_2000(app: QemuApp, dut: QemuDut) -> None:
@@ -156,7 +156,7 @@ def test_perf_compaction_2000(app: QemuApp, dut: QemuDut) -> None:
     assert throughput > 0, "Throughput should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_float_encode(app: QemuApp, dut: QemuDut) -> None:
@@ -167,7 +167,7 @@ def test_perf_float_encode(app: QemuApp, dut: QemuDut) -> None:
     assert ratio > 0, "Compression ratio should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_float_decode(app: QemuApp, dut: QemuDut) -> None:
@@ -178,7 +178,7 @@ def test_perf_float_decode(app: QemuApp, dut: QemuDut) -> None:
     assert throughput > 0, "Throughput should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_int_encode(app: QemuApp, dut: QemuDut) -> None:
@@ -189,7 +189,7 @@ def test_perf_int_encode(app: QemuApp, dut: QemuDut) -> None:
     assert ratio > 0, "Compression ratio should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_int_decode(app: QemuApp, dut: QemuDut) -> None:
@@ -200,7 +200,7 @@ def test_perf_int_decode(app: QemuApp, dut: QemuDut) -> None:
     assert throughput > 0, "Throughput should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_e2e_workflow(app: QemuApp, dut: QemuDut) -> None:
@@ -214,7 +214,7 @@ def test_perf_e2e_workflow(app: QemuApp, dut: QemuDut) -> None:
     assert throughput > 0, "Throughput should be positive"
 
 
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_perf_stress_test(app: QemuApp, dut: QemuDut) -> None:
@@ -226,7 +226,7 @@ def test_perf_stress_test(app: QemuApp, dut: QemuDut) -> None:
 
 
 # Combined test that runs all performance tests and collects metrics
-@pytest.mark.esp32
+@pytest.mark.esp32s3
 @pytest.mark.host_test
 @pytest.mark.qemu
 def test_run_all_perf_tests(app: QemuApp, dut: QemuDut) -> None:

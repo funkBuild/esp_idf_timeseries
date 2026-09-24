@@ -22,6 +22,7 @@
 #include "timeseries_internal.h"
 #include "timeseries_iterator.h"
 #include "timeseries_page_cache.h"
+#include "timeseries_repair.h"
 #include "timeseries_string_list.h"
 
 #include "freertos/FreeRTOS.h"
@@ -354,6 +355,20 @@ bool tsdb_create_measurement_id(timeseries_db_t* db, const char* measurement_nam
   return true;
 }
 
+/* The measurement ID an index key ("<id>:field" or "<id>:tag:value") names,
+ * or false when the key does not start that way. */
+static bool index_key_measurement_id(const char *key, size_t len, uint32_t *out) {
+  uint32_t id = 0;
+  size_t i = 0;
+  for (; i < len && key[i] >= '0' && key[i] <= '9'; i++) {
+    id = id * 10u + (uint32_t)(key[i] - '0');
+    if (!tsdb_measurement_id_plausible(id)) return false;
+  }
+  if (i == 0 || i == len || key[i] != ':') return false;
+  *out = id;
+  return true;
+}
+
 bool tsdb_find_max_measurement_id(timeseries_db_t *db, uint32_t *out_max) {
   if (!db || !out_max) {
     return false;
@@ -368,7 +383,18 @@ bool tsdb_find_max_measurement_id(timeseries_db_t *db, uint32_t *out_max) {
   if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count)) {
     return false;
   }
+  if (meta_count == 0) return true;
 
+  // Index keys carry their measurement's ID too. Normally none exceeds the
+  // measurement entries' maximum; after a metadata page is lost (erased by
+  // init recovery) the index entries of its measurements can outlive them,
+  // and a new measurement given one of their IDs would inherit their series.
+  char *key = malloc(256);
+  if (!key) {
+    tsdb_init_fault_transient(db);
+    return false;
+  }
+  bool ok = true;
   for (size_t i = 0; i < meta_count; i++) {
     uint32_t page_offset = meta_offsets[i];
     uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
@@ -378,29 +404,50 @@ bool tsdb_find_max_measurement_id(timeseries_db_t *db, uint32_t *out_max) {
       continue;
     }
 
+    // A read failure here (entity header, key or value) leaves the maximum
+    // unknown: record the page for init's recovery and fail.
+    bool unreadable = false;
     timeseries_entry_header_t e_hdr;
     while (timeseries_entity_iterator_next(&ent_iter, &e_hdr)) {
-      if (e_hdr.key_type != TIMESERIES_KEYTYPE_MEASUREMENT) {
-        continue;
-      }
       if (e_hdr.delete_marker != TIMESERIES_DELETE_MARKER_VALID) {
         continue;
       }
-      // Read only the measurement ID (the value); the name may be up to 255
-      // bytes, and skipping long names made their IDs invisible here, so the
-      // next measurement reused them. An ID torn by an interrupted write
-      // (0xFF top byte) is not a real ID and must not wrap next_id to 0.
       uint32_t val = 0;
-      if (e_hdr.value_len == sizeof(uint32_t) &&
-          timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, NULL, &val) &&
-          tsdb_measurement_id_plausible(val) && val > *out_max) {
+      if (e_hdr.key_type == TIMESERIES_KEYTYPE_MEASUREMENT) {
+        // Read only the measurement ID (the value); the name may be up to 255
+        // bytes, and skipping long names made their IDs invisible here, so
+        // the next measurement reused them. An ID torn by an interrupted write
+        // (0xFF top byte) is not a real ID and must not wrap next_id to 0.
+        if (e_hdr.value_len != sizeof(uint32_t)) continue;
+        if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, NULL, &val)) {
+          unreadable = true;
+          break;
+        }
+      } else if (e_hdr.key_type == TIMESERIES_KEYTYPE_TAGINDEX ||
+                 e_hdr.key_type == TIMESERIES_KEYTYPE_FIELDLISTINDEX) {
+        if (e_hdr.key_len == 0 || e_hdr.key_len > 255) continue;
+        if (!timeseries_entity_iterator_read_data(&ent_iter, &e_hdr, key, NULL)) {
+          unreadable = true;
+          break;
+        }
+        if (!index_key_measurement_id(key, e_hdr.key_len, &val)) continue;
+      } else {
+        continue;
+      }
+      if (tsdb_measurement_id_plausible(val) && val > *out_max) {
         *out_max = val;
       }
     }
+    if (unreadable || ent_iter.read_error) {
+      ESP_LOGE(TAG, "Metadata page @0x%08" PRIx32 " could not be read while restoring the measurement ID",
+               page_offset);
+      tsdb_init_fault_bad_page(db, page_offset, page_size);
+      ok = false;
+    }
     timeseries_entity_iterator_deinit(&ent_iter);
   }
-
-  return true;
+  free(key);
+  return ok;
 }
 
 

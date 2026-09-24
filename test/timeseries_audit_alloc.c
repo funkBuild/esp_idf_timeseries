@@ -89,13 +89,16 @@ void *__wrap_calloc(size_t count, size_t size) {
     return p;
 }
 
-static _Thread_local size_t fail_malloc_size, fail_realloc_size;
+static _Thread_local size_t fail_malloc_size, fail_realloc_size, fail_malloc_always_size;
 void tsdb_audit_fail_malloc(size_t size) { fail_malloc_size = size; }
 void tsdb_audit_fail_realloc(size_t size) { fail_realloc_size = size; }
+/* Every malloc of exactly this size fails until reset with 0. */
+void tsdb_audit_fail_malloc_always(size_t size) { fail_malloc_always_size = size; }
 void *__real_malloc(size_t);
 void *__wrap_malloc(size_t size) {
     if (allocation_probe(size)) return NULL;
     if (size && size == fail_malloc_size) { fail_malloc_size = 0; return NULL; }
+    if (size && size == fail_malloc_always_size) return NULL;
     sigset_t old;
     tsdb_host_sim_block_signals(&old);
     void *p = __real_malloc(size);
@@ -161,11 +164,13 @@ void tsdb_audit_recycle_on_read(TaskHandle_t task, size_t offset) {
     recycle_offset = offset;
 }
 esp_err_t __real_esp_partition_read(const esp_partition_t *, size_t, void *, size_t);
+bool tsdb_test_read_fault(size_t offset, size_t size);  // timeseries_recovery_test.c
 esp_err_t __wrap_esp_partition_read(const esp_partition_t *part, size_t offset,
                                   void *buffer, size_t size) {
     if (sixth_read_armed && offset == sixth_read_offset) {
         sixth_read_armed = sixth_read_persistent; return ESP_FAIL;
     }
+    if (tsdb_test_read_fault(offset, size)) return ESP_FAIL;
     read_bytes += size;
     read_calls++;
     if (recycle_task && offset == recycle_offset && size == 8) {

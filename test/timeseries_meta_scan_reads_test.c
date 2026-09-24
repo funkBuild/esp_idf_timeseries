@@ -40,7 +40,9 @@ static size_t reads_stop(void) { return tsdb_audit_read_calls(); }
 static TaskHandle_t volatile s_count_task;
 static volatile size_t s_read_calls;
 esp_err_t __real_esp_partition_read(const esp_partition_t* part, size_t offset, void* dst, size_t size);
+bool tsdb_test_read_fault(size_t offset, size_t size);  // timeseries_recovery_test.c
 esp_err_t __wrap_esp_partition_read(const esp_partition_t* part, size_t offset, void* dst, size_t size) {
+  if (tsdb_test_read_fault(offset, size)) return ESP_FAIL;
   if (s_count_task && xTaskGetCurrentTaskHandle() == s_count_task) s_read_calls++;
   return __real_esp_partition_read(part, offset, dst, size);
 }

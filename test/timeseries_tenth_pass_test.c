@@ -32,8 +32,10 @@ void __wrap_vTaskDelay(TickType_t ticks) {
 }
 esp_err_t __real_esp_partition_erase_range(const esp_partition_t *, size_t, size_t);
 bool tsdb_audit_fourteenth_erase_gate(void);
+bool tsdb_test_on_erase(const esp_partition_t *p, size_t offset, size_t length);  // timeseries_recovery_test.c
 esp_err_t __wrap_esp_partition_erase_range(const esp_partition_t *p, size_t offset, size_t length) {
   if (!tsdb_audit_fourteenth_erase_gate()) return ESP_FAIL;
+  if (!tsdb_test_on_erase(p, offset, length)) return ESP_FAIL;
   if (erase_owner == xTaskGetCurrentTaskHandle()) {
     erase_owned = atomic_load(&timeseries_get_db_handle()->compaction_in_progress);
     if (fail_erase) return ESP_FAIL;

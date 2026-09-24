@@ -204,7 +204,63 @@ typedef struct {
   uint32_t total_space_bytes;
 } tsdb_usage_summary_t;
 
+/**
+ * @brief Open the database: one attempt, never erases anything.
+ *
+ * False when it could not be opened (the database then stays closed: every
+ * other call returns its error). See timeseries_init_with_recovery.
+ */
 bool timeseries_init(void);
+
+/** Outcome of timeseries_init_with_recovery. */
+typedef enum {
+  TIMESERIES_INIT_OK = 0,
+  TIMESERIES_INIT_ERR_BUSY,          /**< another init/deinit is running, or a teardown is pending */
+  TIMESERIES_INIT_ERR_NO_PARTITION,  /**< no "timeseries" partition in the partition table */
+  TIMESERIES_INIT_ERR_TRANSIENT,     /**< e.g. out of memory on every attempt; nothing was erased */
+  TIMESERIES_INIT_ERR_CORRUPT,       /**< still unreadable after the whole partition was erased */
+  TIMESERIES_INIT_ERR_FLASH,         /**< erasing the partition failed */
+} timeseries_init_status_t;
+
+/** What recovery erased. */
+typedef enum {
+  TIMESERIES_RECOVERY_NONE = 0,         /**< nothing */
+  TIMESERIES_RECOVERY_PAGES_ERASED,     /**< pages_erased unreadable pages */
+  TIMESERIES_RECOVERY_PARTITION_ERASED, /**< the whole partition (after pages_erased pages) */
+} timeseries_recovery_action_t;
+
+typedef struct {
+  timeseries_init_status_t status;
+  timeseries_recovery_action_t action;
+  uint32_t pages_erased;
+  uint32_t attempts; /**< init attempts made */
+} timeseries_recovery_report_t;
+
+/** Init attempts made for a transient failure before giving up. */
+#define TIMESERIES_RECOVERY_TRANSIENT_ATTEMPTS 3
+
+/**
+ * @brief Open the database, repairing stored content that cannot be read.
+ *
+ * - A transient failure (allocation) is retried up to
+ *   TIMESERIES_RECOVERY_TRANSIENT_ATTEMPTS times with a short pause, and
+ *   never erases anything: the caller can retry later with the data intact.
+ * - Pages that cannot be read are erased, only those, and init is retried.
+ * - If that does not help (a page is bad again after its erase, a page erase
+ *   fails, or too many rounds), the whole partition is erased and the
+ *   database starts empty.
+ *
+ * Blocks for the retries' pauses and the erases (seconds for a partition
+ * erase). @p report (optional) says what happened; returns true when open.
+ */
+bool timeseries_init_with_recovery(timeseries_recovery_report_t *report);
+
+/**
+ * @brief Erase the whole partition while the database is closed (e.g. a
+ *        factory reset after a failed init). Refuses (false) while open:
+ *        use timeseries_clear_all then.
+ */
+bool timeseries_erase_partition(void);
 
 /**
  * @brief Insert multiple data points for multiple fields in one call.

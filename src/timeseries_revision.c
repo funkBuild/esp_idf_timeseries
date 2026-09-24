@@ -1,6 +1,7 @@
 #include "timeseries_revision.h"
 #include "timeseries_iterator.h"
 #include "timeseries_data.h"
+#include "timeseries_repair.h"
 #include "esp_log.h"
 #include <inttypes.h>
 #include "alp/alp_int_codec.h"
@@ -224,7 +225,9 @@ static bool stopped_at_malformed(timeseries_db_t *db, uint32_t page_offset, uint
  * would otherwise exhaust the counter and disable every insert. Only an
  * allocation failure or a flash read failure (the maximum would be unknown,
  * and a low guess would order new writes before stored ones) is fatal; the
- * counter is then left unchanged. */
+ * counter is then left unchanged. A page that cannot be read is recorded for
+ * init's recovery and the scan goes on, so every such page is reported;
+ * an allocation failure is recorded as transient. */
 bool tsdb_revision_recover(timeseries_db_t *db) {
   if (!db || !db->partition) return false;
   timeseries_page_cache_iterator_t pages;
@@ -234,22 +237,23 @@ bool tsdb_revision_recover(timeseries_db_t *db) {
   timeseries_page_header_t page;
   uint32_t offset, size;
   bool ok = true;
-  while (ok && timeseries_page_cache_iterator_next(&pages, &page, &offset, &size)) {
+  while (timeseries_page_cache_iterator_next(&pages, &page, &offset, &size)) {
     if (page.page_type != TIMESERIES_PAGE_TYPE_FIELD_DATA || page.page_state != TIMESERIES_PAGE_STATE_ACTIVE) continue;
     if (!buffer) {
       buffer = malloc(4096);
-      if (!buffer) { ok = false; break; }
+      if (!buffer) { tsdb_init_fault_transient(db); ok = false; break; }
     }
     timeseries_fielddata_iterator_t fields;
     if (!timeseries_fielddata_iterator_init_window(db, offset, size, buffer, 4096, &fields)) continue;
     timeseries_field_data_header_t header;
-    while (ok && timeseries_fielddata_iterator_next(&fields, &header)) {
+    bool unreadable = false;
+    while (timeseries_fielddata_iterator_next(&fields, &header)) {
       if (!(header.flags & TSDB_FIELDDATA_FLAG_DELETED)) continue;
       uint32_t data_offset = offset + fields.current_record_offset + sizeof(header);
       uint64_t revision = tsdb_legacy_revision(page.sequence_num, data_offset);
       if (!(header.flags & TSDB_FIELDDATA_FLAG_REVISION)) {
         record_revision_t found = record_maximum(db, &fields, offset, &header, &revision);
-        if (found == REVISION_IO_ERROR) { ok = false; break; }
+        if (found == REVISION_IO_ERROR) { unreadable = true; break; }
         if (found == REVISION_NONE) {
           ESP_LOGW(TAG, "Ignoring implausible revision of record @0x%08" PRIx32, data_offset);
           continue;
@@ -257,12 +261,17 @@ bool tsdb_revision_recover(timeseries_db_t *db) {
       }
       if (revision > maximum) maximum = revision;
     }
-    if (ok && fields.read_error) {
+    if (!unreadable && fields.read_error) {
       if (stopped_at_malformed(db, offset, size, fields.current_record_offset))
         ESP_LOGW(TAG, "Revision scan of page @0x%08" PRIx32 " stopped at malformed record +0x%" PRIx32, offset,
                  fields.current_record_offset);
       else
-        ok = false;
+        unreadable = true;
+    }
+    if (unreadable) {
+      ESP_LOGE(TAG, "Page @0x%08" PRIx32 " could not be read during the revision scan", offset);
+      tsdb_init_fault_bad_page(db, offset, size);
+      ok = false;
     }
     timeseries_fielddata_iterator_deinit(&fields);
   }

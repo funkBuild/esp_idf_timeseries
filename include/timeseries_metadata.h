@@ -176,11 +176,15 @@ bool timeseries_metadata_create_page(timeseries_db_t *db);
 /**
  * @brief Scan all metadata entries to find the maximum measurement ID.
  *        Used during init to restore next_measurement_id across reboots.
+ *        Both measurement entries and the "<id>:..." keys of tag and field
+ *        index entries count, so an ID whose measurement entry was lost
+ *        (metadata page erased by init recovery) is never handed out again.
  *
  * @param db      Pointer to the database context
  * @param out_max Pointer to store the maximum measurement ID found (0 if none)
  * @return true if scan completed (including no metadata pages, max 0); false
- *         if the metadata pages could not be listed (e.g. OOM). On false the
+ *         if the metadata pages could not be listed or read (OOM, or a flash
+ *         read error: that page is recorded in db->init_faults). On false the
  *         maximum is unknown: timeseries_init fails rather than guess it.
  */
 bool tsdb_find_max_measurement_id(timeseries_db_t *db, uint32_t *out_max);

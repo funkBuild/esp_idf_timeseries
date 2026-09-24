@@ -186,8 +186,10 @@ bool tsdb_launch_compaction(timeseries_db_t *db) {
     return true;
 }
 
-bool timeseries_init(void) {
-  // Init and teardown share this guard, including teardown's wait interval.
+// Init and teardown share s_lifecycle_busy, including teardown's wait
+// interval. False when another lifecycle call holds it or a timed-out
+// teardown is still pending.
+static bool lifecycle_enter(void) {
   bool expected = false;
   if (!atomic_compare_exchange_strong(&s_lifecycle_busy, &expected, true)) return false;
   if (s_cleanup_pending) {
@@ -195,20 +197,28 @@ bool timeseries_init(void) {
     atomic_store(&s_lifecycle_busy, false);
     return false;
   }
+  return true;
+}
 
-  // Double-check after acquiring the guard
-  if (s_tsdb.initialized) {
-    atomic_store(&s_lifecycle_busy, false);
-    return true;
-  }
+static const esp_partition_t *find_partition(void) {
+  return esp_partition_find_first(0x40, ESP_PARTITION_SUBTYPE_ANY, "timeseries");
+}
+
+typedef enum { TSDB_INIT_OPENED, TSDB_INIT_NO_PARTITION, TSDB_INIT_FAILED } tsdb_init_outcome_t;
+
+// One init attempt; the caller holds s_lifecycle_busy. On TSDB_INIT_FAILED
+// everything the attempt set up is released and s_tsdb.init_faults says why
+// (see timeseries_repair.h).
+static tsdb_init_outcome_t init_locked(void) {
+  if (s_tsdb.initialized) return TSDB_INIT_OPENED;
+  tsdb_init_faults_reset(&s_tsdb);
 
   ESP_LOGV(TAG, "Initializing Timeseries DB...");
 
-  const esp_partition_t* part = esp_partition_find_first(0x40, ESP_PARTITION_SUBTYPE_ANY, "timeseries");
+  const esp_partition_t* part = find_partition();
   if (!part) {
     ESP_LOGE(TAG, "Failed to find 'timeseries' partition in partition table.");
-    atomic_store(&s_lifecycle_busy, false);
-    return false;
+    return TSDB_INIT_NO_PARTITION;
   }
   s_tsdb.partition = part;
 
@@ -239,10 +249,11 @@ bool timeseries_init(void) {
     goto init_fail;
   }
 
-  // Stored content must never fail startup (the caller would fall back to
-  // safe mode with no way out but a factory reset). Neutralise records torn
-  // by an interrupted write first, so the revision scan, inserts, queries and
-  // compaction all see well-formed pages; both steps fail only on OOM.
+  // Readable stored content never fails startup. Neutralise records torn by
+  // an interrupted write first, so the revision scan, inserts, queries and
+  // compaction all see well-formed pages. Repair fails only on OOM; the
+  // revision scan also fails on a page it cannot read, which it records in
+  // init_faults for timeseries_init_with_recovery to erase.
   if (!tsdb_repair_torn_records(&s_tsdb)) {
     ESP_LOGW(TAG, "Torn-record repair skipped (out of memory)");
   }
@@ -258,7 +269,8 @@ bool timeseries_init(void) {
 
   // Restore next_measurement_id from persisted metadata. No measurements is
   // true with max 0. False means the metadata pages could not be listed (OOM
-  // growing the page list, or no page-cache snapshot); the highest ID is then
+  // growing the page list, or no page-cache snapshot) or read (the page is
+  // recorded in init_faults); the highest ID is then
   // unknown, and any guessed next ID could hand new measurements IDs that
   // existing ones already use, merging their data. Fail init instead: the
   // database stays closed (inserts refused) and the caller can retry.
@@ -326,10 +338,9 @@ bool timeseries_init(void) {
 
   atomic_store(&s_tsdb.initialized, true);
   atomic_store(&s_operations, 0);
-  atomic_store(&s_lifecycle_busy, false);
 
   ESP_LOGI(TAG, "Timeseries DB initialized successfully.");
-  return true;
+  return TSDB_INIT_OPENED;
 
 init_fail:
   free(s_tsdb.l0_usage_cache);
@@ -376,8 +387,143 @@ init_fail:
     s_tsdb.snapshot_mutex = NULL;
   }
   s_tsdb.partition = NULL;
+  return TSDB_INIT_FAILED;
+}
+
+bool timeseries_init(void) {
+  if (!lifecycle_enter()) return false;
+  bool opened = init_locked() == TSDB_INIT_OPENED;
   atomic_store(&s_lifecycle_busy, false);
+  return opened;
+}
+
+// ---------------------------------------------------------------------------
+// Recovery ladder (timeseries_init_with_recovery)
+//
+// Each init attempt records why it failed (db->init_faults, see
+// timeseries_repair.h): stored content that could not be read names its page;
+// a failure that says nothing about stored content (allocation, no snapshot)
+// is transient. An attempt that failed without naming a page is transient
+// too: erasing needs positive evidence of bad content.
+//
+//   transient    -> retry a few times after a short pause; never erase.
+//   bad pages    -> erase exactly those pages and retry (a data page holds
+//                   records keyed by series ID, so no metadata points into
+//                   it; a metadata page's loss is covered by the measurement
+//                   ID floor in tsdb_find_max_measurement_id). Bounded rounds.
+//   still bad    -> a page that is bad again after its erase, a page erase
+//                   that fails, or too many rounds: erase the partition.
+//   still bad    -> give up (flash fault); the database stays closed.
+// ---------------------------------------------------------------------------
+#define TSDB_RECOVERY_TRANSIENT_DELAY_MS 100
+#define TSDB_RECOVERY_PAGE_ROUNDS 3
+
+static bool erased_before(const uint32_t *erased, size_t count, uint32_t offset) {
+  for (size_t i = 0; i < count; i++)
+    if (erased[i] == offset) return true;
   return false;
+}
+
+bool timeseries_init_with_recovery(timeseries_recovery_report_t *out) {
+  timeseries_recovery_report_t report = {.status = TIMESERIES_INIT_ERR_BUSY};
+  if (!lifecycle_enter()) {
+    if (out) *out = report;
+    return false;
+  }
+  uint32_t erased[TSDB_RECOVERY_PAGE_ROUNDS * TSDB_INIT_MAX_BAD_PAGES];
+  size_t erased_count = 0;
+  unsigned transient_retries = TIMESERIES_RECOVERY_TRANSIENT_ATTEMPTS - 1;
+  unsigned rounds = 0;
+  for (;;) {
+    report.attempts++;
+    tsdb_init_outcome_t outcome = init_locked();
+    if (outcome == TSDB_INIT_OPENED) {
+      report.status = TIMESERIES_INIT_OK;
+      break;
+    }
+    if (outcome == TSDB_INIT_NO_PARTITION) {
+      report.status = TIMESERIES_INIT_ERR_NO_PARTITION;
+      break;
+    }
+    const tsdb_init_faults_t *faults = &s_tsdb.init_faults;
+    if (faults->transient || faults->count == 0) {
+      if (!transient_retries) {
+        ESP_LOGE(TAG, "Recovery: init failed %" PRIu32 " time(s) for a transient reason (out of memory?); "
+                      "nothing erased", report.attempts);
+        report.status = TIMESERIES_INIT_ERR_TRANSIENT;
+        break;
+      }
+      transient_retries--;
+      ESP_LOGW(TAG, "Recovery: init attempt %" PRIu32 " failed for a transient reason; retrying", report.attempts);
+      vTaskDelay(pdMS_TO_TICKS(TSDB_RECOVERY_TRANSIENT_DELAY_MS));
+      continue;
+    }
+    // Stored content could not be read.
+    if (report.action == TIMESERIES_RECOVERY_PARTITION_ERASED) {
+      ESP_LOGE(TAG, "Recovery: a freshly erased partition still cannot be read (flash fault?); giving up");
+      report.status = TIMESERIES_INIT_ERR_CORRUPT;
+      break;
+    }
+    const esp_partition_t *part = find_partition();
+    if (!part) {
+      report.status = TIMESERIES_INIT_ERR_NO_PARTITION;
+      break;
+    }
+    bool full = rounds >= TSDB_RECOVERY_PAGE_ROUNDS;
+    for (size_t i = 0; !full && i < faults->count; i++)
+      full = erased_before(erased, erased_count, faults->pages[i].offset);
+    if (!full) {
+      rounds++;
+      ESP_LOGE(TAG, "Recovery round %u: erasing %u unreadable page(s)%s", rounds, (unsigned)faults->count,
+               faults->overflow ? " (more were found; a later round takes them)" : "");
+      for (size_t i = 0; !full && i < faults->count; i++) {
+        uint32_t offset = faults->pages[i].offset, size = faults->pages[i].size;
+        esp_err_t err = esp_partition_erase_range(part, offset, size);
+        if (err != ESP_OK) {
+          ESP_LOGE(TAG, "Recovery: erasing page @0x%08" PRIx32 " (+0x%" PRIx32 ") failed: %s", offset, size,
+                   esp_err_to_name(err));
+          full = true;
+          break;
+        }
+        ESP_LOGW(TAG, "Recovery: erased page @0x%08" PRIx32 " (+0x%" PRIx32 ")", offset, size);
+        erased[erased_count++] = offset;
+        report.pages_erased++;
+        report.action = TIMESERIES_RECOVERY_PAGES_ERASED;
+      }
+      if (!full) continue;
+    }
+    ESP_LOGE(TAG, "Recovery: erasing the whole partition (%" PRIu32 " page(s) erased before)", report.pages_erased);
+    esp_err_t wipe = esp_partition_erase_range(part, 0, part->size);
+    if (wipe != ESP_OK) {
+      ESP_LOGE(TAG, "Recovery: partition erase failed: %s; database stays closed", esp_err_to_name(wipe));
+      report.status = TIMESERIES_INIT_ERR_FLASH;
+      break;
+    }
+    report.action = TIMESERIES_RECOVERY_PARTITION_ERASED;
+  }
+  if (report.status == TIMESERIES_INIT_OK && report.action != TIMESERIES_RECOVERY_NONE) {
+    ESP_LOGW(TAG, "Recovery: database opened after %s (%" PRIu32 " page(s) erased)",
+             report.action == TIMESERIES_RECOVERY_PARTITION_ERASED ? "a partition erase" : "erasing pages",
+             report.pages_erased);
+  }
+  atomic_store(&s_lifecycle_busy, false);
+  if (out) *out = report;
+  return report.status == TIMESERIES_INIT_OK;
+}
+
+bool timeseries_erase_partition(void) {
+  if (!lifecycle_enter()) return false;
+  bool ok = false;
+  if (s_tsdb.initialized) {
+    ESP_LOGW(TAG, "erase_partition: the database is open; use timeseries_clear_all");
+  } else {
+    const esp_partition_t *part = find_partition();
+    esp_err_t err = part ? esp_partition_erase_range(part, 0, part->size) : ESP_ERR_NOT_FOUND;
+    ok = err == ESP_OK;
+    if (!ok) ESP_LOGE(TAG, "erase_partition failed: %s", esp_err_to_name(err));
+  }
+  atomic_store(&s_lifecycle_busy, false);
+  return ok;
 }
 
 static bool insert_ordered(const timeseries_insert_data_t *data, const tsdb_point_order_t *order);

@@ -425,3 +425,61 @@ TEST_CASE("meta scan: query fails when listing the metadata pages runs out of me
   timeseries_query_free_result(&r);
 }
 #endif
+
+#if CONFIG_IDF_TARGET_LINUX
+// Init restores next_measurement_id from the highest ID in the metadata. If
+// listing the metadata pages fails (OOM growing the list past its four inline
+// offsets), init must not guess the next ID: the boot default (1) would hand
+// new measurements IDs that existing measurements already use, merging their
+// data. Init fails instead, and the closed database refuses inserts.
+TEST_CASE("meta scan: init fails when listing the metadata pages runs out of memory",
+          "[metadata][meta_scan_reads]") {
+  setup_db();
+  timeseries_db_t* db = timeseries_get_db_handle();
+  TEST_ASSERT_NOT_NULL(db);
+  uint32_t pages[16];
+  TEST_ASSERT_TRUE(xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY) == pdTRUE);
+  bool created = true;
+  for (size_t i = metadata_pages(db, pages, 16); i < 5 && created; i++) {
+    created = timeseries_metadata_create_page(db);
+  }
+  xSemaphoreGive(db->flash_write_mutex);
+  TEST_ASSERT_TRUE(created);
+  TEST_ASSERT_GREATER_OR_EQUAL(5, metadata_pages(db, pages, 16));
+  uint32_t existing_id = 0;
+  TEST_ASSERT_TRUE(tsdb_find_measurement_id(db, MSR_NAME, &existing_id));
+
+  // Reboot: next_measurement_id starts at its boot default again.
+  timeseries_deinit();
+  db->next_measurement_id = 1;
+
+  // The page list starts with four inline offsets and doubles: 8 * 4 bytes.
+  tsdb_audit_fail_realloc(8 * sizeof(uint32_t));
+  bool ok = timeseries_init();
+  tsdb_audit_fail_realloc(0);
+  if (ok) {
+    // The bug: init succeeded with a guessed next ID; show the reuse.
+    char msg[96];
+    snprintf(msg, sizeof(msg), "init succeeded; next_measurement_id %" PRIu32 " <= existing ID %" PRIu32,
+             db->next_measurement_id, existing_id);
+    TEST_ASSERT_GREATER_THAN_UINT32_MESSAGE(existing_id, db->next_measurement_id, msg);
+  }
+  TEST_ASSERT_FALSE_MESSAGE(ok, "init succeeded with an incomplete metadata page list");
+  TEST_ASSERT_NULL(timeseries_get_db_handle());
+  const char* field = "v";
+  uint64_t ts = 1;
+  timeseries_field_value_t value = {.type = TIMESERIES_FIELD_TYPE_INT, .data.int_val = 1};
+  timeseries_insert_data_t in = {.measurement_name = "msr_after_failed_init", .field_names = &field,
+                                 .num_fields = 1, .num_points = 1, .timestamps_ms = &ts,
+                                 .field_values = &value};
+  TEST_ASSERT_FALSE_MESSAGE(timeseries_insert(&in), "insert accepted by a database whose init failed");
+
+  // The fault was one-shot: init now restores the ID past the existing one.
+  TEST_ASSERT_TRUE(timeseries_init());
+  TEST_ASSERT_GREATER_THAN_UINT32(existing_id, db->next_measurement_id);
+  TEST_ASSERT_TRUE(timeseries_insert(&in));
+  uint32_t new_id = 0;
+  TEST_ASSERT_TRUE(tsdb_find_measurement_id(db, "msr_after_failed_init", &new_id));
+  TEST_ASSERT_GREATER_THAN_UINT32(existing_id, new_id);
+}
+#endif

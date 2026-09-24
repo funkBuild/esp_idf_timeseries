@@ -179,7 +179,9 @@ bool timeseries_metadata_create_page(timeseries_db_t *db);
  *
  * @param db      Pointer to the database context
  * @param out_max Pointer to store the maximum measurement ID found (0 if none)
- * @return true if scan completed, false on error
+ * @return true if scan completed (including no metadata pages, max 0); false
+ *         if the metadata pages could not be listed (e.g. OOM). On false the
+ *         maximum is unknown: timeseries_init fails rather than guess it.
  */
 bool tsdb_find_max_measurement_id(timeseries_db_t *db, uint32_t *out_max);
 

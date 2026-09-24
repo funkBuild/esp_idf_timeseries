@@ -256,12 +256,20 @@ bool timeseries_init(void) {
   // Initialize L0 page count from loaded snapshot
   atomic_store(&s_tsdb.l0_page_count, (uint32_t)tsdb_count_l0_pages(&s_tsdb));
 
-  // Restore next_measurement_id from persisted metadata
+  // Restore next_measurement_id from persisted metadata. No measurements is
+  // true with max 0. False means the metadata pages could not be listed (OOM
+  // growing the page list, or no page-cache snapshot); the highest ID is then
+  // unknown, and any guessed next ID could hand new measurements IDs that
+  // existing ones already use, merging their data. Fail init instead: the
+  // database stays closed (inserts refused) and the caller can retry.
   uint32_t max_id = 0;
-  if (tsdb_find_max_measurement_id(&s_tsdb, &max_id)) {
-    s_tsdb.next_measurement_id = max_id + 1;
-    ESP_LOGI(TAG, "Restored next_measurement_id to %" PRIu32, s_tsdb.next_measurement_id);
+  if (!tsdb_find_max_measurement_id(&s_tsdb, &max_id)) {
+    ESP_LOGE(TAG, "Cannot determine the highest measurement ID (metadata page lookup failed); "
+                  "refusing to open the database");
+    goto init_fail;
   }
+  s_tsdb.next_measurement_id = max_id + 1;
+  ESP_LOGI(TAG, "Restored next_measurement_id to %" PRIu32, s_tsdb.next_measurement_id);
 
   // Initialize series ID cache
   if (!tsdb_cache_init(&s_tsdb)) {

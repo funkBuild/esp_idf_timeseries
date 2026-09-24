@@ -216,6 +216,18 @@ typedef struct {
 } timeseries_cached_page_t;
 
 // Forward declaration of snapshot type
+/* Stored content an init attempt could not read, for the recovery ladder
+ * (timeseries_init_with_recovery). Pages hold [offset, offset + size). */
+#define TSDB_INIT_MAX_BAD_PAGES 16
+typedef struct {
+  bool transient;  // a failure unrelated to stored content (e.g. out of memory)
+  bool overflow;   // more bad pages were seen than fit below
+  uint8_t count;
+  struct {
+    uint32_t offset, size;
+  } pages[TSDB_INIT_MAX_BAD_PAGES];
+} tsdb_init_faults_t;
+
 typedef struct tsdb_page_cache_snapshot tsdb_page_cache_snapshot_t;
 
 // Measurement ID cache entry
@@ -325,6 +337,10 @@ typedef struct {
   void (*pre_compact_hook)(void);
   void (*post_compact_hook)(void);
   void (*log_hook)(int level, const char *message);
+
+  // Why the last init attempt failed (timeseries_repair.h). Written only by
+  // the task running init, under the lifecycle guard.
+  tsdb_init_faults_t init_faults;
 } timeseries_db_t;
 
 typedef struct {

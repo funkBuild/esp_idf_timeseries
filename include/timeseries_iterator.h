@@ -19,6 +19,12 @@ typedef struct {
   timeseries_db_t* db;
   uint32_t current_offset;  // Current byte offset in the partition
   bool valid;
+  // Set when next() returned false because the header at error_offset (a
+  // sector) could not be read. The cursor is already past that sector, so
+  // calling next() again resumes the scan; a false return with read_error
+  // clear is the end of the partition.
+  bool read_error;
+  uint32_t error_offset;
 } timeseries_page_iterator_t;
 
 bool timeseries_page_iterator_init(timeseries_db_t* db, timeseries_page_iterator_t* iter);

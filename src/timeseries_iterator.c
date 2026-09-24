@@ -22,6 +22,8 @@ bool timeseries_page_iterator_init(timeseries_db_t* db, timeseries_page_iterator
   iter->db = db;
   iter->current_offset = 0;  // Start at partition start
   iter->valid = true;
+  iter->read_error = false;
+  iter->error_offset = 0;
   return true;
 }
 
@@ -30,6 +32,7 @@ bool timeseries_page_iterator_next(timeseries_page_iterator_t* iter, timeseries_
   if (!iter || !iter->valid) {
     return false;
   }
+  iter->read_error = false;
 
   while (iter->current_offset < iter->db->partition->size) {
     // Read the full page header in one call
@@ -37,7 +40,12 @@ bool timeseries_page_iterator_next(timeseries_page_iterator_t* iter, timeseries_
     esp_err_t err = esp_partition_read(iter->db->partition, iter->current_offset, &hdr, sizeof(hdr));
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed reading header @0x%08" PRIx32 " (err=0x%x)", iter->current_offset, err);
-      iter->valid = false;
+      // The extent of whatever is here is unknown. Report the sector and step
+      // past it, so the caller can resume and still find every later page
+      // (ending the scan here hid them, and the allocator reused their space).
+      iter->read_error = true;
+      iter->error_offset = iter->current_offset & ~0xFFFu;
+      iter->current_offset = iter->error_offset + 4096;
       return false;
     }
 

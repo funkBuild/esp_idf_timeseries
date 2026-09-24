@@ -2,6 +2,7 @@
 #include "timeseries_iterator.h"
 #include "timeseries_page_cache_snapshot.h"
 #include "timeseries_epoch.h"
+#include "timeseries_repair.h"
 
 #include "esp_log.h"
 #include <string.h>
@@ -64,6 +65,7 @@ bool tsdb_build_page_cache(timeseries_db_t *db) {
   // Create a new snapshot to build into
   tsdb_page_cache_snapshot_t *snap = tsdb_snapshot_create(16);
   if (!snap) {
+    tsdb_init_fault_transient(db);
     return false;
   }
 
@@ -74,14 +76,31 @@ bool tsdb_build_page_cache(timeseries_db_t *db) {
     return false;
   }
 
+  // A header that cannot be read is recorded for init's recovery and the
+  // scan resumes after it: a cache missing the pages behind it would let the
+  // allocator erase them. The build then fails rather than publish a cache
+  // with a hole in it.
   timeseries_page_header_t hdr;
   uint32_t offset = 0, size = 0;
-  while (timeseries_page_iterator_next(&flash_iter, &hdr, &offset, &size)) {
+  size_t unreadable = 0;
+  for (;;) {
+    if (!timeseries_page_iterator_next(&flash_iter, &hdr, &offset, &size)) {
+      if (!flash_iter.read_error) break;
+      tsdb_init_fault_bad_page(db, flash_iter.error_offset, 4096);
+      unreadable++;
+      continue;
+    }
     if (!tsdb_pagecache_batch_add(snap, offset, &hdr)) {
       ESP_LOGE(TAG, "OOM building page cache at offset 0x%08" PRIx32, offset);
+      tsdb_init_fault_transient(db);
       tsdb_snapshot_release(snap);
       return false;
     }
+  }
+  if (unreadable) {
+    ESP_LOGE(TAG, "%zu page header(s) could not be read; page cache not built", unreadable);
+    tsdb_snapshot_release(snap);
+    return false;
   }
 
   // Sort the entries by ascending offset

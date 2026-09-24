@@ -25,10 +25,12 @@ static uint8_t flash[PART_SIZE];
 static esp_partition_t part = { .address = 0x100000, .size = PART_SIZE, .label = "tsdb" };
 static long read_budget;
 static jmp_buf hang_escape;
+static long fail_read_at = -1;  // reads covering this byte fail (flash read error)
 
 esp_err_t esp_partition_read(const esp_partition_t* p, size_t off, void* dst, size_t len) {
     (void)p;
     if (--read_budget < 0) longjmp(hang_escape, 1);  // scan did not terminate
+    if (fail_read_at >= 0 && (size_t)fail_read_at >= off && (size_t)fail_read_at - off < len) return ESP_FAIL;
     if (off > PART_SIZE || len > PART_SIZE - off) return ESP_ERR_INVALID_SIZE;
     memcpy(dst, flash + off, len);
     return ESP_OK;
@@ -68,6 +70,7 @@ static timeseries_db_t db;
 static int overlaps(uint32_t lo, uint32_t hi, uint32_t a, uint32_t b) { return lo < b && a < hi; }
 
 static void fresh(void) {
+    fail_read_at = -1;
     memset(flash, 0xFF, sizeof flash);
     if (db.current_snapshot) tsdb_snapshot_release(db.current_snapshot);
     memset(&db, 0, sizeof db);
@@ -210,12 +213,48 @@ static void test_TS_6_unaligned_page_size(void) {
               (unsigned)s->entries[i].offset);
 }
 
+// Recovery: a page header that cannot be READ (flash read error) ended the
+// scan: every later page was left out of the page cache, init still
+// succeeded, and the allocator then handed those pages' regions out (erasing
+// them). The scan must report the unreadable sector and keep going, and the
+// cache build must fail so init can recover instead of losing the pages.
+static void test_unreadable_header_reported_scan_resumes(void) {
+    fresh();
+    put_page(0x0000, TIMESERIES_PAGE_TYPE_METADATA,   TIMESERIES_PAGE_STATE_ACTIVE, 1, 0x2000);
+    put_page(0x2000, TIMESERIES_PAGE_TYPE_FIELD_DATA, TIMESERIES_PAGE_STATE_ACTIVE, 2, 0x2000);
+    put_page(0x4000, TIMESERIES_PAGE_TYPE_FIELD_DATA, TIMESERIES_PAGE_STATE_ACTIVE, 3, 0x2000);  // unreadable
+    put_page(0x6000, TIMESERIES_PAGE_TYPE_FIELD_DATA, TIMESERIES_PAGE_STATE_ACTIVE, 4, 0x2000);
+    fail_read_at = 0x4000;
+    read_budget = 100000;
+    if (setjmp(hang_escape)) { CHECK(0, "scan did not terminate"); return; }
+
+    timeseries_page_iterator_t it;
+    CHECK(timeseries_page_iterator_init(&db, &it), "iterator init");
+    timeseries_page_header_t h;
+    uint32_t off, size, seen[8];
+    size_t n = 0, errors = 0;
+    for (int guard = 0; guard < 64; guard++) {
+        if (timeseries_page_iterator_next(&it, &h, &off, &size)) { if (n < 8) seen[n++] = off; continue; }
+        if (!it.read_error) break;
+        errors++;
+        CHECK(it.error_offset == 0x4000, "read error reported @0x%05x, expected 0x04000", (unsigned)it.error_offset);
+    }
+    CHECK(errors == 1, "expected one unreadable sector, got %zu", errors);
+    CHECK(n == 3 && seen[2] == 0x6000, "page @0x6000 after the unreadable header was not found (%zu pages)", n);
+
+    CHECK(!tsdb_build_page_cache(&db), "page cache built over an unreadable page header");
+    CHECK(db.init_faults.count == 1 && db.init_faults.pages[0].offset == 0x4000 &&
+          db.init_faults.pages[0].size == 0x1000 && !db.init_faults.transient,
+          "unreadable sector not recorded for recovery (count=%u)", (unsigned)db.init_faults.count);
+}
+
 int main(void) {
     test_LIBS_2_torn_page_size_wraps_scan();
     test_LIBS_2_torn_page_size_infinite_scan();
     test_LIBS_2_entity_iterator_bound();
     test_LIBS_2_torn_header_pages_after_kept();
     test_TS_6_unaligned_page_size();
+    test_unreadable_header_reported_scan_resumes();
     printf("%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? 1 : 0;
 }

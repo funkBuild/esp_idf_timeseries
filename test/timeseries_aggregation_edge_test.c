@@ -326,3 +326,30 @@ TEST_CASE("aggregation: raw query returns all points across L0+L1",
 
   ESP_LOGI(TAG, "Raw query across L0+L1: all 5 points returned in order");
 }
+
+// ============================================================================
+// Rollup windows are shared by all fields
+// ============================================================================
+// Each field's windows started at that field's own first sample and rows were
+// merged by exact window start: fields sampled a few ms apart produced twice
+// the rows, each holding one field and a FLOAT 0.0 placeholder for the other
+// (indistinguishable from a real zero).
+TEST_CASE("aggregation: fields sampled at offsets share rollup windows",
+          "[aggregation][rollup]") {
+  ensure_init();
+  TEST_ASSERT_TRUE(timeseries_clear_all());
+  uint64_t ta[9], tb[9];
+  double va[9], vb[9];
+  for (int i = 0; i < 9; i++) {
+    ta[i] = 1000 + 1000 * (uint64_t)i;   /* a at 1000, 2000, ... 9000 */
+    tb[i] = 1005 + 1000 * (uint64_t)i;   /* b 5 ms later */
+    va[i] = i;
+    vb[i] = 100 + i;
+  }
+  TEST_ASSERT_TRUE(insert_float_vals("offs", "a", va, ta, 9));
+  TEST_ASSERT_TRUE(insert_float_vals("offs", "b", vb, tb, 9));
+  timeseries_query_result_t r;
+  TEST_ASSERT_TRUE(query_agg("offs", TSDB_AGGREGATION_AVG, 1000, &r));
+  TEST_ASSERT_EQUAL_MESSAGE(9, r.num_points, "one row per window across both fields");
+  timeseries_query_free_result(&r);
+}

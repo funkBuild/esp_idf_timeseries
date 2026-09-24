@@ -21,6 +21,8 @@
 #include "timeseries_page_cache.h"
 #include "unity.h"
 #include <inttypes.h>
+#include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "ExpirationTest";
@@ -965,6 +967,142 @@ TEST_CASE("expiration: consecutive runs handle remaining data correctly",
   ESP_LOGI(TAG, "Records after third run: %zu", records_after_third);
 
   ESP_LOGI(TAG, "Consecutive runs test passed");
+}
+
+// -----------------------------------------------------------------------------
+// Horizon robustness to outlier timestamps
+// -----------------------------------------------------------------------------
+
+#define OUTLIER_A_POINTS 2000
+#define OUTLIER_A_BATCH 50
+#define OUTLIER_A_BASE 1700000000000ULL
+
+static bool insert_int_points(const char *measurement, const uint64_t *timestamps, size_t n) {
+  timeseries_field_value_t *values = calloc(n, sizeof(*values));
+  if (!values) return false;
+  for (size_t i = 0; i < n; i++) {
+    values[i].type = TIMESERIES_FIELD_TYPE_INT;
+    values[i].data.int_val = (int64_t)i;
+  }
+  const char *field = "v";
+  timeseries_insert_data_t in = {.measurement_name = measurement, .field_names = &field, .field_values = values,
+                                 .num_fields = 1, .timestamps_ms = timestamps, .num_points = n};
+  bool ok = timeseries_insert(&in);
+  free(values);
+  return ok;
+}
+
+static size_t count_points(const char *measurement) {
+  timeseries_query_t q = {.measurement_name = measurement};
+  timeseries_query_result_t r = {0};
+  if (!timeseries_query(&q, &r)) return SIZE_MAX;
+  size_t n = r.num_points;
+  timeseries_query_free_result(&r);
+  return n;
+}
+
+// Bytes of every live field-data record.
+static uint64_t live_record_bytes(timeseries_db_t *db) {
+  uint64_t bytes = 0;
+  timeseries_page_cache_iterator_t page_iter;
+  if (!timeseries_page_cache_iterator_init(db, &page_iter)) return 0;
+  timeseries_page_header_t hdr;
+  uint32_t page_offset = 0, page_size = 0;
+  while (timeseries_page_cache_iterator_next(&page_iter, &hdr, &page_offset, &page_size)) {
+    if (hdr.magic_number != TIMESERIES_MAGIC_NUM || hdr.page_type != TIMESERIES_PAGE_TYPE_FIELD_DATA ||
+        hdr.page_state != TIMESERIES_PAGE_STATE_ACTIVE)
+      continue;
+    timeseries_fielddata_iterator_t f_iter;
+    if (!timeseries_fielddata_iterator_init(db, page_offset, page_size, &f_iter)) continue;
+    timeseries_field_data_header_t fd;
+    while (timeseries_fielddata_iterator_next(&f_iter, &fd))
+      if (fd.flags & TSDB_FIELDDATA_FLAG_DELETED) bytes += sizeof(fd) + fd.record_length;
+    timeseries_fielddata_iterator_deinit(&f_iter);
+  }
+  timeseries_page_cache_iterator_deinit(&page_iter);
+  return bytes;
+}
+
+// Series A: 2000 points one minute apart, in 40 records. `outliers` adds
+// single-point series (or, with `same_record`, one two-point record) at
+// extreme timestamps. The run is asked for 20% of A's bytes; one horizon
+// chosen from uniform time steps over [min, max] lands past every A point
+// (or at 0 when max_end + 1 wraps), so A is wiped out or nothing is freed.
+static void run_outlier_case(const uint64_t *outliers, size_t num_outliers, bool same_record, size_t *a_before,
+                             size_t *a_after) {
+  TEST_ASSERT_TRUE(timeseries_init());
+  timeseries_db_t *db = timeseries_get_db_handle();
+  TEST_ASSERT_NOT_NULL(db);
+  TEST_ASSERT_TRUE(timeseries_clear_all());
+  TEST_ASSERT_TRUE(timeseries_compact_sync());  // no compaction left running
+  // Keep A in its 40 L0 records: no background compaction while inserting.
+  atomic_store(&db->compaction_in_progress, true);
+  uint64_t ts[OUTLIER_A_BATCH];
+  bool ok = true;
+  for (size_t b = 0; ok && b < OUTLIER_A_POINTS / OUTLIER_A_BATCH; b++) {
+    for (size_t i = 0; i < OUTLIER_A_BATCH; i++) ts[i] = OUTLIER_A_BASE + (b * OUTLIER_A_BATCH + i) * 60000ULL;
+    ok = insert_int_points("outlier_a", ts, OUTLIER_A_BATCH);
+  }
+  uint64_t a_bytes = live_record_bytes(db);
+  if (same_record) {
+    ok = ok && insert_int_points("outlier_b", outliers, num_outliers);
+  } else {
+    for (size_t i = 0; ok && i < num_outliers; i++) {
+      char name[24];
+      snprintf(name, sizeof(name), "outlier_b%zu", i);
+      ok = insert_int_points(name, &outliers[i], 1);
+    }
+  }
+  atomic_store(&db->compaction_in_progress, false);
+  TEST_ASSERT_TRUE(ok);
+  *a_before = count_points("outlier_a");
+  float reduction = (float)(a_bytes / 5) / (float)GET_PARTITION_SIZE(db);
+  bool ran = timeseries_expiration_run(db, 0.0001f, reduction);
+  *a_after = count_points("outlier_a");
+  ESP_LOGI(TAG, "outlier case: A bytes %" PRIu64 ", A points %zu -> %zu", a_bytes, *a_before, *a_after);
+  TEST_ASSERT_TRUE(ran);
+}
+
+static void assert_a_trimmed_about_target(size_t before, size_t after) {
+  TEST_ASSERT_EQUAL(OUTLIER_A_POINTS, before);
+  // About 20% goes: at least one record, and never much more than the target
+  // (target + one record granule + the conservative trim charge).
+  TEST_ASSERT_LESS_THAN(OUTLIER_A_POINTS, after);
+  TEST_ASSERT_GREATER_OR_EQUAL(OUTLIER_A_POINTS * 7 / 10, after);
+  TEST_ASSERT_LESS_OR_EQUAL(OUTLIER_A_POINTS * 17 / 20, after);
+}
+
+TEST_CASE("expiration: an outlier at 2^62 does not expire nearly everything", "[expiration][outlier]") {
+  uint64_t outlier = 1ULL << 62;
+  size_t before, after;
+  run_outlier_case(&outlier, 1, false, &before, &after);
+  assert_a_trimmed_about_target(before, after);
+  TEST_ASSERT_EQUAL(1, count_points("outlier_b0"));
+}
+
+TEST_CASE("expiration: an outlier at UINT64_MAX does not expire nearly everything", "[expiration][outlier]") {
+  uint64_t outlier = UINT64_MAX;
+  size_t before, after;
+  run_outlier_case(&outlier, 1, false, &before, &after);
+  assert_a_trimmed_about_target(before, after);
+  TEST_ASSERT_EQUAL(1, count_points("outlier_b0"));
+}
+
+TEST_CASE("expiration: points at 0 and UINT64_MAX still let space be freed", "[expiration][outlier]") {
+  uint64_t outliers[2] = {0, UINT64_MAX};
+  size_t before, after;
+  run_outlier_case(outliers, 2, false, &before, &after);
+  assert_a_trimmed_about_target(before, after);
+  TEST_ASSERT_EQUAL(0, count_points("outlier_b0"));  // older than every horizon that frees anything
+  TEST_ASSERT_EQUAL(1, count_points("outlier_b1"));
+}
+
+TEST_CASE("expiration: a record spanning 0..UINT64_MAX is trimmed, not fatal", "[expiration][outlier]") {
+  uint64_t outliers[2] = {0, UINT64_MAX};
+  size_t before, after;
+  run_outlier_case(outliers, 2, true, &before, &after);
+  assert_a_trimmed_about_target(before, after);
+  TEST_ASSERT_EQUAL(1, count_points("outlier_b"));  // the point at 0 is trimmed away
 }
 
 TEST_CASE("expiration: final cleanup", "[expiration]") {

@@ -619,7 +619,7 @@ static bool find_level0_page_with_space(timeseries_db_t *db,
         }
       }
 
-      uint32_t free_space = page_size - last_offset;
+      uint32_t free_space = page_size > last_offset ? page_size - last_offset : 0;
       if (free_space >= bytes_needed) {
         // Found a suitable page
         *out_page_offset = page_offset;
@@ -724,6 +724,53 @@ static bool create_level0_field_page(timeseries_db_t *db,
   return true;
 }
 
+// Set the append position of an L0 page in both caches.
+static void set_l0_used(timeseries_db_t *db, uint32_t page_offset, uint32_t used) {
+  size_t slot = l0_usage_slot(page_offset);
+  if (db->l0_usage_cache && db->l0_usage_cache[slot].offset == page_offset) db->l0_usage_cache[slot].used = used;
+  if (db->last_l0_cache_valid && db->last_l0_page_offset == page_offset) db->last_l0_used_offset = used;
+}
+
+/* An append failed. The flash driver programs a record in ascending chunks,
+ * so a prefix of it may be on flash; programming the next record over it
+ * would AND the two into a corrupt one. Unless nothing was programmed, the
+ * region is sealed as a deleted record of its intended length (programming
+ * only clears bits: this completes a torn header, or just clears the DELETED
+ * bit of a whole one) and appends continue after it. If that cannot be
+ * verified, the page takes no more appends; startup repair (tsdb_repair_torn_records)
+ * neutralises its tail. Caller holds flash_write_mutex. */
+static void seal_failed_append(timeseries_db_t *db, uint32_t page_offset, uint32_t used_offset,
+                               const timeseries_field_data_header_t *intended, size_t total_write) {
+  uint32_t addr = page_offset + used_offset;
+  uint8_t chunk[64];
+  bool blank = true, read_ok = true;
+  for (size_t done = 0; blank && read_ok && done < total_write; done += sizeof(chunk)) {
+    size_t n = total_write - done < sizeof(chunk) ? total_write - done : sizeof(chunk);
+    read_ok = esp_partition_read(db->partition, addr + done, chunk, n) == ESP_OK;
+    for (size_t i = 0; read_ok && i < n; i++)
+      if (chunk[i] != 0xFF) {
+        blank = false;
+        break;
+      }
+  }
+  if (read_ok && blank) return;  // nothing programmed: the space is still usable
+
+  timeseries_field_data_header_t seal = *intended, now;
+  seal.flags &= (uint8_t)~TSDB_FIELDDATA_FLAG_DELETED;
+  bool sealed = esp_partition_write(db->partition, addr, &seal, sizeof(seal)) == ESP_OK &&
+                esp_partition_read(db->partition, addr, &now, sizeof(now)) == ESP_OK &&
+                now.record_length == intended->record_length && !(now.flags & TSDB_FIELDDATA_FLAG_DELETED);
+  if (sealed) {
+    ESP_LOGW(TAG, "Failed append @0x%08" PRIx32 " sealed as a deleted record (%zu bytes)", addr, total_write);
+    set_l0_used(db, page_offset, used_offset + (uint32_t)total_write);
+  } else {
+    ESP_LOGE(TAG, "Failed append @0x%08" PRIx32 " could not be sealed; page @0x%08" PRIx32 " takes no more appends",
+             addr, page_offset);
+    set_l0_used(db, page_offset, TIMESERIES_FIELD_DATA_PAGE_SIZE);
+    if (db->last_l0_cache_valid && db->last_l0_page_offset == page_offset) db->last_l0_cache_valid = false;
+  }
+}
+
 /**
  * @brief Write one multi-point field data entry using
  * timeseries_field_data_header_t, storing how many bytes follow in
@@ -823,6 +870,7 @@ static bool write_points_to_page(timeseries_db_t *db, uint32_t page_offset,
   }
 
   if (err != ESP_OK) {
+    seal_failed_append(db, page_offset, used_offset, &fhdr, total_write);
     return false;
   }
 

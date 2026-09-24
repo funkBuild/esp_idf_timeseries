@@ -17,13 +17,18 @@ extern timeseries_db_t *timeseries_get_db_handle(void);
 static TaskHandle_t write_owner;
 static uint32_t fail_write_offset;
 static bool write_failed;
+static size_t fail_write_prefix;
 static TaskHandle_t copy_measure_owner;
 static size_t copy_write_calls;
 esp_err_t __real_esp_partition_write(const esp_partition_t *,size_t,const void *,size_t);
 esp_err_t __wrap_esp_partition_write(const esp_partition_t *p,size_t offset,const void *data,size_t length) {
   if(copy_measure_owner==xTaskGetCurrentTaskHandle()) copy_write_calls++;
   if(write_owner==xTaskGetCurrentTaskHandle() && offset==fail_write_offset) {
-    write_failed=true; write_owner=NULL; return ESP_FAIL;
+    write_failed=true; write_owner=NULL;
+    // A program error part-way through: the first fail_write_prefix bytes
+    // reached flash (the driver programs in ascending chunks), the rest not.
+    if(fail_write_prefix && fail_write_prefix<length) __real_esp_partition_write(p,offset,data,fail_write_prefix);
+    return ESP_FAIL;
   }
   return __real_esp_partition_write(p,offset,data,length);
 }
@@ -281,4 +286,58 @@ TEST_CASE("eleventh: large page rewrite reuses the locked insert buffer", "[elev
 #if CONFIG_IDF_TARGET_LINUX
   TEST_ASSERT_LESS_OR_EQUAL(4096,largest);
 #endif
+}
+
+// A failed L0 append must not leave its torn prefix where the next insert
+// programs: flash ANDs the two writes into a corrupt record. The failed
+// record is neutralised (a deleted record of its length) or its page retired
+// from appends, and the next insert lands after it.
+static void failed_append_not_overwritten(size_t prefix) {
+  uint32_t page; timeseries_field_data_header_t h; timeseries_db_t *db=prepare(10,500,&page,&h);
+  TEST_ASSERT_TRUE(db->last_l0_cache_valid);
+  write_failed=false; fail_write_offset=db->last_l0_page_offset+db->last_l0_used_offset; fail_write_prefix=prefix;
+  write_owner=xTaskGetCurrentTaskHandle();
+  bool first=insert(10,11);
+  write_owner=NULL; fail_write_prefix=0;
+  bool injected=write_failed;
+  bool second=insert(10,21);
+  timeseries_query_t q={.measurement_name="eleventh"}; timeseries_query_result_t r={0};
+  bool queried=timeseries_query(&q,&r);
+  size_t points=r.num_points; bool exact=queried && points==20;
+  for(size_t i=0; exact && i<20; i++) {
+    uint64_t want=i<10 ? i+1 : i+11;
+    exact=r.timestamps[i]==want && r.columns[0].values[i].type==TIMESERIES_FIELD_TYPE_INT &&
+          r.columns[0].values[i].data.int_val==(int64_t)want;
+  }
+  timeseries_query_free_result(&r);
+  // A bounded query relies on the record's header times for pruning.
+  timeseries_query_t qb={.measurement_name="eleventh",.start_ms=21,.end_ms=30}; timeseries_query_result_t rb={0};
+  bool bounded=timeseries_query(&qb,&rb); size_t bounded_points=rb.num_points;
+  timeseries_query_free_result(&rb);
+  // Every record on the page parses, and exactly the two good ones are live.
+  timeseries_fielddata_iterator_t it; size_t live=0; bool parsed=false;
+  if(timeseries_fielddata_iterator_init(db,page,TIMESERIES_FIELD_DATA_PAGE_SIZE,&it)) {
+    timeseries_field_data_header_t rec;
+    while(timeseries_fielddata_iterator_next(&it,&rec)) if(rec.flags&TSDB_FIELDDATA_FLAG_DELETED) live++;
+    parsed=!it.read_error; timeseries_fielddata_iterator_deinit(&it);
+  }
+  cleanup(db);
+  printf("ELEVENTH_TORN_APPEND prefix=%zu injected=%d first=%d second=%d points=%zu live=%zu parsed=%d bounded=%zu\n",
+         prefix,injected,first,second,points,live,parsed,bounded_points);
+  TEST_ASSERT_TRUE(injected); TEST_ASSERT_FALSE(first); TEST_ASSERT_TRUE(second);
+  TEST_ASSERT_TRUE(queried); TEST_ASSERT_EQUAL(20,points); TEST_ASSERT_TRUE(exact);
+  TEST_ASSERT_TRUE(parsed); TEST_ASSERT_EQUAL(2,live);
+  TEST_ASSERT_TRUE(bounded); TEST_ASSERT_EQUAL(10,bounded_points);
+}
+
+TEST_CASE("eleventh: an L0 append torn inside its header is not overwritten", "[eleventh][torn_append]") {
+  failed_append_not_overwritten(16);
+}
+
+TEST_CASE("eleventh: an L0 append torn inside its body is not overwritten", "[eleventh][torn_append]") {
+  failed_append_not_overwritten(96);
+}
+
+TEST_CASE("eleventh: an L0 append that programmed nothing reuses its space", "[eleventh][torn_append]") {
+  failed_append_not_overwritten(0);
 }

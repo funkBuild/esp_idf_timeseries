@@ -33,6 +33,8 @@ cleanup() {
     kill -9 "$QEMU_PID" 2>/dev/null || true
     wait "$QEMU_PID" 2>/dev/null || true
   fi
+  # Keep the console for post-mortem (a panic exits QEMU under -no-reboot).
+  [ -n "$OUTPUT_FILE" ] && [ -d build ] && cp "$OUTPUT_FILE" build/qemu_output.log 2>/dev/null
   [ -n "$OUTPUT_FILE" ] && rm -f "$OUTPUT_FILE"
 }
 trap cleanup EXIT
@@ -64,9 +66,8 @@ python3 -m esptool --chip esp32s3 merge_bin \
   0x8000  build/partition_table/partition-table.bin \
   0x10000 build/unit_test_test.bin
 
-if [ ! -f build/qemu_efuse.bin ]; then
-  dd if=/dev/zero of=build/qemu_efuse.bin bs=1K count=4 2>/dev/null
-fi
+# IDF's default S3 eFuses (chip rev 0.3); a zero image reads as rev 0.0.
+python3 "$SCRIPT_DIR/../../../tools/qemu/make_efuse.py" build/qemu_efuse.bin
 
 # --- Find QEMU ---
 find_qemu() {
@@ -98,7 +99,7 @@ $QEMU_BIN \
   -m 8M \
   -drive file=build/qemu_flash.bin,if=mtd,format=raw \
   -drive file=build/qemu_efuse.bin,if=none,format=raw,id=efuse \
-  -global driver=esp32s3.efuse,property=drive,value=efuse \
+  -global driver=nvram.esp32s3.efuse,property=drive,value=efuse \
   -serial mon:stdio \
   -nographic \
   -no-reboot \

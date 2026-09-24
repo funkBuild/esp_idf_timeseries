@@ -71,16 +71,19 @@ static void insert_measurement(const char *measurement, const char **tag_keys,
 // timeseries_get_measurements
 // ============================================================================
 
-TEST_CASE("api: get_measurements on empty db returns false",
+TEST_CASE("api: get_measurements on empty db returns an empty list",
           "[api][measurements]") {
   clear_db();
 
+  // Empty is a normal answer, not a failure: the HTTP API maps false to a 400
+  // (it broke the web UI's timeseries page on a fresh device) and Lua's
+  // getMeasurements to "backend error".
   char **measurements = NULL;
   size_t count = 0;
   bool ok = timeseries_get_measurements(&measurements, &count);
-  TEST_ASSERT_FALSE(ok);
+  TEST_ASSERT_TRUE(ok);
   TEST_ASSERT_EQUAL(0, count);
-  TEST_ASSERT_NULL(measurements);
+  free(measurements);
 }
 
 TEST_CASE("api: get_measurements returns single measurement",
@@ -625,4 +628,35 @@ TEST_CASE("api: query on empty db returns empty result cleanly",
   TEST_ASSERT_NULL(result.timestamps);
   TEST_ASSERT_NULL(result.columns);
   timeseries_query_free_result(&result);
+}
+
+
+/* Series ids are built from "measurement:tagkey:tagvalue:...:field", so a ':'
+ * in the measurement name made two different measurements share a series and
+ * merge their data. Measurement names with ':' are rejected. */
+TEST_CASE("insert rejects ':' in the measurement name", "[esp_idf_timeseries][api][colon]") {
+  clear_db();
+  const char *tk[] = {"b"};
+  const char *tv[] = {"c"};
+  const char *fields[] = {"v"};
+  uint64_t ts[] = {1000};
+  timeseries_field_value_t val = {.type = TIMESERIES_FIELD_TYPE_FLOAT, .data.float_val = 1.0};
+  timeseries_insert_data_t colon = {
+      .measurement_name = "a:b", .tag_keys = NULL, .tag_values = NULL, .num_tags = 0,
+      .field_names = fields, .field_values = &val, .num_fields = 1,
+      .timestamps_ms = ts, .num_points = 1};
+  TEST_ASSERT_FALSE(timeseries_insert(&colon));
+  /* The would-be collision partner still inserts normally. */
+  timeseries_insert_data_t plain = {
+      .measurement_name = "a", .tag_keys = tk, .tag_values = tv, .num_tags = 1,
+      .field_names = fields, .field_values = &val, .num_fields = 1,
+      .timestamps_ms = ts, .num_points = 1};
+  TEST_ASSERT_TRUE(timeseries_insert(&plain));
+  char **names = NULL;
+  size_t n = 0;
+  TEST_ASSERT_TRUE(timeseries_get_measurements(&names, &n));
+  TEST_ASSERT_EQUAL(1, n);
+  TEST_ASSERT_EQUAL_STRING("a", names[0]);
+  for (size_t i = 0; i < n; i++) free(names[i]);
+  free(names);
 }

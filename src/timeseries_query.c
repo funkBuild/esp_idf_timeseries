@@ -1357,6 +1357,10 @@ static size_t fetch_series_data(timeseries_db_t *db, field_info_t *fields_array,
         complete = false;
         ESP_LOGW(TAG, "Failed multi-series aggregator for '%s'", fld->field_name);
       } else {
+        /* One window grid for every field (the query start, else the epoch):
+         * windows starting at each field's own first sample never lined up,
+         * so fields sampled a few ms apart landed in separate rows. */
+        timeseries_multi_series_iterator_align(&ms_iter, query->start_ms > 0 ? (uint64_t)query->start_ms : 0);
         prof_temp = esp_timer_get_time();
         size_t agg_hint = 0;
         while (true) {

@@ -209,6 +209,8 @@ bool timeseries_init(void);
 /**
  * @brief Insert multiple data points for multiple fields in one call.
  *        Each field is stored in a single entry (multi (ts,value) array).
+ *        The measurement name must not contain ':' (series ids join
+ *        measurement, tags and field with ':'); such an insert returns false.
  */
 bool timeseries_insert(const timeseries_insert_data_t* data);
 

@@ -51,6 +51,14 @@ typedef struct {
  * @param[out] out_iter   The resulting multi-series iterator
  * @return true if OK
  */
+/**
+ * @brief Align rollup windows to origin + k * rollup_interval (k >= 0) instead
+ * of the iterator's first sample. Every field of one query must use the same
+ * origin, or their windows differ and rows cannot be merged. Call right after
+ * init; a no-op for pass-through (rollup_interval 0) or empty iterators.
+ */
+void timeseries_multi_series_iterator_align(timeseries_multi_series_iterator_t *iter, uint64_t origin);
+
 bool timeseries_multi_series_iterator_init(
     timeseries_multi_points_iterator_t **sub_iters, size_t sub_count,
     uint64_t rollup_interval, timeseries_aggregation_method_e method,
@@ -58,7 +66,8 @@ bool timeseries_multi_series_iterator_init(
 
 /**
  * @brief Advance to the next occupied rollup window, skipping empty intervals.
- *        Windows are anchored at the earliest input timestamp. A point belongs
+ *        Windows are anchored at the earliest input timestamp (or at the grid
+ *        set by timeseries_multi_series_iterator_align). A point belongs
  *        when timestamp >= start and timestamp - start < rollup_interval,
  *        including UINT64_MAX when the final window extends past it.
  *        LAST selects the greatest timestamp; later sub-iterators win ties.

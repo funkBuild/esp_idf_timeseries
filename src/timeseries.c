@@ -384,6 +384,12 @@ bool timeseries_insert(const timeseries_insert_data_t* data) {
     ESP_LOGE(TAG, "timeseries_insert: required field is NULL.");
     return false;
   }
+  // Series ids are "measurement:tagkey:tagvalue:...:field"; a ':' in the
+  // measurement name would let two different measurements share a series.
+  if (strchr(data->measurement_name, ':') != NULL) {
+    ESP_LOGE(TAG, "timeseries_insert: measurement name '%s' contains ':'", data->measurement_name);
+    return false;
+  }
   if (data->num_points == 0) {
     ESP_LOGW(TAG, "No data points provided, nothing to store.");
     return true;

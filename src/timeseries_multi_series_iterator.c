@@ -383,6 +383,15 @@ bool timeseries_multi_series_iterator_init(
   return true;
 }
 
+void timeseries_multi_series_iterator_align(timeseries_multi_series_iterator_t *iter, uint64_t origin) {
+  if (!iter || !iter->valid || iter->rollup_interval == 0) return;
+  const uint64_t first = iter->current_window_start;
+  if (first < origin) return;  /* range-trimmed sub-iterators never start before it */
+  const uint64_t start = origin + ((first - origin) / iter->rollup_interval) * iter->rollup_interval;
+  iter->current_window_start = start;
+  iter->current_window_end = iter->rollup_interval > UINT64_MAX - start ? UINT64_MAX : start + iter->rollup_interval;
+}
+
 /*-------------------------------------------------------------------------------------
  *  NEXT
  *-------------------------------------------------------------------------------------*/

@@ -37,12 +37,26 @@ typedef struct {
   uint32_t current_entry_offset;
   bool valid;
   bool read_error;         /* iteration stopped on a flash read error */
-  const uint8_t* page_ptr; /* mmap’d view, NULL if mmap failed   */
+  const uint8_t* page_ptr; /* in-RAM view of the page, NULL = read flash per entry */
   esp_partition_mmap_handle_t mmap_hdl;
+  bool owns_page_buf;      /* page_ptr is a heap buffer from _buffer(), freed by deinit */
+  uint32_t buf_end;        /* page_ptr holds page bytes [header, buf_end) */
 } timeseries_entity_iterator_t;
 
 bool timeseries_entity_iterator_init(timeseries_db_t* db, uint32_t page_offset, uint32_t page_size,
                                      timeseries_entity_iterator_t* ent_iter);
+
+/**
+ * Serve next() and read_data() from a heap copy of the page instead of 1-3
+ * flash reads per entry. The copy is filled on demand in doubling blocks
+ * (64 B, 128 B, ... up to the page size), so a scan costs about log2(used/64)+1
+ * flash reads and reads at most about twice the bytes the entries occupy.
+ * Bytes are read from flash when first needed, not updated afterwards: use it
+ * only for read-only scans, never when the caller writes to this page while
+ * iterating. Returns false (the iterator keeps reading flash per entry) if the
+ * buffer cannot be allocated. deinit() frees the buffer.
+ */
+bool timeseries_entity_iterator_buffer(timeseries_entity_iterator_t* ent_iter);
 
 void timeseries_entity_iterator_deinit(timeseries_entity_iterator_t* ent_iter);
 

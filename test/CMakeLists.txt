@@ -21,4 +21,8 @@ if(IDF_TARGET STREQUAL "linux")
         # Linux-simulator lock guards (timeseries_host_sim_guards.c)
         "-Wl,--wrap=free" "-Wl,--wrap=pthread_join"
         "-Wl,--wrap=esp_log_impl_lock" "-Wl,--wrap=esp_log_impl_lock_timeout" "-Wl,--wrap=esp_log_impl_unlock")
+else()
+    # Flash-read counter for metadata scan tests (timeseries_meta_scan_reads_test.c);
+    # the Linux build wraps it in timeseries_audit_alloc.c.
+    target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_partition_read")
 endif()

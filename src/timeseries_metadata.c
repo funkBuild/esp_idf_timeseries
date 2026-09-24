@@ -44,6 +44,18 @@ static inline bool tsdb_measurement_id_plausible(uint32_t id) { return id < TSDB
 static bool tsdb_create_empty_metadata_page(timeseries_db_t* db, uint32_t page_offset);
 static uint32_t tsdb_compact_metadata_page(timeseries_db_t* db, uint32_t page_offset, uint32_t *out_new_offset);
 
+/* Open a page for a READ-ONLY scan: the page is copied to RAM with one flash
+ * read and entries are served from the copy (one read per page instead of one
+ * to three per entry). Falls back to per-entry flash reads if the copy cannot
+ * be made. Callers that write to the page while iterating must use
+ * timeseries_entity_iterator_init() directly so they see their own writes. */
+static bool tsdb_meta_scan_open(timeseries_db_t* db, uint32_t page_offset, uint32_t page_size,
+                                timeseries_entity_iterator_t* it) {
+  if (!timeseries_entity_iterator_init(db, page_offset, page_size, it)) return false;
+  (void)timeseries_entity_iterator_buffer(it);
+  return true;
+}
+
 /* Where the next metadata entry of `need` bytes goes on this page. The entry
  * iterator stops without advancing both at the blank tail and at a header
  * whose extent overflows the page (a torn entry header); the second is not
@@ -232,7 +244,7 @@ bool tsdb_find_measurement_id(timeseries_db_t* db, const char* measurement_name,
 
     // Initialize an entity iterator for this page
     timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+    if (!tsdb_meta_scan_open(db, page_offset, page_size, &ent_iter)) {
       ESP_LOGW(TAG, "Failed to init entity iterator for meta offset=0x%08" PRIx32, page_offset);
       continue;
     }
@@ -355,7 +367,7 @@ bool tsdb_find_max_measurement_id(timeseries_db_t *db, uint32_t *out_max) {
     uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
 
     timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+    if (!tsdb_meta_scan_open(db, page_offset, page_size, &ent_iter)) {
       continue;
     }
 
@@ -406,7 +418,7 @@ static tsdb_series_type_status_t scan_series_type(timeseries_db_t* db, const uns
   bool complete = true;
   for (size_t i = 0; i < meta_count; i++) {
     timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, meta_offsets[i], TIMESERIES_METADATA_PAGE_SIZE, &ent_iter)) {
+    if (!tsdb_meta_scan_open(db, meta_offsets[i], TIMESERIES_METADATA_PAGE_SIZE, &ent_iter)) {
       complete = false;
       continue;
     }
@@ -1394,7 +1406,7 @@ bool tsdb_find_series_ids_for_tag(timeseries_db_t* db, uint32_t measurement_id, 
     uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;  // e.g. 8KB
 
     timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+    if (!tsdb_meta_scan_open(db, page_offset, page_size, &ent_iter)) {
       continue;
     }
 
@@ -1686,7 +1698,7 @@ bool tsdb_find_series_ids_for_field(timeseries_db_t* db, uint32_t measurement_id
     const uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;  // e.g. 8KB
 
     timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+    if (!tsdb_meta_scan_open(db, page_offset, page_size, &ent_iter)) {
       ESP_LOGW(TAG, "Failed to initialize entity iterator for page offset=0x%08" PRIx32, page_offset);
       continue;
     }
@@ -1785,7 +1797,7 @@ bool tsdb_list_all_measurements(timeseries_db_t* db, timeseries_string_list_t* o
     uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
 
     timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+    if (!tsdb_meta_scan_open(db, page_offset, page_size, &ent_iter)) {
       continue;
     }
 
@@ -1860,7 +1872,7 @@ bool tsdb_list_fields_for_measurement(timeseries_db_t* db, uint32_t measurement_
     uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
 
     timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+    if (!tsdb_meta_scan_open(db, page_offset, page_size, &ent_iter)) {
       continue;
     }
 
@@ -1953,7 +1965,7 @@ bool tsdb_find_all_series_ids_for_measurement(timeseries_db_t* db, uint32_t meas
     uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
 
     timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+    if (!tsdb_meta_scan_open(db, page_offset, page_size, &ent_iter)) {
       continue;
     }
 
@@ -2031,6 +2043,7 @@ bool tsdb_find_all_series_ids_for_measurement(timeseries_db_t* db, uint32_t meas
             if (!tsdb_series_id_list_append(out_series_list, sid)) {
               ESP_LOGE(TAG, "Failed appending a series ID (OOM?)");
               free(series_ids);
+              timeseries_entity_iterator_deinit(&ent_iter);
               return false;
             }
           }
@@ -2352,7 +2365,7 @@ bool timeseries_metadata_get_tags_for_measurement(timeseries_db_t* db, uint32_t 
     uint32_t page_size = TIMESERIES_METADATA_PAGE_SIZE;
 
     timeseries_entity_iterator_t ent_iter;
-    if (!timeseries_entity_iterator_init(db, page_offset, page_size, &ent_iter)) {
+    if (!tsdb_meta_scan_open(db, page_offset, page_size, &ent_iter)) {
       continue;
     }
 

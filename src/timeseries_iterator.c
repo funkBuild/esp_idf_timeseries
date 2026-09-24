@@ -125,11 +125,67 @@ bool timeseries_entity_iterator_init(timeseries_db_t* db, uint32_t page_offset, 
   // minimal performance benefit on metadata pages.
   ent_iter->page_ptr = NULL;
   ent_iter->mmap_hdl = 0;
+  ent_iter->owns_page_buf = false;
+  ent_iter->buf_end = 0;
 
   return true;
 }
 
+// First block of a buffered page; each later block doubles the bytes held.
+#define ENTITY_BUF_FIRST_BLOCK 64u
+
+bool timeseries_entity_iterator_buffer(timeseries_entity_iterator_t* ent_iter) {
+  if (!ent_iter || !ent_iter->valid) {
+    return false;
+  }
+  if (ent_iter->page_ptr != NULL) {
+    return true;
+  }
+  if (ent_iter->page_size < sizeof(timeseries_page_header_t)) {
+    return false;
+  }
+  uint8_t* buf = malloc(ent_iter->page_size);
+  if (!buf) {
+    return false;
+  }
+  ent_iter->page_ptr = buf;
+  ent_iter->owns_page_buf = true;
+  ent_iter->buf_end = sizeof(timeseries_page_header_t);  // nothing loaded yet
+  return true;
+}
+
+/* Buffered mode: make page bytes [.., end) available, reading the next block
+ * from flash if needed. */
+static bool entity_buf_ensure(timeseries_entity_iterator_t* ent_iter, uint32_t end) {
+  if (!ent_iter->owns_page_buf || end <= ent_iter->buf_end) {
+    return true;
+  }
+  if (end > ent_iter->page_size) {
+    return false;
+  }
+  uint32_t held = ent_iter->buf_end - (uint32_t)sizeof(timeseries_page_header_t);
+  uint32_t grow = held > ENTITY_BUF_FIRST_BLOCK ? held : ENTITY_BUF_FIRST_BLOCK;
+  uint32_t new_end = ent_iter->buf_end + grow;
+  if (new_end < end) new_end = end;
+  if (new_end > ent_iter->page_size) new_end = ent_iter->page_size;
+  esp_err_t err = esp_partition_read(ent_iter->db->partition, ent_iter->page_offset + ent_iter->buf_end,
+                                     (uint8_t*)ent_iter->page_ptr + ent_iter->buf_end, new_end - ent_iter->buf_end);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read metadata page @0x%08" PRIx32 " +0x%" PRIx32 " (err=0x%x)", ent_iter->page_offset,
+             ent_iter->buf_end, err);
+    return false;
+  }
+  ent_iter->buf_end = new_end;
+  return true;
+}
+
 void timeseries_entity_iterator_deinit(timeseries_entity_iterator_t* ent_iter) {
+  if (ent_iter && ent_iter->owns_page_buf) {
+    free((void*)ent_iter->page_ptr);
+    ent_iter->page_ptr = NULL;
+    ent_iter->owns_page_buf = false;
+    return;
+  }
   if (ent_iter && ent_iter->page_ptr != NULL && ent_iter->mmap_hdl != 0) {
     esp_partition_munmap(ent_iter->mmap_hdl);
     ent_iter->page_ptr = NULL;
@@ -152,11 +208,15 @@ bool timeseries_entity_iterator_next(timeseries_entity_iterator_t* ent_iter, tim
   // Save the entry_offset BEFORE reading
   ent_iter->current_entry_offset = ent_iter->offset;
 
-  // Read the header - use mmap if available, otherwise fall back to partition read
+  // Read the header from the in-RAM page copy if buffered, otherwise from flash
   timeseries_entry_header_t hdr;
 
   if (ent_iter->page_ptr != NULL) {
-    // Use direct memory access via mmap
+    if (!entity_buf_ensure(ent_iter, ent_iter->offset + (uint32_t)sizeof(hdr))) {
+      ent_iter->valid = false;
+      ent_iter->read_error = true;
+      return false;
+    }
     memcpy(&hdr, ent_iter->page_ptr + ent_iter->offset, sizeof(hdr));
   } else {
     // Fall back to partition read
@@ -213,7 +273,9 @@ bool timeseries_entity_iterator_read_data(timeseries_entity_iterator_t* ent_iter
   uint32_t value_offset_rel = key_offset_rel + header->key_len;
 
   if (ent_iter->page_ptr != NULL) {
-    // Use direct memory access via mmap
+    if (!entity_buf_ensure(ent_iter, value_offset_rel + header->value_len)) {
+      return false;
+    }
     if (key_buf && header->key_len > 0) {
       memcpy(key_buf, ent_iter->page_ptr + key_offset_rel, header->key_len);
     }

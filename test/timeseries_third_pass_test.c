@@ -165,7 +165,10 @@ static void raw_range_test(timeseries_field_type_e type) {
     TEST_ASSERT_EQUAL_UINT64(500,r.timestamps[0]); timeseries_query_free_result(&r);
     timeseries_deinit();
 #if CONFIG_IDF_TARGET_LINUX
-    TEST_ASSERT_LESS_THAN(type==TIMESERIES_FIELD_TYPE_BOOL ? 8350 : 9000,bytes);
+    // Includes the query's metadata reads. Buffered metadata scans read whole
+    // 64 B+ blocks (fewer, larger reads), about 110 B more per scan of this
+    // tiny page than exact per-entry reads; the query still scans 4 times.
+    TEST_ASSERT_LESS_THAN(type==TIMESERIES_FIELD_TYPE_BOOL ? 8600 : 9000,bytes);
 #endif
 }
 TEST_CASE("third: narrow raw integer record", "[third][third_range]") {raw_range_test(TIMESERIES_FIELD_TYPE_INT);}

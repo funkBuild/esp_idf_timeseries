@@ -96,6 +96,11 @@ static bool tsdb_insert_measurement_entry(timeseries_db_t* db, uint32_t page_off
 // offsets inline (no allocation, the common case) and grows on the heap
 // (PSRAM) beyond that; TSDB_META_PAGES frees it when it goes out of scope.
 // *out_offsets/*found_count are set to the list's contents.
+// tsdb_find_metadata_pages returns false only when the list could not be
+// built (bad arguments, snapshot unavailable, OOM growing the list); no
+// metadata pages is success with *found_count == 0. Callers that act on
+// "no metadata" must check the count and must not treat a false return as
+// an empty metadata set, or an OOM becomes a silent empty answer.
 typedef struct {
   uint32_t *heap;
   size_t heap_capacity;
@@ -232,7 +237,7 @@ bool tsdb_find_measurement_id(timeseries_db_t* db, const char* measurement_name,
   TSDB_META_PAGES(meta_list);
   const uint32_t* meta_offsets = NULL;
   size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count)) {
+  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count) || meta_count == 0) {
     ESP_LOGW(TAG, "No metadata pages found to search for measurement '%s'.", measurement_name);
     return false;
   }
@@ -358,8 +363,10 @@ bool tsdb_find_max_measurement_id(timeseries_db_t *db, uint32_t *out_max) {
   TSDB_META_PAGES(meta_list);
   const uint32_t* meta_offsets = NULL;
   size_t meta_count = 0;
+  // No metadata pages => max is 0 (meta_count == 0). A failed lookup is not
+  // "no measurements": reporting 0 would let new measurements reuse IDs.
   if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count)) {
-    return true; // No metadata pages, max is 0
+    return false;
   }
 
   for (size_t i = 0; i < meta_count; i++) {
@@ -410,7 +417,7 @@ static tsdb_series_type_status_t scan_series_type(timeseries_db_t* db, const uns
   TSDB_META_PAGES(meta_list);
   const uint32_t* meta_offsets = NULL;
   size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count)) {
+  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count) || meta_count == 0) {
     ESP_LOGE(TAG, "No active metadata pages for series ID lookup");
     return TSDB_SERIES_TYPE_UNKNOWN;
   }
@@ -581,7 +588,7 @@ bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, co
     const uint32_t* meta_offsets = NULL;
     size_t meta_count = 0;
     for (size_t i = 0; i < num_tags; i++) {
-      if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count)) {
+      if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count) || meta_count == 0) {
         return false;
       }
       char key_buf[128];
@@ -618,7 +625,7 @@ bool tsdb_index_tags_for_series(timeseries_db_t* db, uint32_t measurement_id, co
   // the page ent_iter walks, so the scan restarts from a fresh page list; the
   // tag just replaced is already marked done, so at most num_tags restarts.
 rescan:
-  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count)) {
+  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count) || meta_count == 0) {
     ESP_LOGE(TAG, "No active metadata pages for tag indexing");
     free(tag_key_bufs);
     return false;
@@ -760,7 +767,9 @@ rescan:
 
     bool created = false;
     if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count)) {
-      meta_count = 0;
+      ESP_LOGE(TAG, "Metadata page lookup failed while indexing tag '%s'", tag_key_bufs + t * 128);
+      free(tag_key_bufs);
+      return false;
     }
     for (size_t p = 0; p < meta_count && !created; p++) {
       created = tsdb_create_new_index_entry(
@@ -1071,8 +1080,9 @@ static bool tsdb_insert_measurement_entry(timeseries_db_t* db, uint32_t page_off
 /**
  * @brief Finds all offsets in the partition that are active METADATA pages.
  *
- * Uses a cache to avoid repeated full page scans. The cache is populated
- * on the first call and reused until invalidated.
+ * @return true when the list is complete, including an empty list (no
+ *         metadata pages); false when it could not be built (bad arguments,
+ *         no page-cache snapshot, or OOM growing the list).
  */
 static bool tsdb_find_metadata_pages(timeseries_db_t* db, tsdb_meta_pages_t* list, const uint32_t** out_offsets,
                                      size_t* found_count) {
@@ -1127,7 +1137,7 @@ static bool tsdb_find_metadata_pages(timeseries_db_t* db, tsdb_meta_pages_t* lis
   if (!ok) return false;
   *out_offsets = offsets;
   *found_count = count;
-  return count > 0;
+  return true;
 }
 
 bool tsdb_soft_delete_entry(timeseries_db_t* db, uint32_t page_offset, uint32_t current_entry_offset) {
@@ -1175,7 +1185,7 @@ static bool tsdb_retire_replaced_entry(timeseries_db_t* db, uint32_t gen_before,
   TSDB_META_PAGES(meta_list);
   const uint32_t* meta_offsets = NULL;
   size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count)) {
+  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count) || meta_count == 0) {
     return false;
   }
   unsigned char* value_buf = malloc(old_value_len > 0 ? old_value_len : 1);
@@ -2195,7 +2205,11 @@ bool tsdb_remove_measurement_from_metadata(timeseries_db_t* db, const char* meas
   TSDB_META_PAGES(meta_list);
   const uint32_t* meta_offsets = NULL;
   size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count) || meta_count == 0) {
+  // No metadata pages => nothing to delete; a failed lookup is not success.
+  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count)) {
+    return false;
+  }
+  if (meta_count == 0) {
     return true;
   }
 
@@ -2282,7 +2296,11 @@ bool tsdb_soft_delete_fieldlistindex_entry(timeseries_db_t* db, uint32_t measure
   TSDB_META_PAGES(meta_list);
   const uint32_t* meta_offsets = NULL;
   size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count) || meta_count == 0) {
+  // No metadata pages => nothing to delete; a failed lookup is not success.
+  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count)) {
+    return false;
+  }
+  if (meta_count == 0) {
     return true;
   }
 
@@ -2554,8 +2572,12 @@ bool tsdb_collect_query_series(timeseries_db_t* db, uint32_t measurement_id, con
     }
   }
 
+  // No metadata pages (meta_count == 0) => nothing matches. A failed lookup
+  // (OOM growing the page list) is not "no metadata": fail the query rather
+  // than return an empty result for a measurement that has series.
   if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count)) {
-    meta_count = 0;  // no metadata => nothing matches (the per-lookup functions agree)
+    ok = false;
+    goto out;
   }
 
   for (size_t p = 0; p < meta_count && ok; p++) {

@@ -379,3 +379,49 @@ TEST_CASE("meta scan: query sees a re-created measurement, not a stale cached ID
   TEST_ASSERT_EQUAL_DOUBLE(2.0, r.columns[0].values[0].data.float_val);
   timeseries_query_free_result(&r);
 }
+
+#if CONFIG_IDF_TARGET_LINUX
+void tsdb_audit_fail_realloc(size_t size);
+// With more than four metadata pages the page list grows on the heap. If that
+// allocation fails, the query does not know which pages hold its series, so
+// it must fail. It must not return an empty result as if the measurement had
+// no series. The measurement ID comes from the cache (filled by the inserts),
+// so collecting the series is the query's first metadata-page lookup.
+TEST_CASE("meta scan: query fails when listing the metadata pages runs out of memory",
+          "[metadata][meta_scan_reads]") {
+  setup_db();
+  timeseries_db_t* db = timeseries_get_db_handle();
+  TEST_ASSERT_NOT_NULL(db);
+  uint32_t pages[16];
+  TEST_ASSERT_TRUE(xSemaphoreTake(db->flash_write_mutex, portMAX_DELAY) == pdTRUE);
+  bool created = true;
+  for (size_t i = metadata_pages(db, pages, 16); i < 5 && created; i++) {
+    created = timeseries_metadata_create_page(db);
+  }
+  xSemaphoreGive(db->flash_write_mutex);
+  TEST_ASSERT_TRUE(created);
+  TEST_ASSERT_GREATER_OR_EQUAL(5, metadata_pages(db, pages, 16));
+
+  const char* two[] = {"field1", "field4"};
+  timeseries_query_t q = {.measurement_name = MSR_NAME, .field_names = two, .num_fields = 2};
+  timeseries_query_result_t r;
+  TEST_ASSERT_TRUE(timeseries_query(&q, &r));
+  TEST_ASSERT_EQUAL(2 * MSR_TAGVALS, r.num_points);
+  timeseries_query_free_result(&r);
+
+  // The page list starts with four inline offsets and doubles: 8 * 4 bytes.
+  tsdb_audit_fail_realloc(8 * sizeof(uint32_t));
+  memset(&r, 0, sizeof(r));
+  bool ok = timeseries_query(&q, &r);
+  tsdb_audit_fail_realloc(0);
+  size_t points = r.num_points;
+  timeseries_query_free_result(&r);
+  TEST_ASSERT_FALSE_MESSAGE(ok, "query reported success with an incomplete metadata page list");
+  TEST_ASSERT_EQUAL(0, points);
+
+  // The fault was one-shot: the same query succeeds again.
+  TEST_ASSERT_TRUE(timeseries_query(&q, &r));
+  TEST_ASSERT_EQUAL(2 * MSR_TAGVALS, r.num_points);
+  timeseries_query_free_result(&r);
+}
+#endif

@@ -1305,11 +1305,11 @@ TEST_CASE("public_api: clear_all then verify all APIs work", "[public_api][lifec
     // All APIs should return empty/false but not crash
     measurements = NULL;
     num_measurements = 0;
-    bool got_measurements = timeseries_get_measurements(&measurements, &num_measurements);
-    if (got_measurements) {
-        TEST_ASSERT_EQUAL(0, num_measurements);
-        free(measurements);
-    }
+    // An empty DB is an empty list, not an error: the HTTP API maps false to
+    // a 400 and Lua's getMeasurements to "backend error".
+    TEST_ASSERT_TRUE(timeseries_get_measurements(&measurements, &num_measurements));
+    TEST_ASSERT_EQUAL(0, num_measurements);
+    free(measurements);
 
     timeseries_query_result_t r;
     TEST_ASSERT_TRUE(query_measurement("clear_m1", &r));

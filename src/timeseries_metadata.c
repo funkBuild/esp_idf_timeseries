@@ -1814,12 +1814,18 @@ bool tsdb_list_all_measurements(timeseries_db_t* db, timeseries_string_list_t* o
   TSDB_META_PAGES(meta_list);
   const uint32_t* meta_offsets = NULL;
   size_t meta_count = 0;
-  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count) || meta_count == 0) {
-    ESP_LOGD(TAG, "No active metadata pages => no measurements");
+  // false means the lookup failed; an empty list (a fresh DB has no metadata
+  // pages yet) is a normal answer, not an error.
+  if (!tsdb_find_metadata_pages(db, &meta_list, &meta_offsets, &meta_count)) {
+    ESP_LOGW(TAG, "Metadata page lookup failed while listing measurements");
     return false;
   }
+  if (meta_count == 0) {
+    ESP_LOGD(TAG, "No active metadata pages => no measurements");
+    return true;
+  }
 
-  bool found_any = false;
+  bool ok = true;
 
   // 2) Scan each page for measurement entries
   for (size_t p = 0; p < meta_count; p++) {
@@ -1843,6 +1849,7 @@ bool tsdb_list_all_measurements(timeseries_db_t* db, timeseries_string_list_t* o
         char *name_buf = (char *)malloc(256);
         if (!name_buf) {
           ESP_LOGE(TAG, "OOM allocating name_buf in tsdb_list_all_measurements");
+          ok = false;
           continue;
         }
         uint32_t measurement_id;
@@ -1856,9 +1863,9 @@ bool tsdb_list_all_measurements(timeseries_db_t* db, timeseries_string_list_t* o
         // name_buf is now the measurement name
         name_buf[e_hdr.key_len] = '\0';
 
-        // Append unique to the output list
-        if (tsdb_string_list_append_unique(out_measurements, name_buf)) {
-          found_any = true;
+        // Append unique to the output list (false only on OOM)
+        if (!tsdb_string_list_append_unique(out_measurements, name_buf)) {
+          ok = false;
         }
         free(name_buf);
       }
@@ -1867,7 +1874,7 @@ bool tsdb_list_all_measurements(timeseries_db_t* db, timeseries_string_list_t* o
     timeseries_entity_iterator_deinit(&ent_iter);
   }
 
-  return found_any;
+  return ok;
 }
 
 /**

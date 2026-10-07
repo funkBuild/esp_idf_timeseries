@@ -34,6 +34,9 @@ static struct {
   fault_clear_t clear;
 } s_fault;
 static size_t s_erases, s_full_erases, s_last_erase_offset, s_last_erase_length;
+// The erase that covered the armed fault (later erases, e.g. allocating a
+// replacement page, may follow it)
+static size_t s_cover_erase_offset, s_cover_erase_length;
 static bool s_fail_erases;
 
 /* Called by the esp_partition_read wraps: true fails the read. */
@@ -59,6 +62,10 @@ bool tsdb_test_on_erase(const esp_partition_t *part, size_t offset, size_t lengt
   bool full = offset == 0 && part && length >= part->size;
   if (full) s_full_erases++;
   bool covers = offset <= s_fault.start && s_fault.end <= offset + length;
+  if (s_fault.armed && covers) {
+    s_cover_erase_offset = offset;
+    s_cover_erase_length = length;
+  }
   if (s_fault.armed && covers &&
       (s_fault.clear == CLEAR_ON_COVERING_ERASE || (s_fault.clear == CLEAR_ON_FULL_ERASE && full)))
     s_fault.armed = false;
@@ -74,6 +81,7 @@ static void arm_fault(size_t start, size_t end, fault_clear_t clear) {
 
 static void reset_counters(void) {
   s_erases = s_full_erases = s_last_erase_offset = s_last_erase_length = 0;
+  s_cover_erase_offset = s_cover_erase_length = 0;
 }
 
 static void disarm(void) {
@@ -234,8 +242,8 @@ TEST_CASE("recovery: unreadable metadata page is erased alone; data pages surviv
   TEST_ASSERT_EQUAL(TIMESERIES_RECOVERY_PAGES_ERASED, report.action);
   TEST_ASSERT_EQUAL_UINT32(1, report.pages_erased);
   TEST_ASSERT_EQUAL(0, s_full_erases);
-  TEST_ASSERT_EQUAL(meta, s_last_erase_offset);
-  TEST_ASSERT_EQUAL(TIMESERIES_METADATA_PAGE_SIZE, s_last_erase_length);
+  TEST_ASSERT_EQUAL(meta, s_cover_erase_offset);
+  TEST_ASSERT_EQUAL(TIMESERIES_METADATA_PAGE_SIZE, s_cover_erase_length);
 
   // The names are gone with their page; the data pages were not touched, so
   // writing a measurement again (same series IDs) brings its points back.

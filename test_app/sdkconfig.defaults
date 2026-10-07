@@ -71,3 +71,6 @@ CONFIG_TIMESERIES_ALP_CHUNK_MAX_POINTS=200
 # CONFIG_LOG_IN_IRAM is not set
 # CONFIG_LIBC_MISC_IN_IRAM is not set
 # CONFIG_LIBC_LOCKS_PLACE_IN_IRAM is not set
+
+# Wear tests run on a 2 MB partition: a bigger zone holds the recycled pages
+CONFIG_TIMESERIES_SMALL_PAGE_ZONE_PCT=25

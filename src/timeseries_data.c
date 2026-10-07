@@ -26,6 +26,71 @@ static const char *TAG = "TimeseriesData";
 // ---------------------------------------------------------------------------
 // Longest wait for retired space still read by another operation.
 #define TSDB_RETIRED_WAIT_MS 5000
+
+// Zoned allocation (wear spreading). Pages that are recycled often (L0 field
+// pages, metadata pages, and the outputs of the low compaction levels, which
+// are merged away again a few L0 cycles later) were placed first fit from
+// offset 0 and re-erased the same sectors every cycle. They rotate next-fit
+// through a zone at the top of the partition instead. The rare, large outputs
+// of the top merges stay first-fit below the zone, so the rotating pages do not
+// fragment the contiguous space those need. Either falls back to first fit
+// anywhere. "Rotating" means up to a quarter of the zone (at least 16 KB).
+#define TSDB_ROTATE_MIN_MAX (16u * 1024u)
+
+static bool pick_region(timeseries_db_t *db, timeseries_blank_iterator_t *it, uint32_t size,
+                        uint32_t *out_ofs, uint32_t *out_size) {
+    uint32_t zone = db->alloc_zone_start;
+    uint32_t rotate_max = (db->partition->size - zone) / 4;
+    if (rotate_max < TSDB_ROTATE_MIN_MAX) rotate_max = TSDB_ROTATE_MIN_MAX;
+    bool small = size <= rotate_max && zone < db->partition->size;
+    uint32_t cursor = db->alloc_cursor < zone ? zone : db->alloc_cursor;
+    uint32_t c_ofs[3], c_end[3];
+    bool have[3] = {false, false, false};  // preferred, second choice, any
+    uint32_t g_ofs, g_size;
+    while (timeseries_blank_iterator_next(it, &g_ofs, &g_size)) {
+        uint32_t g_end = g_ofs + g_size;
+        uint32_t lo[2], hi[2];
+        if (small) {
+            lo[0] = g_ofs > cursor ? g_ofs : cursor;  // in the zone at/after the cursor
+            hi[0] = g_end;
+            lo[1] = g_ofs > zone ? g_ofs : zone;      // in the zone, wrapped
+            hi[1] = g_end;
+        } else {
+            lo[0] = g_ofs;                            // below the zone
+            hi[0] = g_end < zone ? g_end : zone;
+            lo[1] = 1;                                // (no second choice)
+            hi[1] = 0;
+        }
+        for (int k = 0; k < 2; k++) {
+            lo[k] = (lo[k] + 4095u) & ~4095u;
+            if (!have[k] && lo[k] < hi[k] && hi[k] - lo[k] >= size) {
+                have[k] = true;
+                c_ofs[k] = lo[k];
+                c_end[k] = hi[k];
+            }
+        }
+        if (!have[2]) {
+            have[2] = true;
+            c_ofs[2] = g_ofs;
+            c_end[2] = g_end;
+        }
+        if (have[0]) {
+            break;
+        }
+    }
+    for (int k = 0; k < 3; k++) {
+        if (have[k]) {
+            *out_ofs = c_ofs[k];
+            *out_size = c_end[k] - c_ofs[k];
+            if (small) {
+                db->alloc_cursor = c_ofs[k] + size;
+                if (db->alloc_cursor >= db->partition->size) db->alloc_cursor = zone;
+            }
+            return true;
+        }
+    }
+    return false;
+}
 bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
                                 tsdb_page_cache_snapshot_t *batch_snapshot,
                                 uint32_t *out_offset, uint32_t *out_size) {
@@ -53,8 +118,11 @@ bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
         tsdb_page_cache_snapshot_t *occupied = tsdb_occupied_snapshot(db);
         bool scanning = occupied &&
                         timeseries_blank_iterator_init_with_snapshot(db, &blank_iter, reserve_size, occupied);
-        bool found = scanning && timeseries_blank_iterator_next(&blank_iter, &region_ofs, &region_size);
-        if (scanning) timeseries_blank_iterator_deinit(&blank_iter);
+        bool found = false;
+        if (scanning) {
+            found = pick_region(db, &blank_iter, reserve_size, &region_ofs, &region_size);
+            timeseries_blank_iterator_deinit(&blank_iter);
+        }
         tsdb_snapshot_release(occupied);
         if (found) break;
         if (!occupied || !tsdb_retired_pinned_by_others(db) ||
@@ -72,6 +140,7 @@ bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
         xSemaphoreGive(db->region_alloc_mutex);
         return false;
     }
+    TSDB_ERASE_HOOK(region_ofs, reserve_size);
 
     // Register in both snapshots so neither path can double-allocate
     // Create a placeholder header for registration

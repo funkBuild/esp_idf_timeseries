@@ -986,7 +986,7 @@ static bool insert_int_points(const char *measurement, const uint64_t *timestamp
   }
   const char *field = "v";
   timeseries_insert_data_t in = {.measurement_name = measurement, .field_names = &field, .field_values = values,
-                                 .num_fields = 1, .timestamps_ms = timestamps, .num_points = n};
+                                 .num_fields = 1, .timestamps_ms = (uint64_t *)timestamps, .num_points = n};
   bool ok = timeseries_insert(&in);
   free(values);
   return ok;

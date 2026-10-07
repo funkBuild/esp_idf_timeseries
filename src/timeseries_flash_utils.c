@@ -92,6 +92,7 @@ bool tsdb_safe_rewrite_page_header(const esp_partition_t *part,
     free(sector_buf);
     return false;
   }
+  TSDB_ERASE_HOOK(page_offset, 4096);
 
   // Write the sector back once. A failed program has already cleared some
   // bits; writing again would AND stale data into it. Callers rewrite only

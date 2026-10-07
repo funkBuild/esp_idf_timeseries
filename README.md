@@ -43,15 +43,32 @@ components/
 
 ### Partition Table
 
-Create a data partition named `storage` in your `partitions.csv`:
+Create a partition labelled `timeseries` with type `0x40` (the library looks
+it up with `esp_partition_find_first(0x40, ESP_PARTITION_SUBTYPE_ANY, "timeseries")`)
+in your `partitions.csv`:
 
 ```csv
-# Name,   Type, SubType, Offset,  Size
-nvs,      data, nvs,     0x9000,  0x6000
-phy_init, data, phy,     0xf000,  0x1000
-factory,  app,  factory, 0x10000, 1M
-storage,  data, 0x99,    ,        14M
+# Name,     Type, SubType, Offset,  Size
+nvs,        data, nvs,     0x9000,  0x6000
+phy_init,   data, phy,     0xf000,  0x1000
+factory,    app,  factory, 0x10000, 1M
+timeseries, 0x40, ,        ,        14M
 ```
+
+### Flash wear
+
+Pages that are recycled often (level-0 pages, metadata pages and the outputs
+of the low compaction levels) rotate next-fit through a zone at the end of the
+partition (`CONFIG_TIMESERIES_SMALL_PAGE_ZONE_PCT`, 12% by default), so their
+erases are spread over the zone instead of landing on the first free sectors
+every cycle. The large outputs of the top merges are placed first-fit below the
+zone, which keeps contiguous space for them. `timeseries_set_erase_hook()`
+reports every erase for wear accounting (see `test/timeseries_wear_test.c`).
+
+The largest compaction step needs a free contiguous region about the size of
+the data it merges, so hold usage to roughly half the partition with
+`timeseries_expire_ex()`, e.g. `timeseries_expire_ex(0.45f, 0.05f)` once in a
+while.
 
 ## Kconfig Options
 

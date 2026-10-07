@@ -5,6 +5,7 @@
 #include "timeseries_repair.h"
 
 #include "esp_log.h"
+#include "sdkconfig.h"
 #include <string.h>
 
 static const char *TAG = "TimeseriesPageCache";
@@ -105,6 +106,24 @@ bool tsdb_build_page_cache(timeseries_db_t *db) {
 
   // Sort the entries by ascending offset
   tsdb_pagecache_batch_sort(snap);
+
+  // Small-page zone at the top of the partition; resume its rotation after
+  // the newest page in it, so wear keeps walking the zone across reboots
+  uint32_t part = db->partition->size;
+  uint32_t zone = (uint32_t)(((uint64_t)part * CONFIG_TIMESERIES_SMALL_PAGE_ZONE_PCT / 100) & ~4095ull);
+  uint32_t zone_start = part - zone;
+  uint32_t newest_seq = 0, cursor = zone_start;
+  for (size_t i = 0; i < snap->count; i++) {
+    const timeseries_cached_page_t *e = &snap->entries[i];
+    if (e->offset >= zone_start && e->header.sequence_num >= newest_seq) {
+      newest_seq = e->header.sequence_num;
+      cursor = e->offset + e->header.page_size;
+    }
+  }
+  if (db->region_alloc_mutex) xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
+  db->alloc_zone_start = zone_start;
+  db->alloc_cursor = cursor < part ? cursor : zone_start;
+  if (db->region_alloc_mutex) xSemaphoreGive(db->region_alloc_mutex);
 
   ESP_LOGV(TAG, "Built page cache with %u entries.",
            (unsigned)snap->count);

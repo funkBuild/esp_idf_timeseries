@@ -288,7 +288,18 @@ bool timeseries_compact_sync(void);
  */
 bool timeseries_compact_force_sync(void);
 
+/**
+ * @brief Expire the oldest data: when usage is at least 50% of the partition,
+ * remove about 5% of it. Same as timeseries_expire_ex(0.5f, 0.05f).
+ */
 bool timeseries_expire(void);
+
+/**
+ * @brief Expire the oldest data when usage is at least @p usage_threshold of
+ * the partition, removing about @p reduction of it (both fractions, 0..1).
+ * Call periodically to hold a retention ceiling, e.g. (0.85f, 0.05f).
+ */
+bool timeseries_expire_ex(float usage_threshold, float reduction);
 
 bool timeseries_query(const timeseries_query_t* query, timeseries_query_result_t* result);
 
@@ -321,6 +332,15 @@ void timeseries_set_compaction_hooks(timeseries_compaction_hook_t pre_compact,
  */
 typedef void (*timeseries_log_hook_t)(int level, const char *message);
 void timeseries_set_log_hook(timeseries_log_hook_t hook);
+
+/**
+ * @brief Register a callback invoked after each flash erase the database
+ * makes (page allocation, page header rewrite), for wear accounting in tests
+ * and diagnostics. Runs in the erasing task with internal locks held: keep it
+ * short. Pass NULL to disable.
+ */
+typedef void (*timeseries_erase_hook_t)(uint32_t offset, uint32_t size);
+void timeseries_set_erase_hook(timeseries_erase_hook_t hook);
 
 /**
  * @brief Deinitialize the timeseries database, stopping background tasks and

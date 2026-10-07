@@ -249,6 +249,12 @@ typedef struct {
   SemaphoreHandle_t snapshot_mutex;
   SemaphoreHandle_t flash_write_mutex;
   SemaphoreHandle_t region_alloc_mutex;       // Serializes blank-region allocation
+  // Wear spreading (tsdb_reserve_blank_region): small pages rotate next-fit
+  // through [alloc_zone_start, partition end), starting at alloc_cursor.
+  // alloc_zone_start == partition size disables the zone (plain first fit).
+  // Guarded by region_alloc_mutex; set when the page cache is built.
+  uint32_t alloc_zone_start;
+  uint32_t alloc_cursor;
   SemaphoreHandle_t series_cache_mutex;       // Guards the series-ID cache (lock-free reads on dual-core would tear the 128-byte key)
   SemaphoreHandle_t type_cache_mutex;         // Guards the series type cache (read by queries, written by inserts)
   tsdb_page_cache_snapshot_t *active_batch;   // Compactor-owned batch; other tasks must never mutate it

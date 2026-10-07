@@ -35,4 +35,12 @@ bool tsdb_safe_rewrite_page_header(const esp_partition_t *part,
 esp_err_t tsdb_flash_write_byte(const esp_partition_t *part, uint32_t offset,
                                 uint8_t value);
 
+/* Erase accounting (timeseries_set_erase_hook); called after each erase */
+extern void (*volatile tsdb_erase_hook)(uint32_t offset, uint32_t size);
+#define TSDB_ERASE_HOOK(offset, size)                              \
+  do {                                                             \
+    void (*hook_)(uint32_t, uint32_t) = tsdb_erase_hook;           \
+    if (hook_) hook_((offset), (size));                            \
+  } while (0)
+
 #endif // TIMESERIES_FLASH_UTILS_H

@@ -8,6 +8,7 @@
 #include "timeseries_cache.h"
 #include "timeseries_compaction.h"
 #include "timeseries_data.h"
+#include "timeseries_flash_utils.h"
 #include "timeseries_delete.h"
 #include "timeseries_expiration.h"
 #include "timeseries_internal.h"
@@ -93,6 +94,12 @@ void timeseries_set_compaction_hooks(timeseries_compaction_hook_t pre_compact,
 
 void timeseries_set_log_hook(timeseries_log_hook_t hook) {
     s_tsdb.log_hook = hook;
+}
+
+void (*volatile tsdb_erase_hook)(uint32_t offset, uint32_t size);
+
+void timeseries_set_erase_hook(timeseries_erase_hook_t hook) {
+    tsdb_erase_hook = hook;
 }
 
 // Compaction task: loops while work remains, then self-deletes.
@@ -982,11 +989,18 @@ void timeseries_deinit(void) {
 }
 
 bool timeseries_expire(void) {
+  return timeseries_expire_ex(0.5f, 0.05f);
+}
+
+bool timeseries_expire_ex(float usage_threshold, float reduction) {
+  if (!(usage_threshold >= 0.0f && usage_threshold <= 1.0f && reduction > 0.0f && reduction <= 1.0f)) {
+    return false;
+  }
   TSDB_OPERATION_GUARD(false);
 
   ESP_LOGV(TAG, "Starting expiration...");
 
-  if (!timeseries_expiration_run(&s_tsdb, 0.5, 0.05)) {
+  if (!timeseries_expiration_run(&s_tsdb, usage_threshold, reduction)) {
     ESP_LOGE(TAG, "Expiration failed.");
     return false;
   }

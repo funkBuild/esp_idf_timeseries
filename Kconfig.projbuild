@@ -71,4 +71,17 @@ menu "ESP IDF Timeseries Configuration"
             Test builds may set a lower value (e.g. 200) to exercise chunking
             with small datasets.
 
+    config TIMESERIES_SMALL_PAGE_ZONE_PCT
+        int "Wear-spreading zone for frequently recycled pages (% of the partition)"
+        default 12
+        range 0 50
+        help
+            Pages that are allocated and freed often (level-0 field pages,
+            metadata pages, and compaction outputs up to a quarter of the
+            zone) rotate through a zone of this size at the end of the
+            partition, so their constant re-allocation spreads erases over the
+            zone instead of re-erasing the first free sectors. The large
+            outputs of the top merges are placed below the zone. 0 disables the
+            zone (plain first fit).
+
 endmenu

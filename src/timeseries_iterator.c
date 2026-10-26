@@ -27,6 +27,46 @@ bool timeseries_page_iterator_init(timeseries_db_t* db, timeseries_page_iterator
   return true;
 }
 
+tsdb_page_scan_step_t tsdb_page_scan_step(const esp_partition_t* part, uint32_t offset,
+                                           timeseries_page_header_t* out_header, uint32_t* out_next) {
+  // Read the full page header in one call
+  timeseries_page_header_t hdr;
+  esp_err_t err = esp_partition_read(part, offset, &hdr, sizeof(hdr));
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed reading header @0x%08" PRIx32 " (err=0x%x)", offset, err);
+    *out_next = (offset & ~0xFFFu) + 4096;
+    return TSDB_PAGE_SCAN_READ_ERROR;
+  }
+
+  // Validate magic, type, etc.
+  if (hdr.magic_number == TIMESERIES_MAGIC_NUM &&
+      (hdr.page_type == TIMESERIES_PAGE_TYPE_METADATA || hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA)) {
+    uint32_t page_size = hdr.page_size;
+    // Bound the size by subtraction: offset < partition size here, so this
+    // cannot wrap. A header torn by power loss (or bit decay) can carry a
+    // size near 2^32; the old `offset + size > part_size` form wrapped,
+    // accepted it and moved the cursor backwards (lost pages, or an endless
+    // scan). The page's real extent is unknown, so skip one sector and keep
+    // scanning: the cursor only ever moves forward, and valid pages after the
+    // bad header are still found.
+    // Every writer (1.0.19 and later) sizes pages in whole 4 KiB sectors;
+    // anything else is a torn or decayed header. Accepting it would move the
+    // cursor off the sector grid and hide every later page (whose regions the
+    // allocator would then erase).
+    if (page_size < sizeof(hdr) || (page_size & 0xFFFu) || page_size > part->size - offset) {
+      ESP_LOGW(TAG, "Invalid page_size 0x%08" PRIx32 " @0x%08" PRIx32 ", skipping sector", page_size, offset);
+    } else {
+      if (out_header) memcpy(out_header, &hdr, sizeof(hdr));
+      *out_next = offset + page_size;
+      return TSDB_PAGE_SCAN_PAGE;
+    }
+  }
+
+  // If no valid magic or unknown => skip to the next sector boundary
+  *out_next = (offset & ~0xFFFu) + 4096;
+  return TSDB_PAGE_SCAN_NONE;
+}
+
 bool timeseries_page_iterator_next(timeseries_page_iterator_t* iter, timeseries_page_header_t* out_header,
                                    uint32_t* out_offset, uint32_t* out_size) {
   if (!iter || !iter->valid) {
@@ -35,67 +75,31 @@ bool timeseries_page_iterator_next(timeseries_page_iterator_t* iter, timeseries_
   iter->read_error = false;
 
   while (iter->current_offset < iter->db->partition->size) {
-    // Read the full page header in one call
     timeseries_page_header_t hdr;
-    esp_err_t err = esp_partition_read(iter->db->partition, iter->current_offset, &hdr, sizeof(hdr));
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed reading header @0x%08" PRIx32 " (err=0x%x)", iter->current_offset, err);
+    uint32_t at = iter->current_offset, next = 0;
+    tsdb_page_scan_step_t step = tsdb_page_scan_step(iter->db->partition, at, &hdr, &next);
+    iter->current_offset = next;
+    if (step == TSDB_PAGE_SCAN_READ_ERROR) {
       // The extent of whatever is here is unknown. Report the sector and step
       // past it, so the caller can resume and still find every later page
       // (ending the scan here hid them, and the allocator reused their space).
       iter->read_error = true;
-      iter->error_offset = iter->current_offset & ~0xFFFu;
-      iter->current_offset = iter->error_offset + 4096;
+      iter->error_offset = at & ~0xFFFu;
       return false;
     }
-
-    // Validate magic, type, etc.
-    if (hdr.magic_number == TIMESERIES_MAGIC_NUM) {
-      if (hdr.page_type == TIMESERIES_PAGE_TYPE_METADATA || hdr.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA) {
-        uint32_t page_size = hdr.page_size;
-        // Bound the size by subtraction: current_offset < partition size here,
-        // so this cannot wrap. A header torn by power loss (or bit decay) can
-        // carry a size near 2^32; the old `offset + size > part_size` form
-        // wrapped, accepted it and moved the cursor backwards (lost pages,
-        // or an endless scan). The page's real extent is unknown, so skip one
-        // sector and keep scanning: the cursor only ever moves forward, and
-        // valid pages after the bad header are still found.
-        // Every writer (1.0.19 and later) sizes pages in whole 4 KiB sectors;
-        // anything else is a torn or decayed header. Accepting it would move
-        // the cursor off the sector grid and hide every later page (whose
-        // regions the allocator would then erase).
-        if (page_size < sizeof(hdr) || (page_size & 0xFFFu) ||
-            page_size > iter->db->partition->size - iter->current_offset) {
-          ESP_LOGW(TAG, "Invalid page_size 0x%08" PRIx32 " @0x%08" PRIx32 ", skipping sector", page_size,
-                   iter->current_offset);
-          iter->current_offset = (iter->current_offset & ~0xFFFu) + 4096;
-          continue;
-        }
-
-        // Now check the page_state
-        if (hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE) {
-          // => return it as a valid page
-          if (out_header) {
-            memcpy(out_header, &hdr, sizeof(hdr));
-          }
-          if (out_offset) {
-            *out_offset = iter->current_offset;
-          }
-          if (out_size) {
-            *out_size = page_size;
-          }
-          iter->current_offset += page_size;
-          return true;
-        } else {
-          // If FREE or OBSOLETE => skip it entirely
-          iter->current_offset += page_size;
-          continue;
-        }
+    // FREE or OBSOLETE pages are skipped entirely (the cursor is past them).
+    if (step == TSDB_PAGE_SCAN_PAGE && hdr.page_state == TIMESERIES_PAGE_STATE_ACTIVE) {
+      if (out_header) {
+        memcpy(out_header, &hdr, sizeof(hdr));
       }
+      if (out_offset) {
+        *out_offset = at;
+      }
+      if (out_size) {
+        *out_size = next - at;
+      }
+      return true;
     }
-
-    // If no valid magic or unknown => skip to the next sector boundary
-    iter->current_offset = (iter->current_offset & ~0xFFFu) + 4096;
   }
 
   iter->valid = false;

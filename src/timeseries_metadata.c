@@ -218,6 +218,7 @@ bool tsdb_load_pages_into_memory(timeseries_db_t* db) {
 
   bool found_metadata_page = false;
   unsigned int pages_scanned = 0;
+  uint32_t newest_seq = 0, newest_end = 0;
 
   timeseries_page_header_t hdr;
   uint32_t page_offset = 0;
@@ -241,9 +242,15 @@ bool tsdb_load_pages_into_memory(timeseries_db_t* db) {
       if (hdr.sequence_num > db->sequence_num) {
         db->sequence_num = hdr.sequence_num;
       }
+      if (hdr.sequence_num >= newest_seq) {
+        newest_seq = hdr.sequence_num;
+        newest_end = page_offset + page_size;
+      }
     }
   }
   timeseries_page_cache_iterator_deinit(&page_iter);
+  // L0 pages continue next-fit after the newest page (timeseries_data.h).
+  db->l0_cursor = newest_end < db->partition->size ? newest_end : 0;
 
   ESP_LOGV(TAG, "Scanned %u pages in 'storage' partition.", pages_scanned);
 

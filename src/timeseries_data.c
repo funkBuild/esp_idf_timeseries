@@ -26,9 +26,79 @@ static const char *TAG = "TimeseriesData";
 // ---------------------------------------------------------------------------
 // Longest wait for retired space still read by another operation.
 #define TSDB_RETIRED_WAIT_MS 5000
-bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
-                                tsdb_page_cache_snapshot_t *batch_snapshot,
-                                uint32_t *out_offset, uint32_t *out_size) {
+
+// Wear leveling (TSDB_WEAR_ROTATE_PAGES, timeseries_data.h).
+static uint32_t wear_origin(const timeseries_db_t *db) {
+    uint32_t sectors = db->partition->size / 4096;
+    return sectors ? ((atomic_load(&db->sequence_num) / TSDB_WEAR_ROTATE_PAGES) % sectors) * 4096 : 0;
+}
+
+// The first region of `size` bytes in the free runs of `occupied` that starts
+// at or after `origin`, else (wrapping) the first one from offset 0.
+// *out_run_start is the start of the free run holding it.
+static bool find_free_region(timeseries_db_t *db, tsdb_page_cache_snapshot_t *occupied, uint32_t size,
+                             uint32_t origin, uint32_t *out_offset, uint32_t *out_run_start) {
+    timeseries_blank_iterator_t it;
+    if (!timeseries_blank_iterator_init_with_snapshot(db, &it, 4096, occupied)) return false;
+    bool have_first = false, found = false;
+    uint32_t first = 0, run = 0, run_end = 0, piece = 0, piece_size = 0;
+    while (!found && timeseries_blank_iterator_next(&it, &piece, &piece_size)) {
+        // The iterator may return one free run in pieces (it splits at
+        // OBSOLETE cache entries); join adjacent pieces.
+        if (run_end && piece == run_end) {
+            run_end += piece_size;
+        } else {
+            run = piece;
+            run_end = piece + piece_size;
+        }
+        if (run_end - run < size) continue;
+        if (!have_first) {
+            have_first = true;
+            first = run;
+        }
+        uint32_t start = run < origin ? origin : run;
+        if (start < run_end && run_end - start >= size) {
+            *out_offset = start;
+            *out_run_start = run;
+            found = true;
+        }
+    }
+    timeseries_blank_iterator_deinit(&it);
+    if (!found && have_first) {
+        *out_offset = *out_run_start = first;
+        found = true;
+    }
+    return found;
+}
+
+// A region that starts inside a free run can lie inside the extent of an old
+// OBSOLETE or FREE header earlier in the run. Startup skips such a page by its
+// page_size and would never see the new page (nor protect its space). Clear
+// the magic of every header the startup scan would honour across `start`: only
+// bits are cleared, and the scan then steps sector by sector through that old
+// page's records, as it already does through the unreused rest of any page.
+// A region starting at its run start needs nothing: the erase removes any
+// header at that offset, and none earlier reaches past an occupied region.
+static bool unshadow_region(timeseries_db_t *db, uint32_t run_start, uint32_t start) {
+    for (uint32_t at = run_start; at < start;) {
+        uint32_t next = 0;
+        tsdb_page_scan_step_t step = tsdb_page_scan_step(db->partition, at, NULL, &next);
+        if (step == TSDB_PAGE_SCAN_READ_ERROR) return false;
+        if (step == TSDB_PAGE_SCAN_PAGE && next > start) {
+            static const uint32_t no_magic = 0;
+            if (esp_partition_write(db->partition, at, &no_magic, sizeof(no_magic)) != ESP_OK) return false;
+            ESP_LOGD(TAG, "Cleared stale page header @0x%08" PRIx32 " covering new region @0x%08" PRIx32, at, start);
+            next = (at & ~0xFFFu) + 4096;
+        }
+        at = next;
+    }
+    return true;
+}
+
+// `cursor` non-NULL: search from *cursor (next-fit) instead of the rotating
+// origin, and advance it past the region.
+static bool reserve_region(timeseries_db_t *db, uint32_t min_size, tsdb_page_cache_snapshot_t *batch_snapshot,
+                           uint32_t *cursor, uint32_t *out_offset, uint32_t *out_size) {
     if (!db || !db->partition || !db->region_alloc_mutex || !db->snapshot_mutex || !out_offset || !out_size ||
         !min_size || min_size > UINT32_MAX - 4095) return false;
     uint32_t reserve_size = ((min_size + 4095) / 4096) * 4096;
@@ -38,7 +108,6 @@ bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
     // All reservations are published in the live snapshot while this mutex is
     // held. A compaction batch may predate an insert, so it cannot be used as
     // the allocator's source of truth.
-    timeseries_blank_iterator_t blank_iter;
     if (batch_snapshot && !tsdb_pagecache_batch_reserve(batch_snapshot, 1)) {
         xSemaphoreGive(db->region_alloc_mutex);
         return false;
@@ -47,14 +116,12 @@ bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
     // When only retired space would fit, wait (bounded) for the operations
     // that may still read it instead of failing: they are short readers or
     // are about to leave, and space retired a moment ago is not "full".
-    uint32_t region_ofs = 0, region_size = 0;
+    uint32_t region_ofs = 0, run_start = 0;
+    uint32_t origin = !cursor ? wear_origin(db) : *cursor < db->partition->size ? *cursor & ~0xFFFu : 0;
     TickType_t wait_start = xTaskGetTickCount();
     for (;;) {
         tsdb_page_cache_snapshot_t *occupied = tsdb_occupied_snapshot(db);
-        bool scanning = occupied &&
-                        timeseries_blank_iterator_init_with_snapshot(db, &blank_iter, reserve_size, occupied);
-        bool found = scanning && timeseries_blank_iterator_next(&blank_iter, &region_ofs, &region_size);
-        if (scanning) timeseries_blank_iterator_deinit(&blank_iter);
+        bool found = occupied && find_free_region(db, occupied, reserve_size, origin, &region_ofs, &run_start);
         tsdb_snapshot_release(occupied);
         if (found) break;
         if (!occupied || !tsdb_retired_pinned_by_others(db) ||
@@ -65,6 +132,14 @@ bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
         xSemaphoreGive(db->region_alloc_mutex);
         vTaskDelay(1);
         xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
+    }
+
+    // A failed unshadow leaves only some headers cleared, which startup
+    // tolerates; the run start needs no unshadowing.
+    if (region_ofs != run_start && !unshadow_region(db, run_start, region_ofs)) {
+        ESP_LOGW(TAG, "Could not clear stale headers before @0x%08" PRIx32 "; allocating at the run start",
+                 region_ofs);
+        region_ofs = run_start;
     }
 
     // Erase only the reserved portion
@@ -97,10 +172,17 @@ bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
         tsdb_pagecache_batch_add(batch_snapshot, region_ofs, &placeholder_hdr);
     }
 
+    if (cursor) *cursor = region_ofs + reserve_size;
     *out_offset = region_ofs;
     *out_size = reserve_size;
     xSemaphoreGive(db->region_alloc_mutex);
     return true;
+}
+
+bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
+                                tsdb_page_cache_snapshot_t *batch_snapshot,
+                                uint32_t *out_offset, uint32_t *out_size) {
+    return reserve_region(db, min_size, batch_snapshot, NULL, out_offset, out_size);
 }
 
 bool tsdb_finalize_reserved_region(timeseries_db_t *db, uint32_t offset,
@@ -652,10 +734,12 @@ static bool create_level0_field_page(timeseries_db_t *db,
 
   uint32_t l0_size = TIMESERIES_FIELD_DATA_PAGE_SIZE;
 
-  // 1) Reserve a blank region (mutex-protected, registers placeholder)
+  // 1) Reserve a blank region (mutex-protected, registers placeholder). L0
+  //    pages live only until compaction: next-fit spreads them over the
+  //    partition (timeseries_data.h, wear leveling).
   uint32_t blank_offset = 0;
   uint32_t blank_length = 0;
-  if (!tsdb_reserve_blank_region(db, l0_size, NULL, &blank_offset, &blank_length)) {
+  if (!reserve_region(db, l0_size, NULL, &db->l0_cursor, &blank_offset, &blank_length)) {
     ESP_LOGW(TAG, "No blank region found to create L0 page (size=%u).",
              (unsigned int)l0_size);
     return false;

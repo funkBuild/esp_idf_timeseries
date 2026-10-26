@@ -42,6 +42,30 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
                                  const timeseries_field_value_t *values,
                                  size_t count);
 
+/*
+ * Wear leveling. Plain first-fit from offset 0 reused the lowest free space
+ * first, so the start of the partition took most erases (in the host B1
+ * benchmark the hottest sector took ~6.5x the mean erases; flash wears out at
+ * its hottest sector). Two policies now spread them:
+ *
+ * - Every region except an L0 page: first-fit from an origin that moves one
+ *   sector every TSDB_WEAR_ROTATE_PAGES page allocations and wraps at the end.
+ *   Long-lived pages still pack densely after the origin, which keeps large
+ *   free runs (a faster-moving origin fragments free space), while the busy
+ *   zone drifts round the whole partition. The origin derives from
+ *   sequence_num, which startup recovers from the page headers.
+ * - L0 pages: next-fit from db->l0_cursor (just past the previous L0 page;
+ *   startup resumes after the newest page). They live only until compaction,
+ *   so scattering them costs little contiguity, whereas with first-fit each
+ *   one reused the first hole ahead of the origin as soon as it was freed.
+ *
+ * B1 at the product's 50% usage threshold: hottest sector 1.26x the mean.
+ * A region may start inside a free run; see unshadow_region().
+ */
+#ifndef TSDB_WEAR_ROTATE_PAGES
+#define TSDB_WEAR_ROTATE_PAGES 16u
+#endif
+
 /**
  * @brief Reserve a blank region under the region_alloc_mutex.
  *

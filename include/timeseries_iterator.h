@@ -29,6 +29,18 @@ typedef struct {
 
 bool timeseries_page_iterator_init(timeseries_db_t* db, timeseries_page_iterator_t* iter);
 
+/**
+ * One position of the startup page scan. PAGE: a header the scan honours (any
+ * state) is at `offset`; the scan continues at its end, so nothing inside its
+ * extent is ever seen. NONE: no valid header; the scan continues at the next
+ * sector. READ_ERROR: the header could not be read; *out_next is the next
+ * sector. The page iterator and the allocator (timeseries_data.c) share this
+ * so they agree on what a later startup will find.
+ */
+typedef enum { TSDB_PAGE_SCAN_PAGE, TSDB_PAGE_SCAN_NONE, TSDB_PAGE_SCAN_READ_ERROR } tsdb_page_scan_step_t;
+tsdb_page_scan_step_t tsdb_page_scan_step(const esp_partition_t* part, uint32_t offset,
+                                           timeseries_page_header_t* out_header, uint32_t* out_next);
+
 bool timeseries_page_iterator_next(timeseries_page_iterator_t* iter, timeseries_page_header_t* out_header,
                                    uint32_t* out_offset, uint32_t* out_size);
 

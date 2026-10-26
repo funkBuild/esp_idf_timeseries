@@ -249,6 +249,7 @@ typedef struct {
   SemaphoreHandle_t snapshot_mutex;
   SemaphoreHandle_t flash_write_mutex;
   SemaphoreHandle_t region_alloc_mutex;       // Serializes blank-region allocation
+  uint32_t l0_cursor;                         // Next-fit start for L0 pages (region_alloc_mutex)
   SemaphoreHandle_t series_cache_mutex;       // Guards the series-ID cache (lock-free reads on dual-core would tear the 128-byte key)
   SemaphoreHandle_t type_cache_mutex;         // Guards the series type cache (read by queries, written by inserts)
   tsdb_page_cache_snapshot_t *active_batch;   // Compactor-owned batch; other tasks must never mutate it

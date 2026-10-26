@@ -8,6 +8,19 @@
 
 #include "gorilla/gorilla_stream_encoder.h" // for gorilla_stream_t
 
+/*
+ * Largest page a stream writer opens (compaction and expiration outputs). A
+ * larger output continues in further pages, split between records, so the
+ * allocator is never asked for one large contiguous region. A writer that
+ * needed its whole source size in one piece could not compact once free space
+ * was fragmented (by a rotating allocation origin, timeseries_data.h, or by
+ * fill alone), leaving inserts without the space the compaction would have
+ * freed. A single record (under 64 KiB) may still grow one page past this.
+ */
+#ifndef TSDB_STREAM_PAGE_MAX_SIZE
+#define TSDB_STREAM_PAGE_MAX_SIZE (32 * 1024U)
+#endif
+
 // 1) Define your flush context struct
 typedef struct timeseries_page_stream_writer timeseries_page_stream_writer_t;
 
@@ -28,6 +41,8 @@ typedef struct timeseries_page_stream_writer {
   uint32_t write_ptr;
   uint32_t capacity;
   bool finalized;
+  uint8_t level;         // level of every page this writer opens
+  uint32_t source_left;  // source bytes not yet covered by finished pages (sizes the next page)
 
   // Optional borrowed revisions for the next record, supplied by compaction.
   // Count 1 broadcasts a single revision to every point.

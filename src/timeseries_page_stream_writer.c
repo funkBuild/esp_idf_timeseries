@@ -235,21 +235,19 @@ static bool prepare_revisions(timeseries_page_stream_writer_t *writer, size_t co
   return tsdb_revision_encode(writer->point_revisions, count, revision, encoded, length, flags);
 }
 
-bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_stream_writer_t* writer, uint8_t to_level,
-                                        uint32_t prev_data_size) {
-  if (!db || !writer) {
-    return false;
-  }
-  // Preserve batch_snapshot that may have been set before init
-  tsdb_page_cache_snapshot_t *saved_batch = writer->batch_snapshot;
-  memset(writer, 0, sizeof(*writer));
-  writer->batch_snapshot = saved_batch;
-  writer->db = db;
-
+// Opens a new FREE output page at writer->level with room for `needed` bytes
+// after its header: sized to the source bytes still expected, at most
+// TSDB_STREAM_PAGE_MAX_SIZE unless `needed` itself is larger. On failure the
+// writer is unchanged and nothing stays reserved.
+static bool open_page(timeseries_page_stream_writer_t* writer, uint32_t needed) {
+  timeseries_db_t* db = writer->db;
   int64_t start_time = esp_timer_get_time();
 
   // 1) Reserve a blank region (mutex-protected, registers placeholder in both snapshots)
-  uint32_t initial_size = tsdb_round_up_4k(prev_data_size);
+  uint32_t want = writer->source_left < TSDB_STREAM_PAGE_MAX_SIZE ? writer->source_left : TSDB_STREAM_PAGE_MAX_SIZE;
+  if (needed > db->partition->size) return false;
+  uint32_t fit = needed + (uint32_t)sizeof(timeseries_page_header_t);
+  uint32_t initial_size = tsdb_round_up_4k(want > fit ? want : fit);
   uint32_t region_ofs = 0;
   uint32_t found_page_size = 0;
 
@@ -260,8 +258,7 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
   if (found_page_size < initial_size) {
     ESP_LOGE(TAG, "Reserved region is smaller than requested (%u < %u)",
              (unsigned int)found_page_size, (unsigned int)initial_size);
-    writer->base_offset = region_ofs;
-    timeseries_page_stream_writer_abort(writer);
+    tsdb_release_reserved_region(db, region_ofs, writer->batch_snapshot);
     return false;
   }
 
@@ -280,17 +277,15 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
   hdr.page_state = TIMESERIES_PAGE_STATE_FREE;
   // Reserve a unique physical page sequence across concurrent allocations.
   hdr.sequence_num = atomic_fetch_add(&db->sequence_num, 1) + 1;
-  hdr.field_data_level = to_level;
+  hdr.field_data_level = writer->level;
   hdr.page_size = found_page_size;
 
   ESP_LOGV(TAG, "Init: Writing header @0x%08" PRIx32 " type=%u state=%u level=%u",
-           region_ofs, hdr.page_type, hdr.page_state, to_level);
+           region_ofs, hdr.page_type, hdr.page_state, writer->level);
 
   if (esp_partition_write(db->partition, region_ofs, &hdr, sizeof(hdr)) != ESP_OK) {
     ESP_LOGE(TAG, "Failed writing initial page header");
-    writer->base_offset = region_ofs;
-    writer->capacity = found_page_size;
-    timeseries_page_stream_writer_abort(writer);
+    tsdb_release_reserved_region(db, region_ofs, writer->batch_snapshot);
     return false;
   }
 
@@ -311,9 +306,61 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
   return true;
 }
 
+bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_stream_writer_t* writer, uint8_t to_level,
+                                        uint32_t prev_data_size) {
+  if (!db || !writer || !db->partition) {
+    return false;
+  }
+  // Preserve batch_snapshot that may have been set before init
+  tsdb_page_cache_snapshot_t *saved_batch = writer->batch_snapshot;
+  memset(writer, 0, sizeof(*writer));
+  writer->batch_snapshot = saved_batch;
+  writer->db = db;
+  writer->level = to_level;
+  writer->source_left = prev_data_size;
+  return open_page(writer, 0);
+}
+
+// Finishes the current page and continues the output in a new one. Called
+// only between records: a record never spans pages. The finished page is
+// published like a single output (batch or live cache); if the new page
+// cannot be opened, the caller's abort releases the finished one.
+static bool rollover(timeseries_page_stream_writer_t* writer, uint32_t needed) {
+  uint32_t used = writer->write_ptr - writer->base_offset;
+  if (!timeseries_page_stream_writer_finalize(writer)) return false;
+  writer->source_left = used < writer->source_left ? writer->source_left - used : 0;
+  writer->finalized = false;  // the writer continues; abort now refers to the finished page
+  ESP_LOGD(TAG, "Output page @0x%08" PRIx32 " full (%" PRIu32 " B); continuing in a new page",
+           writer->base_offset, used);
+  return open_page(writer, needed);
+}
+
+static bool page_has_records(const timeseries_page_stream_writer_t* writer) {
+  return writer->write_ptr > writer->base_offset + sizeof(timeseries_page_header_t);
+}
+
+// Room for a whole record of `needed` bytes at a record boundary: a new page
+// once this one holds records, else (one oversized record) a larger page.
+static bool make_room_for_record(timeseries_page_stream_writer_t* writer, uint32_t needed) {
+  uint32_t region_end = writer->base_offset + writer->capacity;
+  uint32_t avail = writer->write_ptr <= region_end ? region_end - writer->write_ptr : 0;
+  if (needed <= avail) return true;
+  if (page_has_records(writer)) return rollover(writer, needed);
+  return ensure_capacity(writer, needed);
+}
+
+// Space left in a page below which a Gorilla-streamed record (size unknown
+// until it ends) starts a new page rather than grow this one by relocation.
+#define SERIES_HEADROOM 4096u
+
 bool timeseries_page_stream_writer_begin_series(timeseries_page_stream_writer_t* writer,
                                                 const unsigned char series_id[16], timeseries_field_type_e ftype) {
   if (!writer || writer->finalized) {
+    return false;
+  }
+  uint32_t region_end = writer->base_offset + writer->capacity;
+  uint32_t avail = writer->write_ptr <= region_end ? region_end - writer->write_ptr : 0;
+  if (avail < SERIES_HEADROOM && page_has_records(writer) && !rollover(writer, SERIES_HEADROOM)) {
     return false;
   }
 
@@ -624,8 +671,8 @@ static bool write_alp_with_revisions(
   size_t total = sizeof(timeseries_field_data_header_t) +
                  sizeof(timeseries_col_data_header_t) + ts_len + val_len + revisions_len;
 
-  if (!ensure_capacity(sw, total)) {
-    ESP_LOGE(TAG, "ensure_capacity failed for ALP series (need %zu bytes)", total);
+  if (!make_room_for_record(sw, (uint32_t)total)) {
+    ESP_LOGE(TAG, "No room for ALP series (need %zu bytes)", total);
     return false;
   }
 

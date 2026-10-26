@@ -1,16 +1,18 @@
 #include "unity.h"
 #include "timeseries.h"
+#include "timeseries_compaction.h"
 #include "timeseries_data.h"
 #include "timeseries_internal.h"
 #include "timeseries_iterator.h"
 #include "timeseries_page_cache_snapshot.h"
+#include "timeseries_page_stream_writer.h"
 #include "esp_partition.h"
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
-// Wear leveling: the allocator's rotating first-fit origin and L0 next-fit
-// cursor (timeseries_data.h).
+// Wear leveling: the allocator's rotating first-fit origin (timeseries_data.h)
+// and the capped compaction output pages (timeseries_page_stream_writer.h).
 
 extern timeseries_db_t *timeseries_get_db_handle(void);
 
@@ -158,6 +160,109 @@ TEST_CASE("wear: L0 pages are allocated next-fit and the cursor resumes after a 
   TEST_ASSERT_EQUAL_HEX32(first + TIMESERIES_FIELD_DATA_PAGE_SIZE, after_first);
   TEST_ASSERT_TRUE(restarted); TEST_ASSERT_EQUAL_HEX32(after_first, resumed);
   TEST_ASSERT_EQUAL_HEX32(first + TIMESERIES_FIELD_DATA_PAGE_SIZE, second);
+}
+
+// Field-data pages at `level` in the live cache, and the largest of them.
+static size_t level_pages(timeseries_db_t *db, uint8_t level, uint32_t *largest) {
+  tsdb_page_cache_snapshot_t *s = tsdb_snapshot_acquire_current(db);
+  size_t n = 0; *largest = 0;
+  for (size_t i = 0; i < s->count; i++) {
+    const timeseries_page_header_t *h = &s->entries[i].header;
+    if (h->page_type != TIMESERIES_PAGE_TYPE_FIELD_DATA || h->page_state != TIMESERIES_PAGE_STATE_ACTIVE ||
+        h->field_data_level != level) continue;
+    n++;
+    if (h->page_size > *largest) *largest = h->page_size;
+  }
+  tsdb_snapshot_release(s);
+  return n;
+}
+// Incompressible float points (ALP keeps them near 8 bytes each) at ts 1..n.
+static bool insert_floats(size_t n, uint64_t *sum) {
+  uint64_t *ts = malloc(n * sizeof(*ts));
+  timeseries_field_value_t *values = calloc(n, sizeof(*values));
+  if (!ts || !values) { free(ts); free(values); return false; }
+  uint32_t x = 2463534242u; *sum = 0;
+  for (size_t i = 0; i < n; i++) {
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    ts[i] = i + 1; values[i].type = TIMESERIES_FIELD_TYPE_FLOAT; values[i].data.float_val = (double)x / 3.0;
+    *sum += x;
+  }
+  const char *field = "f";
+  timeseries_insert_data_t in = {.measurement_name = "wear", .field_names = &field,
+    .field_values = values, .num_fields = 1, .timestamps_ms = ts, .num_points = n};
+  bool ok = timeseries_insert(&in); free(ts); free(values); return ok;
+}
+static bool floats_intact(size_t n, uint64_t sum) {
+  const char *field = "f";
+  timeseries_query_t q = {.measurement_name = "wear", .field_names = &field, .num_fields = 1};
+  timeseries_query_result_t r = {0};
+  bool ok = timeseries_query(&q, &r) && r.num_points == n && r.num_columns == 1;
+  uint64_t got = 0;
+  for (size_t i = 0; ok && i < n; i++) {
+    ok = r.timestamps[i] == i + 1;
+    got += (uint64_t)(r.columns[0].values[i].data.float_val * 3.0 + 0.5);
+  }
+  timeseries_query_free_result(&r);
+  return ok && got == sum;
+}
+
+TEST_CASE("wear: a compaction output larger than the page cap continues in further pages", "[wear][wear_page_cap]") {
+  timeseries_db_t *db = prepare();
+  const size_t n = 10000;  // ~160 KiB of L0 pages, ~80 KiB compacted
+  uint64_t sum = 0;
+  bool inserted = insert_floats(n, &sum);
+  bool compacted = timeseries_compact_level0_pages(db);
+  uint32_t l0_largest = 0, l1_largest = 0;
+  size_t l0 = level_pages(db, 0, &l0_largest), l1 = level_pages(db, 1, &l1_largest);
+  bool intact = floats_intact(n, sum);
+  cleanup(db);
+  bool restarted = timeseries_init();
+  bool intact_after = restarted && floats_intact(n, sum);
+  timeseries_deinit();
+  TEST_ASSERT_TRUE(inserted); TEST_ASSERT_TRUE(compacted);
+  TEST_ASSERT_EQUAL(0, l0); TEST_ASSERT_GREATER_OR_EQUAL(3, l1);
+  TEST_ASSERT_LESS_OR_EQUAL_UINT32(TSDB_STREAM_PAGE_MAX_SIZE, l1_largest);
+  TEST_ASSERT_TRUE(intact); TEST_ASSERT_TRUE(restarted); TEST_ASSERT_TRUE(intact_after);
+}
+
+// Strings take the Gorilla streaming path, whose record size is unknown until
+// it ends: the writer starts a new page between records instead.
+TEST_CASE("wear: streamed string records split across capped pages", "[wear][wear_page_cap_strings]") {
+  timeseries_db_t *db = prepare();
+  const size_t n = 600, len = 200;  // ~120 KiB of strings
+  uint64_t *ts = malloc(n * sizeof(*ts));
+  timeseries_field_value_t *values = calloc(n, sizeof(*values));
+  char *text = malloc(n * len);
+  TEST_ASSERT_NOT_NULL(ts); TEST_ASSERT_NOT_NULL(values); TEST_ASSERT_NOT_NULL(text);
+  uint32_t x = 88172645u;
+  for (size_t i = 0; i < n; i++) {
+    for (size_t k = 0; k < len; k++) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; text[i * len + k] = 'a' + x % 26; }
+    ts[i] = i + 1; values[i].type = TIMESERIES_FIELD_TYPE_STRING;
+    values[i].data.string_val.str = text + i * len; values[i].data.string_val.length = len;
+  }
+  const char *field = "s";
+  timeseries_insert_data_t in = {.measurement_name = "wear", .field_names = &field,
+    .field_values = values, .num_fields = 1, .timestamps_ms = ts, .num_points = n};
+  bool inserted = timeseries_insert(&in);
+  bool compacted = timeseries_compact_level0_pages(db);
+  uint32_t l1_largest = 0;
+  size_t l1 = level_pages(db, 1, &l1_largest);
+  cleanup(db);
+  bool restarted = timeseries_init();
+  timeseries_query_t q = {.measurement_name = "wear", .field_names = &field, .num_fields = 1};
+  timeseries_query_result_t r = {0};
+  bool intact = restarted && timeseries_query(&q, &r) && r.num_points == n;
+  for (size_t i = 0; intact && i < n; i++)
+    intact = r.timestamps[i] == i + 1 && r.columns[0].values[i].data.string_val.length == len &&
+             !memcmp(r.columns[0].values[i].data.string_val.str, text + i * len, len);
+  timeseries_query_free_result(&r);
+  timeseries_deinit();
+  free(ts); free(values); free(text);
+  TEST_ASSERT_TRUE(inserted); TEST_ASSERT_TRUE(compacted);
+  TEST_ASSERT_GREATER_OR_EQUAL(2, l1);
+  // One streamed record (a string chunk, ~8 KiB) may grow a page past the cap.
+  TEST_ASSERT_LESS_OR_EQUAL_UINT32(TSDB_STREAM_PAGE_MAX_SIZE + 16384, l1_largest);
+  TEST_ASSERT_TRUE(restarted); TEST_ASSERT_TRUE(intact);
 }
 
 // The startup scan helper the allocator relies on agrees with the page iterator.

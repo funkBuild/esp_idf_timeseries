@@ -36,10 +36,12 @@
  * non-erased NOR flash; CONFIG_ESP_PARTITION_ERASE_CHECK). Count them here:
  * logging is disabled because the linux FreeRTOS port can preempt a task inside
  * printf and deadlock the next printer on the libc stdout lock (sim artifact). */
+#define REVIEW_MAX_SECTORS 1024  // 4 MiB of partition
 static atomic_uint s_bad_writes;
 static atomic_uint s_writes;
 _Atomic uint64_t review_write_bytes, review_erase_bytes;
 atomic_uint review_erase_calls;
+atomic_uint review_sector_erases[REVIEW_MAX_SECTORS];  // per 4 KiB partition sector (wear phases)
 esp_err_t __real_esp_partition_write(const esp_partition_t* p, size_t off, const void* src, size_t len);
 TaskHandle_t _Atomic review_fail_write_task;  // TSDB_REVIEW fault injection (tsdb_review_phases.c)
 _Atomic uint32_t review_fail_write_len, review_fail_write_offset;
@@ -57,11 +59,13 @@ esp_err_t __wrap_esp_partition_write(const esp_partition_t* p, size_t off, const
   return r;
 }
 
-/* Flash-wear counters for the retention benchmark (B1). */
+/* Flash-wear counters for the retention benchmark (B1) and wear phases. */
 esp_err_t __real_esp_partition_erase_range(const esp_partition_t* p, size_t off, size_t len);
 esp_err_t __wrap_esp_partition_erase_range(const esp_partition_t* p, size_t off, size_t len) {
   atomic_fetch_add(&review_erase_calls, 1);
   atomic_fetch_add(&review_erase_bytes, len);
+  for (size_t o = off; o < off + len && o / 4096 < REVIEW_MAX_SECTORS; o += 4096)
+    atomic_fetch_add(&review_sector_erases[o / 4096], 1);
   return __real_esp_partition_erase_range(p, off, len);
 }
 unsigned review_write_calls(void) { return atomic_load(&s_writes); }

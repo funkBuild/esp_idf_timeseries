@@ -21,6 +21,7 @@
 #include "timeseries_internal.h"
 #include "timeseries_iterator.h"
 #include "timeseries_page_cache.h"
+#include "timeseries_page_cache_snapshot.h"
 #include "mbedtls/md.h"
 
 extern timeseries_db_t* review_db(void);
@@ -425,26 +426,42 @@ static int t_trim_failure(void) {
   return bad;
 }
 
-/* ---- B1: flash wear and expiration latency (benchmark, not in "all") ---- */
-// A heartbeat-like load: 8000 inserts of 12 fields x 1 point, expiration
-// every 100 inserts (35% usage threshold, free 5% of the partition: the
-// product's 5% at a threshold this load reaches) after a synchronous
-// compaction, background compaction as in the product. Reports flash writes and
-// erases per 1000 inserts and the time spent in each expiration call.
+/* ---- Heartbeat load (B1, R19, R20) -------------------------------------- */
+// A heartbeat-like load: inserts of 12 fields x 1 point, expiration every 100
+// inserts (free 5% of the partition once usage passes `threshold`) after a
+// synchronous compaction, background compaction as in the product.
 extern _Atomic uint64_t review_write_bytes, review_erase_bytes;
 extern atomic_uint review_erase_calls;
+extern atomic_uint review_sector_erases[];
 extern unsigned review_write_calls(void);
-static int t_bench_wear_latency(void) {
-  timeseries_clear_all();
+
+typedef struct {
+  unsigned failed, exp_calls;
+  uint64_t exp_us, exp_max;
+  uint32_t min_free_run;  // smallest largest-free-run seen once the partition has filled
+} hb_result_t;
+
+// The largest gap between live pages.
+static uint32_t largest_free_run(void) {
+  timeseries_db_t* db = review_db();
+  tsdb_page_cache_snapshot_t* sn = tsdb_snapshot_acquire_current(db);
+  uint32_t at = 0, big = 0;
+  for (size_t k = 0; sn && k <= sn->count; k++) {
+    uint32_t next = k < sn->count ? sn->entries[k].offset : db->partition->size;
+    if (next > at && next - at > big) big = next - at;
+    if (k < sn->count) at = next + sn->entries[k].header.page_size;
+  }
+  tsdb_snapshot_release(sn);
+  return big;
+}
+
+static hb_result_t heartbeat_load(unsigned n, float threshold) {
   static const char* names[12] = {"f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11"};
   timeseries_field_value_t fv[12];
-  unsigned w0 = review_write_calls(), e0 = atomic_load(&review_erase_calls);
-  uint64_t wb0 = atomic_load(&review_write_bytes), eb0 = atomic_load(&review_erase_bytes);
-  uint64_t ts = RS_TS0, exp_us = 0, exp_max = 0;
-  unsigned exp_calls = 0, failed = 0;
+  hb_result_t r = {.min_free_run = UINT32_MAX};
+  uint64_t ts = RS_TS0;
   uint32_t s = 12345;
-  const unsigned N = 8000;
-  for (unsigned i = 0; i < N; i++) {
+  for (unsigned i = 0; i < n; i++) {
     for (int f = 0; f < 12; f++) {
       s ^= s << 13;
       s ^= s >> 17;
@@ -455,20 +472,62 @@ static int t_bench_wear_latency(void) {
     ts += 1000;
     timeseries_insert_data_t d = {.measurement_name = "bench", .field_names = names, .field_values = fv,
                                   .num_fields = 12, .timestamps_ms = &ts, .num_points = 1};
-    if (!timeseries_insert(&d)) failed++;
+    if (!timeseries_insert(&d)) r.failed++;
     if (i % 100 == 99) {
       // Settle compaction first: expiration needs the maintenance slot and
       // returns "busy" (doing nothing) while a compaction holds it.
       timeseries_compact_sync();
       int64_t t0 = esp_timer_get_time();
-      timeseries_expiration_run(review_db(), 0.35f, 0.05f);
+      timeseries_expiration_run(review_db(), threshold, 0.05f);
       uint64_t dt = (uint64_t)(esp_timer_get_time() - t0);
-      exp_us += dt;
-      exp_calls++;
-      if (dt > exp_max) exp_max = dt;
+      r.exp_us += dt;
+      r.exp_calls++;
+      if (dt > r.exp_max) r.exp_max = dt;
+    }
+    // Contiguous space only matters once usage reaches the threshold.
+    if (i % 1000 == 999 && i >= n / 4) {
+      uint32_t run = largest_free_run();
+      if (run < r.min_free_run) r.min_free_run = run;
     }
   }
   timeseries_compact_sync();
+  return r;
+}
+
+// Erase counts per sector since the last reset: hottest / mean.
+static double wear_report(const char* tag) {
+  const esp_partition_t* part = review_db()->partition;
+  unsigned n = part->size / 4096, mx = 0, never = 0;
+  uint64_t sum = 0;
+  for (unsigned i = 0; i < n; i++) {
+    unsigned v = atomic_load(&review_sector_erases[i]);
+    sum += v;
+    if (v > mx) mx = v;
+    if (!v) never++;
+  }
+  double mean = (double)sum / n, ratio = sum ? mx / mean : 0;
+  printf("%s: erases per 4 KiB sector: mean %.1f, hottest %u (%.2fx mean), never erased %u of %u\n", tag, mean, mx,
+         ratio, never, n);
+  return ratio;
+}
+
+static void wear_reset(void) {
+  for (unsigned i = 0; i < review_db()->partition->size / 4096; i++) atomic_store(&review_sector_erases[i], 0);
+}
+
+/* ---- B1: flash wear and expiration latency (benchmark, not in "all") ---- */
+// 8000 heartbeat inserts at a 35% usage threshold (the product's 5% at a
+// threshold this load reaches). Reports flash writes and erases per 1000
+// inserts and the time spent in each expiration call.
+static int t_bench_wear_latency(void) {
+  timeseries_clear_all();
+  wear_reset();
+  unsigned w0 = review_write_calls(), e0 = atomic_load(&review_erase_calls);
+  uint64_t wb0 = atomic_load(&review_write_bytes), eb0 = atomic_load(&review_erase_bytes);
+  const char* env = getenv("B1_N");
+  const unsigned N = env ? (unsigned)atoi(env) : 8000;
+  hb_result_t r = heartbeat_load(N, 0.35f);
+  unsigned failed = r.failed;
   unsigned writes = review_write_calls() - w0, erases = atomic_load(&review_erase_calls) - e0;
   uint64_t wbytes = atomic_load(&review_write_bytes) - wb0, ebytes = atomic_load(&review_erase_bytes) - eb0;
   tsdb_usage_summary_t us;
@@ -476,9 +535,49 @@ static int t_bench_wear_latency(void) {
   printf("B1: %u inserts (%u failed); per 1000 successful inserts: %.1f writes, %.1f KiB written, %.1f erases, %.1f KiB erased; "
          "expire: %u calls, mean %.2f ms, max %.2f ms; final usage %" PRIu32 " KiB\n",
          N, failed, writes * 1000.0 / (N - failed), wbytes / 1024.0 * 1000.0 / (N - failed),
-         erases * 1000.0 / (N - failed), ebytes / 1024.0 * 1000.0 / (N - failed), exp_calls, exp_us / 1000.0 / exp_calls, exp_max / 1000.0,
-         us.used_space_bytes / 1024);
+         erases * 1000.0 / (N - failed), ebytes / 1024.0 * 1000.0 / (N - failed), r.exp_calls,
+         r.exp_us / 1000.0 / r.exp_calls, r.exp_max / 1000.0, us.used_space_bytes / 1024);
+  wear_report("B1");
   return failed ? 1 : 0;
+}
+
+/* ---- R19: erases spread over the partition ------------------------------- */
+// First-fit from offset 0 put most erases on the first few hundred KiB: the
+// hottest sector took ~7.6x the mean on this load, and the flash wears out at
+// its hottest sector. The wear-leveling allocator (timeseries_data.h) keeps it
+// near 1.5x.
+#define R19_INSERTS 100000
+#define R19_MAX_RATIO 2.0
+static int t_wear_spread(void) {
+  timeseries_clear_all();
+  wear_reset();
+  hb_result_t r = heartbeat_load(R19_INSERTS, 0.35f);
+  double ratio = wear_report("R19");
+  printf("R19: %u inserts, %u failed; hottest sector %.2fx the mean (limit %.1f)\n", R19_INSERTS, r.failed, ratio,
+         R19_MAX_RATIO);
+  if (r.failed || ratio > R19_MAX_RATIO) {
+    printf("R19: FAIL erases concentrate on part of the partition\n");
+    return 1;
+  }
+  return 0;
+}
+
+/* ---- R20: compaction never needs one large contiguous region -------------- */
+// At 70% usage free space is fragmented, more so with a rotating allocation
+// origin. A compaction that reserved its whole source size in one region
+// (120 KiB here) then found none and every insert failed; outputs now
+// continue in pages of at most TSDB_STREAM_PAGE_MAX_SIZE.
+#define R20_INSERTS 100000
+static int t_fill_seventy(void) {
+  timeseries_clear_all();
+  hb_result_t r = heartbeat_load(R20_INSERTS, 0.70f);
+  printf("R20: %u inserts at a 70%% usage threshold, %u failed; smallest largest-free-run %" PRIu32 " KiB\n",
+         R20_INSERTS, r.failed, r.min_free_run / 1024);
+  if (r.failed) {
+    printf("R20: FAIL inserts failed for lack of contiguous space\n");
+    return 1;
+  }
+  return 0;
 }
 
 int retention_main(const char* which) {
@@ -487,7 +586,8 @@ int retention_main(const char* which) {
     int (*fn)(void);
   } t[] = {{"R14", t_expiration_horizon_interleaved}, {"R15", t_compaction_time_contiguous},
            {"R16", t_backfill_before_horizon},        {"R17", t_restart_between_runs},
-           {"R18", t_trim_failure},                   {"B1", t_bench_wear_latency}};
+           {"R18", t_trim_failure},                   {"R19", t_wear_spread},
+           {"R20", t_fill_seventy},                   {"B1", t_bench_wear_latency}};
   int bad = 0;
   for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
     if (strcmp(which, "all") ? strcmp(which, t[i].name) : t[i].name[0] == 'B') continue;  // benchmarks on request

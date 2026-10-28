@@ -65,6 +65,22 @@ Configure via `idf.py menuconfig` under **ESP IDF Timeseries Configuration**:
 | `TIMESERIES_ENABLE_CACHE_STATS` | `n` | Track and log cache hit/miss statistics |
 | `TIMESERIES_CHUNK_BUFFER_SIZE` | `16` | Initial chunk write buffer size in KB (4-64) |
 | `TIMESERIES_ALP_CHUNK_MAX_POINTS` | `1024` | Max points per ALP compaction record (16-65535) |
+| `TIMESERIES_WHEN_FULL` | Drop the oldest data | When the partition is full: keep recording by dropping the oldest data, or stop recording (inserts fail) |
+| `TIMESERIES_INSERT_RESERVE_KB` | `64` | Usable free space inserts leave for compaction and expiration (at most 1/8 of the partition) |
+| `TIMESERIES_MAINTENANCE_RESERVE_KB` | `32` | Usable free space compaction leaves for expiration (at most 1/16 of the partition) |
+| `TIMESERIES_CLEAR_FREE_KB` | `128` | Drop-oldest only: the background task expires the oldest data below this much usable free space |
+| `TIMESERIES_MAX_USAGE_PERCENT` | `0` | Drop-oldest only: also expire the oldest data above this usage (0 = off); trades capacity for flash life |
+
+### A full partition
+
+Compaction and expiration write before they free, so inserts leave free space
+for them (the reserves above). With *drop the oldest data* (the default), the
+background task expires the oldest data before free space runs out, and an
+insert that still finds no room drops the oldest page, which needs no free
+space at all. Records of the same series that overlap a dropped page in time
+are dropped with it, so an overwritten value never reappears. With *stop
+recording*, inserts fail once the partition is full; `timeseries_expire()`
+makes room again.
 
 ## API Reference
 
@@ -257,7 +273,8 @@ bool timeseries_compact_force_sync(void);
 ### Expiration
 
 ```c
-// Expire old data based on configured retention policies.
+// Expire the oldest 5% of the partition once usage is above 50%. On a full,
+// fragmented partition it drops the oldest page first if needed.
 bool timeseries_expire(void);
 ```
 

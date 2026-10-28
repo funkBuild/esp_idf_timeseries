@@ -1,5 +1,6 @@
 #include "timeseries_data.h"
 #include "timeseries_epoch.h"
+#include "timeseries_expiration.h"
 #include "timeseries_revision.h"
 #include "timeseries_flash_utils.h"
 #include "esp_log.h"
@@ -26,6 +27,11 @@ static const char *TAG = "TimeseriesData";
 // ---------------------------------------------------------------------------
 // Longest wait for retired space still read by another operation.
 #define TSDB_RETIRED_WAIT_MS 5000
+// Longest wait for a running compaction or expiration before an insert
+// without space gives up on it.
+#define TSDB_MAINTENANCE_WAIT_MS 10000
+// Most pages one insert drops to make room (db->space.drop_oldest).
+#define TSDB_EMERGENCY_MAX_DROPS 64
 
 // Wear leveling (TSDB_WEAR_ROTATE_PAGES, timeseries_data.h).
 static uint32_t wear_origin(const timeseries_db_t *db) {
@@ -33,42 +39,150 @@ static uint32_t wear_origin(const timeseries_db_t *db) {
     return sectors ? ((atomic_load(&db->sequence_num) / TSDB_WEAR_ROTATE_PAGES) % sectors) * 4096 : 0;
 }
 
-// The first region of `size` bytes in the free runs of `occupied` that starts
-// at or after `origin`, else (wrapping) the first one from offset 0.
-// *out_run_start is the start of the free run holding it.
-static bool find_free_region(timeseries_db_t *db, tsdb_page_cache_snapshot_t *occupied, uint32_t size,
-                             uint32_t origin, uint32_t *out_offset, uint32_t *out_run_start) {
+// Free space and reserves (timeseries_data.h).
+void tsdb_space_config_default(timeseries_db_t *db) {
+    db->space.insert_reserve = CONFIG_TIMESERIES_INSERT_RESERVE_KB * 1024u;
+    db->space.maintenance_reserve = CONFIG_TIMESERIES_MAINTENANCE_RESERVE_KB * 1024u;
+#ifdef CONFIG_TIMESERIES_WHEN_FULL_DROP_OLDEST
+    db->space.drop_oldest = true;
+    db->space.clear_free = CONFIG_TIMESERIES_CLEAR_FREE_KB * 1024u;
+    db->space.max_usage_percent = CONFIG_TIMESERIES_MAX_USAGE_PERCENT;
+#else
+    db->space.drop_oldest = false;
+    db->space.clear_free = 0;
+    db->space.max_usage_percent = 0;
+#endif
+    // A small partition keeps most of its space for data.
+    uint32_t size = db->partition ? db->partition->size : 0;
+    if (db->space.insert_reserve > size / 8) db->space.insert_reserve = size / 8;
+    if (db->space.maintenance_reserve > size / 16) db->space.maintenance_reserve = size / 16;
+    if (db->space.clear_free > size / 4) db->space.clear_free = size / 4;
+}
+
+static uint32_t usable_len(uint32_t len) { return len >= TSDB_USABLE_RUN_MIN ? len : 0; }
+
+// Usable free space after taking [start, start + size) out of the free run
+// [run, run_end), given `usable` before.
+static uint32_t usable_after(uint32_t usable, uint32_t run, uint32_t run_end, uint32_t start, uint32_t size) {
+    return usable - usable_len(run_end - run) + usable_len(start - run) + usable_len(run_end - start - size);
+}
+
+// Calls visit(ctx, run, run_end) for each free run of `occupied`, in offset
+// order. The iterator may return one free run in pieces (it splits at
+// OBSOLETE cache entries); adjacent pieces are joined.
+typedef bool (*free_run_visit_t)(void *ctx, uint32_t run, uint32_t run_end);
+static bool visit_free_runs(timeseries_db_t *db, tsdb_page_cache_snapshot_t *occupied, free_run_visit_t visit,
+                            void *ctx) {
     timeseries_blank_iterator_t it;
     if (!timeseries_blank_iterator_init_with_snapshot(db, &it, 4096, occupied)) return false;
-    bool have_first = false, found = false;
-    uint32_t first = 0, run = 0, run_end = 0, piece = 0, piece_size = 0;
-    while (!found && timeseries_blank_iterator_next(&it, &piece, &piece_size)) {
-        // The iterator may return one free run in pieces (it splits at
-        // OBSOLETE cache entries); join adjacent pieces.
-        if (run_end && piece == run_end) {
+    bool have = false, more = true;
+    uint32_t run = 0, run_end = 0, piece = 0, piece_size = 0;
+    while (more) {
+        more = timeseries_blank_iterator_next(&it, &piece, &piece_size);
+        if (more && have && piece == run_end) {
             run_end += piece_size;
-        } else {
-            run = piece;
-            run_end = piece + piece_size;
+            continue;
         }
-        if (run_end - run < size) continue;
-        if (!have_first) {
-            have_first = true;
-            first = run;
-        }
-        uint32_t start = run < origin ? origin : run;
-        if (start < run_end && run_end - start >= size) {
-            *out_offset = start;
-            *out_run_start = run;
-            found = true;
-        }
+        if (have && !visit(ctx, run, run_end)) break;
+        have = true;
+        run = piece;
+        run_end = piece + piece_size;
     }
     timeseries_blank_iterator_deinit(&it);
-    if (!found && have_first) {
-        *out_offset = *out_run_start = first;
-        found = true;
+    return true;
+}
+
+static bool add_usable(void *ctx, uint32_t run, uint32_t run_end) {
+    *(uint32_t *)ctx += usable_len(run_end - run);
+    return true;
+}
+
+static uint32_t usable_free_in(timeseries_db_t *db, tsdb_page_cache_snapshot_t *occupied) {
+    uint32_t usable = 0;
+    if (occupied) visit_free_runs(db, occupied, add_usable, &usable);
+    return usable;
+}
+
+uint32_t tsdb_usable_free(timeseries_db_t *db) {
+    if (!db || !db->partition || !db->snapshot_mutex) return 0;
+    tsdb_page_cache_snapshot_t *occupied = tsdb_occupied_snapshot(db);
+    uint32_t usable = usable_free_in(db, occupied);
+    tsdb_snapshot_release(occupied);
+    atomic_store(&db->usable_free, usable);
+    return usable;
+}
+
+// The usable free space an allocation must leave: a task that frees space
+// (expiration) may use all of it.
+static uint32_t reserve_for(timeseries_db_t *db, bool l0) {
+    if (atomic_load(&db->reserve_exempt_task) == xTaskGetCurrentTaskHandle()) return 0;
+    return l0 ? db->space.insert_reserve : db->space.maintenance_reserve;
+}
+
+typedef struct {
+    uint32_t size, origin, keep, usable;
+    bool have_first, found;
+    uint32_t first, first_run, first_run_end, offset, run, run_end;
+} region_search_t;
+
+// The region within [run, run_end) that leaves at least `keep` usable free
+// space, starting at or after `start` if it can: placing it at the end of the
+// run keeps the rest of the run in one piece.
+static bool place_in_run(const region_search_t *s, uint32_t run, uint32_t run_end, uint32_t start,
+                         uint32_t *out) {
+    if (start < run || start >= run_end || run_end - start < s->size) return false;
+    if (!s->keep || usable_after(s->usable, run, run_end, start, s->size) >= s->keep) {
+        *out = start;
+        return true;
     }
-    return found;
+    uint32_t end = run_end - s->size;
+    if (usable_after(s->usable, run, run_end, end, s->size) < s->keep) return false;
+    *out = end;
+    return true;
+}
+
+static bool search_run(void *ctx, uint32_t run, uint32_t run_end) {
+    region_search_t *s = ctx;
+    uint32_t at = 0;
+    if (run_end - run < s->size) return true;
+    if (!s->have_first && place_in_run(s, run, run_end, run, &at)) {
+        s->have_first = true;
+        s->first = at;
+        s->first_run = run;
+        s->first_run_end = run_end;
+    }
+    if (!place_in_run(s, run, run_end, run < s->origin ? s->origin : run, &at)) return true;
+    s->offset = at;
+    s->run = run;
+    s->run_end = run_end;
+    s->found = true;
+    return false;
+}
+
+// The first region of `size` bytes in the free runs of `occupied` that starts
+// at or after `origin`, else (wrapping) the first one from offset 0, among
+// those that leave at least `keep` bytes of usable free space.
+// *out_run_start is the start of the free run holding it; *out_usable the
+// usable free space it leaves.
+static bool find_free_region(timeseries_db_t *db, tsdb_page_cache_snapshot_t *occupied, uint32_t size,
+                             uint32_t origin, uint32_t keep, uint32_t *out_offset, uint32_t *out_run_start,
+                             uint32_t *out_usable) {
+    region_search_t s = {.size = size, .origin = origin, .keep = keep, .usable = usable_free_in(db, occupied)};
+    if (!visit_free_runs(db, occupied, search_run, &s)) return false;
+    if (!s.found && s.have_first) {
+        s.offset = s.first;
+        s.run = s.first_run;
+        s.run_end = s.first_run_end;
+        s.found = true;
+    }
+    if (!s.found) {
+        *out_usable = s.usable;
+        return false;
+    }
+    *out_offset = s.offset;
+    *out_run_start = s.run;
+    *out_usable = usable_after(s.usable, s.run, s.run_end, s.offset, size);
+    return true;
 }
 
 // A region that starts inside a free run can lie inside the extent of an old
@@ -116,16 +230,22 @@ static bool reserve_region(timeseries_db_t *db, uint32_t min_size, tsdb_page_cac
     // When only retired space would fit, wait (bounded) for the operations
     // that may still read it instead of failing: they are short readers or
     // are about to leave, and space retired a moment ago is not "full".
-    uint32_t region_ofs = 0, run_start = 0;
+    // An L0 page leaves the insert reserve, any other region the maintenance
+    // reserve (timeseries_data.h).
+    uint32_t region_ofs = 0, run_start = 0, usable = 0;
     uint32_t origin = !cursor ? wear_origin(db) : *cursor < db->partition->size ? *cursor & ~0xFFFu : 0;
+    uint32_t keep = reserve_for(db, cursor != NULL);
     TickType_t wait_start = xTaskGetTickCount();
     for (;;) {
         tsdb_page_cache_snapshot_t *occupied = tsdb_occupied_snapshot(db);
-        bool found = occupied && find_free_region(db, occupied, reserve_size, origin, &region_ofs, &run_start);
+        bool found = occupied && find_free_region(db, occupied, reserve_size, origin, keep, &region_ofs, &run_start,
+                                                  &usable);
         tsdb_snapshot_release(occupied);
+        if (occupied) atomic_store(&db->usable_free, usable);
         if (found) break;
         if (!occupied || !tsdb_retired_pinned_by_others(db) ||
             (TickType_t)(xTaskGetTickCount() - wait_start) > pdMS_TO_TICKS(TSDB_RETIRED_WAIT_MS)) {
+            if (occupied) atomic_fetch_add(&db->no_room_count, 1);
             xSemaphoreGive(db->region_alloc_mutex);
             return false;
         }
@@ -183,6 +303,29 @@ bool tsdb_reserve_blank_region(timeseries_db_t *db, uint32_t min_size,
                                 tsdb_page_cache_snapshot_t *batch_snapshot,
                                 uint32_t *out_offset, uint32_t *out_size) {
     return reserve_region(db, min_size, batch_snapshot, NULL, out_offset, out_size);
+}
+
+bool tsdb_l0_page_fits(timeseries_db_t *db) {
+    if (!db || !db->partition || !db->region_alloc_mutex || !db->snapshot_mutex) return false;
+    uint32_t keep = reserve_for(db, true), ofs = 0, run = 0, usable = 0;
+    TickType_t wait_start = xTaskGetTickCount();
+    xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
+    for (;;) {
+        tsdb_page_cache_snapshot_t *occupied = tsdb_occupied_snapshot(db);
+        bool found = occupied && find_free_region(db, occupied, TIMESERIES_FIELD_DATA_PAGE_SIZE, 0, keep, &ofs,
+                                                  &run, &usable);
+        tsdb_snapshot_release(occupied);
+        // As reserve_region: space another operation may still read is about
+        // to be free, so wait for it rather than report no room.
+        if (found || !occupied || !tsdb_retired_pinned_by_others(db) ||
+            (TickType_t)(xTaskGetTickCount() - wait_start) > pdMS_TO_TICKS(TSDB_RETIRED_WAIT_MS)) {
+            xSemaphoreGive(db->region_alloc_mutex);
+            return found;
+        }
+        xSemaphoreGive(db->region_alloc_mutex);
+        vTaskDelay(1);
+        xSemaphoreTake(db->region_alloc_mutex, portMAX_DELAY);
+    }
 }
 
 bool tsdb_finalize_reserved_region(timeseries_db_t *db, uint32_t offset,
@@ -385,6 +528,61 @@ static bool schema_changed(timeseries_db_t *db, const uint32_t *schema_gen, bool
   return true;
 }
 
+// Wait (bounded) while compaction or expiration holds the maintenance slot.
+static void wait_for_maintenance(timeseries_db_t *db) {
+  for (int wait = TSDB_MAINTENANCE_WAIT_MS; atomic_load(&db->compaction_in_progress) && wait > 0; wait -= 10)
+    vTaskDelay(pdMS_TO_TICKS(10));
+}
+
+// Called holding no page offsets and no locks, when no L0 page could be
+// created. A compaction frees space without losing data, so one runs first
+// (it also clears the oldest data when free space is low, timeseries.c).
+// With db->space.drop_oldest the oldest pages are then dropped until an L0
+// page fits: that allocates nothing, so it works however fragmented free
+// space is.
+static void make_room_for_l0(timeseries_db_t *db) {
+  tsdb_epoch_idle(db, true);  // waits holding no page offsets
+  tsdb_launch_compaction(db);
+  wait_for_maintenance(db);
+  tsdb_epoch_idle(db, false);
+  for (int drops = 0; db->space.drop_oldest && drops < TSDB_EMERGENCY_MAX_DROPS && !tsdb_l0_page_fits(db);
+       drops++) {
+    bool expected = false, dropped = false;
+    tsdb_epoch_idle(db, true);
+    for (int wait = TSDB_MAINTENANCE_WAIT_MS;
+         !atomic_compare_exchange_strong(&db->compaction_in_progress, &expected, true); wait -= 10) {
+      expected = false;
+      if (wait <= 0) {
+        tsdb_epoch_idle(db, false);
+        return;
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    tsdb_epoch_idle(db, false);
+    bool ok = tsdb_drop_oldest_page_held(db, &dropped);
+    atomic_store(&db->compaction_in_progress, false);
+    // The dropped pages are retired; this insert reads none of them again.
+    tsdb_epoch_quiesce(db);
+    if (!ok || !dropped) break;
+  }
+}
+
+// Creates a new L0 page, making room first if there is none. Called holding
+// flash_write_mutex; on failure it has been released.
+static bool create_l0_page_making_room(timeseries_db_t *db, const uint32_t *schema_gen, bool *stale,
+                                       uint32_t *out_offset) {
+  if (create_level0_field_page(db, out_offset)) return true;
+  ESP_LOGW(TAG, "No space for a new L0 page; making room");
+  if (db->flash_write_mutex) xSemaphoreGive(db->flash_write_mutex);
+  make_room_for_l0(db);
+  if (db->flash_write_mutex) tsdb_write_lock(db);
+  if (schema_changed(db, schema_gen, stale)) return false;
+  if (create_level0_field_page(db, out_offset)) return true;
+  ESP_LOGE(TAG, "No space for a new L0 page: the partition is full");
+  if (db->flash_write_mutex) xSemaphoreGive(db->flash_write_mutex);
+  return false;
+}
+
 bool tsdb_append_ordered_points_checked(timeseries_db_t *db, const unsigned char series_id[16],
                                         const uint64_t *timestamps, const timeseries_field_value_t *values,
                                         const tsdb_point_order_t *order, const uint32_t *schema_gen,
@@ -459,34 +657,7 @@ bool tsdb_append_ordered_points_checked(timeseries_db_t *db, const unsigned char
           // no L0 pages => create one
           ESP_LOGV(TAG, "No existing L0 pages => creating one...");
           uint32_t new_page_offset = 0;
-          if (!create_level0_field_page(db, &new_page_offset)) {
-            // No space — trigger background compaction and retry once
-            ESP_LOGW(TAG, "No space for L0 page, triggering background compaction...");
-            if (db->flash_write_mutex) {
-              xSemaphoreGive(db->flash_write_mutex);
-            }
-            // Launch compaction on background task (dedicated stack) and wait
-            tsdb_launch_compaction(db);
-            // Wait for compaction to finish (already running or just launched)
-            int wait = 10000;
-            tsdb_epoch_idle(db, true);  // waits holding no page offsets
-            while (atomic_load(&db->compaction_in_progress) && wait > 0) {
-              vTaskDelay(pdMS_TO_TICKS(10));
-              wait -= 10;
-            }
-            tsdb_epoch_idle(db, false);
-            if (db->flash_write_mutex) {
-              tsdb_write_lock(db);
-            }
-            if (schema_changed(db, schema_gen, stale)) return false;
-            if (!create_level0_field_page(db, &new_page_offset)) {
-              ESP_LOGE(TAG, "Failed to create L0 page even after compaction.");
-              if (db->flash_write_mutex) {
-                xSemaphoreGive(db->flash_write_mutex);
-              }
-              return false;
-            }
-          }
+          if (!create_l0_page_making_room(db, schema_gen, stale, &new_page_offset)) return false;
           // now try again
           continue;
         } else {
@@ -496,34 +667,7 @@ bool tsdb_append_ordered_points_checked(timeseries_db_t *db, const unsigned char
             ESP_LOGV(TAG, "All L0 pages full => creating new L0 page (progress: %zu/%zu points)",
                      count - remaining, count);
             uint32_t new_page_offset = 0;
-            if (!create_level0_field_page(db, &new_page_offset)) {
-              // No space — trigger background compaction and retry once
-              ESP_LOGW(TAG, "No space for new L0 page, triggering background compaction...");
-              if (db->flash_write_mutex) {
-                xSemaphoreGive(db->flash_write_mutex);
-              }
-              // Launch compaction on background task (dedicated stack) and wait
-              tsdb_launch_compaction(db);
-              // Wait for compaction to finish (already running or just launched)
-              int wait = 10000;
-              tsdb_epoch_idle(db, true);  // waits holding no page offsets
-              while (atomic_load(&db->compaction_in_progress) && wait > 0) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                wait -= 10;
-              }
-              tsdb_epoch_idle(db, false);
-              if (db->flash_write_mutex) {
-                tsdb_write_lock(db);
-              }
-              if (schema_changed(db, schema_gen, stale)) return false;
-              if (!create_level0_field_page(db, &new_page_offset)) {
-                ESP_LOGE(TAG, "Failed to create new L0 page even after compaction.");
-                if (db->flash_write_mutex) {
-                  xSemaphoreGive(db->flash_write_mutex);
-                }
-                return false;
-              }
-            }
+            if (!create_l0_page_making_room(db, schema_gen, stale, &new_page_offset)) return false;
             ESP_LOGV(TAG, "Created new L0 page @0x%08" PRIX32, new_page_offset);
             continue;
           } else {

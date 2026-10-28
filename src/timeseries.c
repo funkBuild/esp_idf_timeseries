@@ -116,8 +116,13 @@ static void tsdb_compaction_oneshot_task(void *param) {
 
     for (;;) {
         ESP_LOGI(TAG, "Compaction task started");
+        uint32_t l0_before = atomic_load(&db->l0_page_count);
         int slot = tsdb_epoch_enter(db);
+        // Clear the oldest data first when space is low (db->space): a
+        // compaction writes its outputs before it frees its sources.
+        (void)tsdb_clear_space_held(db);
         bool success = timeseries_compact_all_levels(db);
+        tsdb_usable_free(db);
         tsdb_epoch_exit(db, slot);
         atomic_fetch_add(&db->compaction_generation, 1);
         ESP_LOGI(TAG, "Compaction task finished");
@@ -132,9 +137,11 @@ static void tsdb_compaction_oneshot_task(void *param) {
             atomic_store(&s_compaction_consecutive_failures, 0);
         }
 
-        // Re-check L0 count — inserts during compaction may have accumulated new pages
+        // Re-check L0 count — inserts during compaction may have accumulated
+        // new pages. A run that reduced none (no room: timeseries_compaction.c)
+        // is not repeated; the next insert that needs space launches one.
         uint32_t l0_count = atomic_load(&db->l0_page_count);
-        if (!atomic_load(&db->initialized) || l0_count < MIN_PAGES_FOR_COMPACTION) {
+        if (!atomic_load(&db->initialized) || l0_count < MIN_PAGES_FOR_COMPACTION || l0_count >= l0_before) {
             break;
         }
         ESP_LOGI(TAG, "Re-running compaction: %" PRIu32 " L0 pages accumulated", l0_count);
@@ -310,6 +317,8 @@ static tsdb_init_outcome_t init_locked(void) {
   // Initialize chunk size (default 500 points - optimal from performance testing)
   s_tsdb.chunk_size = 500;
 
+  tsdb_space_config_default(&s_tsdb);
+
   // Initialize series type cache (Phase 2 optimization)
   s_tsdb.type_cache_size = 128;  // Simple fixed-size cache
   s_tsdb.type_cache = (series_type_cache_entry_t*)calloc(s_tsdb.type_cache_size,
@@ -335,6 +344,9 @@ static tsdb_init_outcome_t init_locked(void) {
     ESP_LOGE(TAG, "Failed to create compaction_done semaphore");
     goto init_fail;
   }
+
+  atomic_store(&s_tsdb.reserve_exempt_task, (TaskHandle_t)NULL);
+  tsdb_usable_free(&s_tsdb);  // as of the loaded page cache
 
   atomic_store(&s_tsdb.initialized, true);
   atomic_store(&s_operations, 0);
@@ -811,11 +823,16 @@ static bool insert_ordered_once(const timeseries_insert_data_t *data, const tsdb
   ESP_LOGD(TAG, "Inserted %zu points in %zu fields for measurement '%s' in %.3f ms", data->num_points, data->num_fields,
            data->measurement_name, (end_time - start_time) / 1000.0);
 
-  // Auto-trigger background compaction when L0 page count is high enough
+  // Auto-trigger background maintenance when L0 page count is high enough,
+  // or to clear the oldest data when free space runs low.
   if (!any_field_failed && !atomic_load(&s_tsdb.compaction_in_progress)) {
     uint32_t l0_count = atomic_load(&s_tsdb.l0_page_count);
     if (l0_count >= MIN_PAGES_FOR_COMPACTION) {
       ESP_LOGI(TAG, "Auto-triggering compaction: %" PRIu32 " L0 pages", l0_count);
+      tsdb_launch_compaction(&s_tsdb);
+    } else if (tsdb_clear_space_needed(&s_tsdb)) {
+      ESP_LOGI(TAG, "Auto-triggering maintenance: %" PRIu32 " KiB usable free",
+               atomic_load(&s_tsdb.usable_free) / 1024);
       tsdb_launch_compaction(&s_tsdb);
     }
   }

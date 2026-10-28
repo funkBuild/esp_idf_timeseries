@@ -253,12 +253,25 @@ TEST_CASE("torn: intact records survive the startup repair untouched", "[torn][t
   torn_check_recovered(survivors, 2);
 }
 
-/* TS-2 / TS-5: a compaction output page stays FREE on flash (invisible to
- * startup and to 1.0.19) until finalize has written its final size and every
- * record; only then is it flipped to ACTIVE. */
+/* TS-2 / TS-5: a compaction output page is built in RAM and reaches flash
+ * only at finalize, into a region of exactly its size: FREE until every
+ * record is written, then flipped to ACTIVE. An unfinished output leaves
+ * nothing on flash for startup (or 1.0.19) to read. */
 #include "timeseries_page_stream_writer.h"
 
-TEST_CASE("torn: stream-writer output page is FREE until finalize", "[torn][ts2]") {
+static size_t torn_field_pages(timeseries_db_t *db) {
+  timeseries_page_cache_iterator_t it;
+  timeseries_page_header_t h;
+  uint32_t off, size;
+  size_t n = 0;
+  TEST_ASSERT_TRUE(timeseries_page_cache_iterator_init(db, &it));
+  while (timeseries_page_cache_iterator_next(&it, &h, &off, &size))
+    n += h.page_type == TIMESERIES_PAGE_TYPE_FIELD_DATA && h.page_state == TIMESERIES_PAGE_STATE_ACTIVE;
+  timeseries_page_cache_iterator_deinit(&it);
+  return n;
+}
+
+TEST_CASE("torn: stream-writer output page reaches flash only at finalize", "[torn][ts2]") {
   TEST_ASSERT_TRUE(timeseries_init());
   TEST_ASSERT_TRUE(timeseries_clear_all());
   TEST_ASSERT_TRUE(torn_insert(1));
@@ -266,8 +279,10 @@ TEST_CASE("torn: stream-writer output page is FREE until finalize", "[torn][ts2]
   const esp_partition_t *part = db->partition;
   uint8_t series_id[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
   timeseries_field_value_t val = {.type = TIMESERIES_FIELD_TYPE_FLOAT, .data.float_val = 1.5f};
+  const size_t pages0 = torn_field_pages(db);
 
-  // A finished page: ACTIVE, size shrunk from the 16 KiB reservation.
+  // A finished page: nothing on flash until finalize, then ACTIVE at its
+  // exact size (one record in 4 KiB, not the 16 KiB the writer expected).
   timeseries_page_stream_writer_t done = {0};
   TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &done, 1, 16384));
   TEST_ASSERT_TRUE(timeseries_page_stream_writer_begin_series(&done, series_id, TIMESERIES_FIELD_TYPE_FLOAT));
@@ -275,16 +290,17 @@ TEST_CASE("torn: stream-writer output page is FREE until finalize", "[torn][ts2]
   TEST_ASSERT_TRUE(timeseries_page_stream_writer_finalize_timestamp(&done));
   TEST_ASSERT_TRUE(timeseries_page_stream_writer_write_value(&done, &val));
   TEST_ASSERT_TRUE(timeseries_page_stream_writer_end_series(&done));
-  timeseries_page_header_t h;
-  TEST_ASSERT_EQUAL(ESP_OK, esp_partition_read(part, done.base_offset, &h, sizeof(h)));
-  TEST_ASSERT_EQUAL_HEX8(TIMESERIES_PAGE_STATE_FREE, h.page_state);
+  TEST_ASSERT_EQUAL(pages0, torn_field_pages(db));
+  TEST_ASSERT_FALSE(done.reserved);
   TEST_ASSERT_TRUE(timeseries_page_stream_writer_finalize(&done));
+  timeseries_page_header_t h;
   TEST_ASSERT_EQUAL(ESP_OK, esp_partition_read(part, done.base_offset, &h, sizeof(h)));
   TEST_ASSERT_EQUAL_HEX8(TIMESERIES_PAGE_STATE_ACTIVE, h.page_state);
   TEST_ASSERT_EQUAL_UINT32(4096, h.page_size);
   TEST_ASSERT_EQUAL_UINT32(TIMESERIES_MAGIC_NUM, h.magic_number);
+  TEST_ASSERT_EQUAL(pages0 + 1, torn_field_pages(db));
 
-  // An unfinished page, as a reset mid-compaction leaves it.
+  // An unfinished page, as a reset mid-compaction leaves it: only in RAM.
   timeseries_page_stream_writer_t cut = {0};
   TEST_ASSERT_TRUE(timeseries_page_stream_writer_init(db, &cut, 1, 8192));
   TEST_ASSERT_TRUE(timeseries_page_stream_writer_begin_series(&cut, series_id, TIMESERIES_FIELD_TYPE_FLOAT));
@@ -292,9 +308,9 @@ TEST_CASE("torn: stream-writer output page is FREE until finalize", "[torn][ts2]
   TEST_ASSERT_TRUE(timeseries_page_stream_writer_finalize_timestamp(&cut));
   TEST_ASSERT_TRUE(timeseries_page_stream_writer_write_value(&cut, &val));
   TEST_ASSERT_TRUE(timeseries_page_stream_writer_end_series(&cut));
-  uint32_t cut_offset = cut.base_offset;
-  TEST_ASSERT_EQUAL(ESP_OK, esp_partition_read(part, cut_offset, &h, sizeof(h)));
-  TEST_ASSERT_EQUAL_HEX8(TIMESERIES_PAGE_STATE_FREE, h.page_state);
+  TEST_ASSERT_FALSE(cut.reserved);
+  TEST_ASSERT_EQUAL(pages0 + 1, torn_field_pages(db));
+  timeseries_page_stream_writer_abort(&cut);  // frees the RAM page
   timeseries_deinit();  // "reset" before finalize
 
   TEST_ASSERT_TRUE(timeseries_init());
@@ -302,14 +318,11 @@ TEST_CASE("torn: stream-writer output page is FREE until finalize", "[torn][ts2]
   timeseries_page_cache_iterator_t it;
   TEST_ASSERT_TRUE(timeseries_page_cache_iterator_init(db, &it));
   uint32_t off, size;
-  bool cut_live = false, done_live = false;
-  while (timeseries_page_cache_iterator_next(&it, &h, &off, &size)) {
-    cut_live |= off == cut_offset;
-    done_live |= off == done.base_offset;
-  }
+  bool done_live = false;
+  while (timeseries_page_cache_iterator_next(&it, &h, &off, &size)) done_live |= off == done.base_offset;
   timeseries_page_cache_iterator_deinit(&it);
-  TEST_ASSERT_FALSE(cut_live);
   TEST_ASSERT_TRUE(done_live);
+  TEST_ASSERT_EQUAL(pages0 + 1, torn_field_pages(db));
   const uint64_t survivors[] = {1};
   TEST_ASSERT_TRUE(torn_matches(survivors, 1));
   TEST_ASSERT_TRUE(torn_insert(3));

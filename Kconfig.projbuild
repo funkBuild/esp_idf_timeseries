@@ -71,4 +71,70 @@ menu "ESP IDF Timeseries Configuration"
             Test builds may set a lower value (e.g. 200) to exercise chunking
             with small datasets.
 
+    menu "Free space and retention"
+
+        choice TIMESERIES_WHEN_FULL
+            prompt "When the partition is full"
+            default TIMESERIES_WHEN_FULL_DROP_OLDEST
+            help
+                What an insert does when no space is left for it.
+
+            config TIMESERIES_WHEN_FULL_DROP_OLDEST
+                bool "Drop the oldest data"
+                help
+                    Keep recording: delete the oldest data to make room. A
+                    background task also clears the oldest data before free
+                    space runs out (TIMESERIES_CLEAR_FREE_KB), so inserts
+                    rarely wait for it.
+
+            config TIMESERIES_WHEN_FULL_STOP
+                bool "Stop recording"
+                help
+                    Keep all stored data; inserts fail once the partition is
+                    full, until the application expires or deletes data.
+        endchoice
+
+        config TIMESERIES_INSERT_RESERVE_KB
+            int "Free space inserts leave for maintenance (KB)"
+            range 16 1024
+            default 64
+            help
+                An insert does not take a new page if that would leave less
+                than this much usable free space (free runs of at least
+                16 KB). Compaction and expiration need it to make space.
+                Capped at 1/8 of the partition.
+
+        config TIMESERIES_MAINTENANCE_RESERVE_KB
+            int "Free space compaction leaves for expiration (KB)"
+            range 0 1024
+            default 32
+            help
+                Compaction does not take a page if that would leave less than
+                this much usable free space. Expiration may use it. Keep it
+                below TIMESERIES_INSERT_RESERVE_KB. Capped at 1/16 of the
+                partition.
+
+        config TIMESERIES_CLEAR_FREE_KB
+            int "Clear the oldest data below this much free space (KB)"
+            depends on TIMESERIES_WHEN_FULL_DROP_OLDEST
+            range 0 65536
+            default 128
+            help
+                The background task expires the oldest data when usable free
+                space falls below this. 0 leaves clearing to inserts that
+                find no space. Capped at 1/4 of the partition.
+
+        config TIMESERIES_MAX_USAGE_PERCENT
+            int "Expire the oldest data above this usage (%)"
+            depends on TIMESERIES_WHEN_FULL_DROP_OLDEST
+            range 0 99
+            default 0
+            help
+                The background task also expires the oldest data while more
+                than this share of the partition is used. A fuller partition
+                erases its flash more often; a lower limit trades capacity
+                for flash life. 0 disables the limit.
+
+    endmenu
+
 endmenu

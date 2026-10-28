@@ -34,6 +34,7 @@ static struct {
   fault_clear_t clear;
 } s_fault;
 static size_t s_erases, s_full_erases, s_last_erase_offset, s_last_erase_length;
+static size_t s_first_erase_offset, s_first_erase_length;
 static bool s_fail_erases;
 
 /* Called by the esp_partition_read wraps: true fails the read. */
@@ -53,7 +54,10 @@ void tsdb_test_disarm_read_fault(void) { s_fault.armed = false; }
 /* Called by the esp_partition_erase_range wrap: false fails the erase. */
 bool tsdb_test_on_erase(const esp_partition_t *part, size_t offset, size_t length) {
   if (s_fail_erases) return false;
-  s_erases++;
+  if (!s_erases++) {
+    s_first_erase_offset = offset;
+    s_first_erase_length = length;
+  }
   s_last_erase_offset = offset;
   s_last_erase_length = length;
   bool full = offset == 0 && part && length >= part->size;
@@ -74,6 +78,7 @@ static void arm_fault(size_t start, size_t end, fault_clear_t clear) {
 
 static void reset_counters(void) {
   s_erases = s_full_erases = s_last_erase_offset = s_last_erase_length = 0;
+  s_first_erase_offset = s_first_erase_length = 0;
 }
 
 static void disarm(void) {
@@ -234,8 +239,10 @@ TEST_CASE("recovery: unreadable metadata page is erased alone; data pages surviv
   TEST_ASSERT_EQUAL(TIMESERIES_RECOVERY_PAGES_ERASED, report.action);
   TEST_ASSERT_EQUAL_UINT32(1, report.pages_erased);
   TEST_ASSERT_EQUAL(0, s_full_erases);
-  TEST_ASSERT_EQUAL(meta, s_last_erase_offset);
-  TEST_ASSERT_EQUAL(TIMESERIES_METADATA_PAGE_SIZE, s_last_erase_length);
+  // Recovery's own erase; opening then writes a new metadata page wherever
+  // the allocator puts it (the wear-leveling origin), which erases again.
+  TEST_ASSERT_EQUAL(meta, s_first_erase_offset);
+  TEST_ASSERT_EQUAL(TIMESERIES_METADATA_PAGE_SIZE, s_first_erase_length);
 
   // The names are gone with their page; the data pages were not touched, so
   // writing a measurement again (same series IDs) brings its points back.

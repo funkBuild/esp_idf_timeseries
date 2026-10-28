@@ -303,6 +303,13 @@ TEST_CASE("error: expire on empty db does not crash", "[error][expire]") {
 
 TEST_CASE("error: partition full graceful handling", "[error][full]") {
   ensure_clean();
+  // Inserts fail when full only with dropping of the oldest data off (the
+  // default drops it: timeseries_full_partition_test.c).
+  timeseries_db_t *db = timeseries_get_db_handle();
+  typeof(db->space) space = db->space;
+  db->space.drop_oldest = false;
+  db->space.clear_free = 0;
+  db->space.max_usage_percent = 0;
 
   // Strategy: Insert in rounds of 500 points, compacting after each round.
   // This keeps L0 page count low (avoiding OOM during compaction) and fills
@@ -366,6 +373,7 @@ TEST_CASE("error: partition full graceful handling", "[error][full]") {
   free(timestamps);
   free(values);
 
+  db->space = space;
   ESP_LOGI(TAG, "Partition full after %" PRIu32 " points inserted",
            (uint32_t)total_inserted);
   TEST_ASSERT_TRUE_MESSAGE(total_inserted > 0,

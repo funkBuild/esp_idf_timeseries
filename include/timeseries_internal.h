@@ -327,6 +327,20 @@ typedef struct {
   // Chunk size for large inserts (default 300)
   size_t chunk_size;
 
+  // Free space and retention (timeseries_data.h), from Kconfig at init. A
+  // zeroed database (built by hand in unit tests) has no reserves, bounds no
+  // compaction by free space, and stops when full.
+  struct {
+    uint32_t insert_reserve;      // usable free bytes an L0 page must leave
+    uint32_t maintenance_reserve; // usable free bytes compaction must leave
+    uint32_t clear_free;          // background clearing below this usable free
+    uint8_t max_usage_percent;    // background clearing above this usage (0 = off)
+    bool drop_oldest;             // an insert without space drops the oldest data
+  } space;
+  _Atomic uint32_t usable_free;           // as of the last allocation or reclaim
+  _Atomic TaskHandle_t reserve_exempt_task; // frees space (expiration): may use the reserves
+  _Atomic uint32_t no_room_count;         // allocations refused for lack of free space
+
   // Measurement ID cache (avoids per-insert flash scan)
 #define MEAS_ID_CACHE_SIZE 16
   meas_cache_entry_t *meas_cache; // heap-allocated array of MEAS_ID_CACHE_SIZE

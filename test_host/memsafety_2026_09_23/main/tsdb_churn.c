@@ -36,12 +36,13 @@
  * non-erased NOR flash; CONFIG_ESP_PARTITION_ERASE_CHECK). Count them here:
  * logging is disabled because the linux FreeRTOS port can preempt a task inside
  * printf and deadlock the next printer on the libc stdout lock (sim artifact). */
-#define REVIEW_MAX_SECTORS 1024  // 4 MiB of partition
+#define REVIEW_MAX_SECTORS 4096  // 16 MiB of partition
 static atomic_uint s_bad_writes;
 static atomic_uint s_writes;
 _Atomic uint64_t review_write_bytes, review_erase_bytes;
 atomic_uint review_erase_calls;
 atomic_uint review_sector_erases[REVIEW_MAX_SECTORS];  // per 4 KiB partition sector (wear phases)
+const unsigned review_max_sectors = REVIEW_MAX_SECTORS;
 esp_err_t __real_esp_partition_write(const esp_partition_t* p, size_t off, const void* src, size_t len);
 TaskHandle_t _Atomic review_fail_write_task;  // TSDB_REVIEW fault injection (tsdb_review_phases.c)
 _Atomic uint32_t review_fail_write_len, review_fail_write_offset;

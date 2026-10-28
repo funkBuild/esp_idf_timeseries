@@ -34,12 +34,16 @@ typedef struct {
  * using Gorilla compression for timestamps and values.
  */
 typedef struct timeseries_page_stream_writer {
-  // The database reference and current region info
+  // The database reference and the page under construction. The page is
+  // built in page_buf and written to flash at finalize, into a region of its
+  // exact size; offsets below are relative to the page start.
   timeseries_db_t *db;
-  uint32_t base_offset;
+  uint8_t *page_buf;
+  uint32_t base_offset;   // flash offset of the last page finalized
   uint32_t ts_end_offset;
   uint32_t write_ptr;
-  uint32_t capacity;
+  uint32_t capacity;      // bytes the page may use before the next one starts
+  bool reserved;          // base_offset is reserved for a page not yet finalized
   bool finalized;
   uint8_t level;         // level of every page this writer opens
   uint32_t source_left;  // source bytes not yet covered by finished pages (sizes the next page)
@@ -111,10 +115,10 @@ bool timeseries_page_stream_writer_finalize(
 /**
  * Abort the stream writer, cleaning up any in-progress state.
  *
- * Marks the partially-written page as OBSOLETE on flash so it will not
- * be re-scanned on reboot, and removes it from the page cache (or batch).
- * Must be called instead of finalize() when the write sequence fails
- * partway through.
+ * Frees the page under construction (nothing of it is on flash), and gives
+ * back the region of a page whose finalize failed. Pages already finalized
+ * stay with the caller. Must be called instead of finalize() when the write
+ * sequence fails partway through.
  */
 void timeseries_page_stream_writer_abort(
     timeseries_page_stream_writer_t *writer);

@@ -433,6 +433,7 @@ static int t_trim_failure(void) {
 extern _Atomic uint64_t review_write_bytes, review_erase_bytes;
 extern atomic_uint review_erase_calls;
 extern atomic_uint review_sector_erases[];
+extern const unsigned review_max_sectors;
 extern unsigned review_write_calls(void);
 
 typedef struct {
@@ -455,24 +456,34 @@ static uint32_t largest_free_run(void) {
   return big;
 }
 
-static hb_result_t heartbeat_load(unsigned n, float threshold) {
+// One heartbeat: 12 float fields at `ts`, values from the xorshift state *s.
+static bool heartbeat(uint64_t ts, uint32_t* s) {
   static const char* names[12] = {"f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11"};
   timeseries_field_value_t fv[12];
+  for (int f = 0; f < 12; f++) {
+    *s ^= *s << 13;
+    *s ^= *s >> 17;
+    *s ^= *s << 5;
+    fv[f].type = TIMESERIES_FIELD_TYPE_FLOAT;
+    fv[f].data.float_val = (double)(*s % 100000) / 7.0;
+  }
+  timeseries_insert_data_t d = {.measurement_name = "bench", .field_names = names, .field_values = fv,
+                                .num_fields = 12, .timestamps_ms = &ts, .num_points = 1};
+  return timeseries_insert(&d);
+}
+
+static hb_result_t heartbeat_load(unsigned n, float threshold) {
   hb_result_t r = {.min_free_run = UINT32_MAX};
   uint64_t ts = RS_TS0;
   uint32_t s = 12345;
   for (unsigned i = 0; i < n; i++) {
-    for (int f = 0; f < 12; f++) {
-      s ^= s << 13;
-      s ^= s >> 17;
-      s ^= s << 5;
-      fv[f].type = TIMESERIES_FIELD_TYPE_FLOAT;
-      fv[f].data.float_val = (double)(s % 100000) / 7.0;
-    }
     ts += 1000;
-    timeseries_insert_data_t d = {.measurement_name = "bench", .field_names = names, .field_values = fv,
-                                  .num_fields = 12, .timestamps_ms = &ts, .num_points = 1};
-    if (!timeseries_insert(&d)) r.failed++;
+    if (!heartbeat(ts, &s)) r.failed++;
+    if (getenv("B1_PROGRESS") && i % 10000 == 9999) {
+      printf("progress i=%u failed=%u used=%" PRIu32 " KiB usable_free=%" PRIu32 " KiB\n", i + 1, r.failed,
+             tsdb_pagecache_get_total_active_size(review_db()) / 1024, tsdb_usable_free(review_db()) / 1024);
+      fflush(stdout);
+    }
     if (i % 100 == 99) {
       // Settle compaction first: expiration needs the maintenance slot and
       // returns "busy" (doing nothing) while a compaction holds it.
@@ -497,7 +508,7 @@ static hb_result_t heartbeat_load(unsigned n, float threshold) {
 // Erase counts per sector since the last reset: hottest / mean.
 static double wear_report(const char* tag) {
   const esp_partition_t* part = review_db()->partition;
-  unsigned n = part->size / 4096, mx = 0, never = 0;
+  unsigned n = part->size / 4096 < review_max_sectors ? part->size / 4096 : review_max_sectors, mx = 0, never = 0;
   uint64_t sum = 0;
   for (unsigned i = 0; i < n; i++) {
     unsigned v = atomic_load(&review_sector_erases[i]);
@@ -512,7 +523,8 @@ static double wear_report(const char* tag) {
 }
 
 static void wear_reset(void) {
-  for (unsigned i = 0; i < review_db()->partition->size / 4096; i++) atomic_store(&review_sector_erases[i], 0);
+  for (unsigned i = 0; i < review_db()->partition->size / 4096 && i < review_max_sectors; i++)
+    atomic_store(&review_sector_erases[i], 0);
 }
 
 /* ---- B1: flash wear and expiration latency (benchmark, not in "all") ---- */
@@ -526,7 +538,9 @@ static int t_bench_wear_latency(void) {
   uint64_t wb0 = atomic_load(&review_write_bytes), eb0 = atomic_load(&review_erase_bytes);
   const char* env = getenv("B1_N");
   const unsigned N = env ? (unsigned)atoi(env) : 8000;
-  hb_result_t r = heartbeat_load(N, 0.35f);
+  // B1_THRESH=0.999: no application expiration, as in the product.
+  const char* thresh = getenv("B1_THRESH");
+  hb_result_t r = heartbeat_load(N, thresh ? (float)atof(thresh) : 0.35f);
   unsigned failed = r.failed;
   unsigned writes = review_write_calls() - w0, erases = atomic_load(&review_erase_calls) - e0;
   uint64_t wbytes = atomic_load(&review_write_bytes) - wb0, ebytes = atomic_load(&review_erase_bytes) - eb0;
@@ -580,6 +594,210 @@ static int t_fill_seventy(void) {
   return 0;
 }
 
+/* ---- R21: a full partition keeps recording -------------------------------- */
+// The product never expires data itself. Compaction and expiration write
+// before they free, so a full, fragmented partition wedged: an expiration
+// could not place its trims and so deleted nothing, a compaction could not
+// place its outputs, and every insert failed. Inserts now leave free space
+// for maintenance (timeseries_data.h), the background task clears the oldest
+// data before space runs out, and an insert that still finds none drops the
+// oldest page, which allocates nothing. 250k inserts span several turnovers
+// of the partition (the wedge appeared from about 184k inserts).
+#define R21_INSERTS 250000
+static uint64_t newest_points(uint64_t from_ts) {
+  const char* fn[1] = {"f0"};
+  timeseries_query_t q = {.measurement_name = "bench", .field_names = fn, .num_fields = 1,
+                          .start_ms = (int64_t)from_ts};
+  timeseries_query_result_t r;
+  memset(&r, 0, sizeof r);
+  if (!timeseries_query(&q, &r)) return 0;
+  uint64_t n = r.num_points;
+  timeseries_query_free_result(&r);
+  return n;
+}
+static int t_full_keeps_recording(void) {
+  timeseries_clear_all();
+  wear_reset();
+  hb_result_t r = heartbeat_load(R21_INSERTS, 0.999f);
+  uint64_t last = RS_TS0 + (uint64_t)R21_INSERTS * 1000;
+  uint64_t recent = newest_points(last - 999 * 1000);
+  uint32_t used = tsdb_pagecache_get_total_active_size(review_db());
+  double ratio = wear_report("R21");
+  printf("R21: %u inserts without expiration, %u failed; newest 1000 points stored=%" PRIu64 " (want 1000); used "
+         "%" PRIu32 " KiB of %" PRIu32 " KiB; hottest sector %.2fx the mean\n",
+         R21_INSERTS, r.failed, recent, used / 1024, review_db()->partition->size / 1024, ratio);
+  if (r.failed || recent != 1000) {
+    printf("R21: FAIL a full partition stopped recording\n");
+    return 1;
+  }
+  return 0;
+}
+
+/* ---- R22: "stop when full" recovers after expiration ------------------------ */
+// With drop_oldest off, inserts fail once the partition is full. The
+// reserves keep space for the application's expiration, which then makes
+// inserts possible again: freeing 10% (about 200 KiB) makes room for some
+// 1500 heartbeats of this load (about 150 bytes each once compacted).
+#define R22_AFTER 500
+static int t_full_stop_recovers(void) {
+  timeseries_db_t* db = review_db();
+  typeof(db->space) space = db->space;
+  db->space.drop_oldest = false;
+  db->space.clear_free = 0;
+  db->space.max_usage_percent = 0;
+  timeseries_clear_all();
+  uint64_t ts = RS_TS0;
+  uint32_t s = 12345;
+  unsigned n = 0;
+  bool filled = false;
+  // Settle compaction every 100 inserts, as heartbeat_load does: the host
+  // scheduler barely runs the background task while this task never blocks.
+  for (; n < 400000 && !filled; n++) {
+    ts += 1000;
+    filled = !heartbeat(ts, &s);
+    if (n % 100 == 99) timeseries_compact_sync();
+  }
+  for (int i = 0; i < 3000 && atomic_load(&db->compaction_in_progress); i++) vTaskDelay(pdMS_TO_TICKS(10));
+  uint32_t used0 = tsdb_pagecache_get_total_active_size(db), usable0 = tsdb_usable_free(db);
+  bool expired = timeseries_expiration_run(db, 0.01f, 0.10f);
+  uint32_t used1 = tsdb_pagecache_get_total_active_size(db), usable1 = tsdb_usable_free(db);
+  printf("R22: full: used %" PRIu32 " KiB, usable free %" PRIu32 " KiB; after expiration: used %" PRIu32
+         " KiB, usable free %" PRIu32 " KiB\n", used0 / 1024, usable0 / 1024, used1 / 1024, usable1 / 1024);
+  unsigned after = 0;
+  for (; after < R22_AFTER; after++) {
+    ts += 1000;
+    if (!heartbeat(ts, &s)) break;
+    if (after % 100 == 99) timeseries_compact_sync();
+  }
+  db->space = space;
+  printf("R22: first failed insert after %u inserts (filled=%d); expiration -> %d; then %u of %d inserts stored\n",
+         n, filled, expired, after, R22_AFTER);
+  if (!filled || !expired || after != R22_AFTER) {
+    printf("R22: FAIL a full partition could not expire its way back to recording\n");
+    return 1;
+  }
+  return 0;
+}
+
+/* ---- R23: dropping a page never brings back an overwritten value ---------- */
+// Points 0..999 are compacted into one L1 record; point 500 is then
+// overwritten (a newer revision, in an L0 page whose newest point is older
+// than the L1 page's). Dropping that L0 page alone would make the old value
+// of point 500 visible again, so the overlapping L1 record goes with it.
+static int t_drop_keeps_newest_revision(void) {
+  timeseries_db_t* db = review_db();
+  timeseries_clear_all();
+  const char* fn[1] = {"v"};
+  static uint64_t ts[1000];
+  static timeseries_field_value_t v[1000];
+  for (int k = 0; k < 1000; k++) {
+    ts[k] = RS_TS0 + (uint64_t)k * 1000;
+    v[k] = (timeseries_field_value_t){.type = TIMESERIES_FIELD_TYPE_FLOAT, .data.float_val = 1.0};
+  }
+  timeseries_insert_data_t d = {.measurement_name = "rv", .field_names = fn, .field_values = v, .num_fields = 1,
+                                .timestamps_ms = ts, .num_points = 1000};
+  bool ok = timeseries_insert(&d) && timeseries_compact_force_sync();
+  timeseries_field_value_t newer = {.type = TIMESERIES_FIELD_TYPE_FLOAT, .data.float_val = 2.0};
+  timeseries_insert_data_t o = {.measurement_name = "rv", .field_names = fn, .field_values = &newer,
+                                .num_fields = 1, .timestamps_ms = &ts[500], .num_points = 1};
+  ok = ok && timeseries_insert(&o);
+  for (int i = 0; i < 3000 && atomic_load(&db->compaction_in_progress); i++) vTaskDelay(pdMS_TO_TICKS(10));
+  bool expected = false, dropped = false;
+  bool slot = atomic_compare_exchange_strong(&db->compaction_in_progress, &expected, true);
+  bool drop_ok = slot && tsdb_drop_oldest_page_held(db, &dropped);
+  if (slot) atomic_store(&db->compaction_in_progress, false);
+  timeseries_query_t q = {.measurement_name = "rv", .field_names = fn, .num_fields = 1};
+  timeseries_query_result_t r;
+  memset(&r, 0, sizeof r);
+  bool q_ok = timeseries_query(&q, &r);
+  int stale = 0;
+  for (size_t p = 0; q_ok && p < r.num_points; p++)
+    if (r.timestamps[p] == ts[500] && r.columns[0].values[p].data.float_val == 1.0) stale++;
+  size_t left = q_ok ? r.num_points : 0;
+  timeseries_query_free_result(&r);
+  printf("R23: setup -> %d; drop -> %d (dropped %d); points left %zu; overwritten value visible again %d (want 0)\n",
+         ok, drop_ok, dropped, left, stale);
+  if (!ok || !drop_ok || !dropped || !q_ok || stale || left >= 1000) {
+    printf("R23: FAIL dropping a page exposed an overwritten value (or dropped nothing)\n");
+    return 1;
+  }
+  return 0;
+}
+
+/* ---- R24: a full partition holds data, not deleted records ---------------- */
+// 1000 random doubles x 4 fields per insert (they barely compress), as the
+// QEMU test full_drop: the partition must hold many inserts' worth of live
+// data, with deleted records reclaimed rather than accumulating.
+static void space_report(const char* tag) {
+  timeseries_db_t* db = review_db();
+  uint32_t pages[6] = {0}, page_bytes[6] = {0}, live[6] = {0}, dead[6] = {0};
+  timeseries_page_cache_iterator_t it;
+  timeseries_page_header_t h;
+  uint32_t off, size;
+  timeseries_page_cache_iterator_init(db, &it);
+  while (timeseries_page_cache_iterator_next(&it, &h, &off, &size)) {
+    if (h.page_type != TIMESERIES_PAGE_TYPE_FIELD_DATA || h.page_state != TIMESERIES_PAGE_STATE_ACTIVE) continue;
+    int l = h.field_data_level < 5 ? h.field_data_level : 5;
+    pages[l]++;
+    page_bytes[l] += size;
+    timeseries_fielddata_iterator_t f;
+    timeseries_field_data_header_t r;
+    if (!timeseries_fielddata_iterator_init(db, off, size, &f)) continue;
+    while (timeseries_fielddata_iterator_next(&f, &r)) {
+      uint32_t b = sizeof(r) + r.record_length;
+      if (r.flags & TSDB_FIELDDATA_FLAG_DELETED) live[l] += b; else dead[l] += b;
+    }
+    timeseries_fielddata_iterator_deinit(&f);
+  }
+  timeseries_page_cache_iterator_deinit(&it);
+  for (int l = 0; l < 6; l++)
+    if (pages[l])
+      printf("%s: L%d %3" PRIu32 " pages %5" PRIu32 " KiB: live %5" PRIu32 " KiB, deleted %5" PRIu32 " KiB\n", tag, l,
+             pages[l], page_bytes[l] / 1024, live[l] / 1024, dead[l] / 1024);
+}
+#define R24_POINTS 1000
+static int t_full_random_batches(void) {
+  static const char* fields[4] = {"a", "b", "c", "d"};
+  static uint64_t ts[R24_POINTS];
+  static timeseries_field_value_t v[4 * R24_POINTS];
+  timeseries_clear_all();
+  uint32_t s = 12345, failed = 0;
+  const int inserts = (int)(review_db()->partition->size / 12000);
+  uint64_t t = 1000000;
+  for (int i = 0; i < inserts; i++, t += R24_POINTS * 1000) {
+    for (size_t k = 0; k < R24_POINTS; k++) ts[k] = t + k * 1000;
+    for (size_t k = 0; k < 4 * R24_POINTS; k++) {
+      s ^= s << 13;
+      s ^= s >> 17;
+      s ^= s << 5;
+      v[k].type = TIMESERIES_FIELD_TYPE_FLOAT;
+      v[k].data.float_val = (double)s / 7.0;
+    }
+    timeseries_insert_data_t d = {.measurement_name = "full", .field_names = fields, .field_values = v,
+                                  .num_fields = 4, .timestamps_ms = ts, .num_points = R24_POINTS};
+    if (!timeseries_insert(&d)) failed++;
+  }
+  for (int i = 0; i < 6000 && atomic_load(&review_db()->compaction_in_progress); i++) vTaskDelay(pdMS_TO_TICKS(10));
+  const char* fn[1] = {"a"};
+  timeseries_query_t q = {.measurement_name = "full", .field_names = fn, .num_fields = 1};
+  timeseries_query_result_t r;
+  memset(&r, 0, sizeof r);
+  size_t stored = timeseries_query(&q, &r) ? r.num_points : 0;
+  uint64_t last = t - R24_POINTS * 1000;
+  size_t newest = 0;
+  for (size_t p = 0; p < stored; p++) newest += r.timestamps[p] >= last;
+  timeseries_query_free_result(&r);
+  space_report("R24");
+  printf("R24: %d inserts, %" PRIu32 " failed; field a holds %zu points (%zu of the newest insert's %d)\n", inserts,
+         failed, stored, newest, R24_POINTS);
+  // The partition holds roughly 50 inserts of this data.
+  if (failed || newest != R24_POINTS || stored < 20 * R24_POINTS) {
+    printf("R24: FAIL a full partition lost recent data\n");
+    return 1;
+  }
+  return 0;
+}
+
 int retention_main(const char* which) {
   struct {
     const char* name;
@@ -587,7 +805,10 @@ int retention_main(const char* which) {
   } t[] = {{"R14", t_expiration_horizon_interleaved}, {"R15", t_compaction_time_contiguous},
            {"R16", t_backfill_before_horizon},        {"R17", t_restart_between_runs},
            {"R18", t_trim_failure},                   {"R19", t_wear_spread},
-           {"R20", t_fill_seventy},                   {"B1", t_bench_wear_latency}};
+           {"R20", t_fill_seventy},                   {"R21", t_full_keeps_recording},
+           {"R22", t_full_stop_recovers},             {"R23", t_drop_keeps_newest_revision},
+           {"R24", t_full_random_batches},
+           {"B1", t_bench_wear_latency}};
   int bad = 0;
   for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
     if (strcmp(which, "all") ? strcmp(which, t[i].name) : t[i].name[0] == 'B') continue;  // benchmarks on request

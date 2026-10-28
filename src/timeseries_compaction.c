@@ -38,6 +38,10 @@ static const char* TAG = "TimeseriesCompaction";
  */
 #define TSDB_MAX_LEVEL 4
 
+/* Most runs of one level in a forced compaction (each merges at most
+ * MAX_PAGES_PER_LEVEL pages, and only as many as free space allows). */
+#define TSDB_MAX_RUNS_PER_LEVEL 64
+
 // -----------------------------------------------------------------------------
 // Forward Declarations
 // -----------------------------------------------------------------------------
@@ -72,6 +76,9 @@ bool timeseries_compact_all_levels(timeseries_db_t* db) {
   for (uint8_t from_level = 0; from_level < TSDB_MAX_LEVEL; from_level++) {
     uint8_t to_level = (uint8_t)(from_level + 1);
 
+    // One run per level: a run merges the oldest pages free space allows, and
+    // the background task runs again while L0 pages accumulate.
+
     // 1) Figure out how many pages are at `from_level`
     tsdb_level_page_t* pages = NULL;
     size_t page_count = 0;
@@ -81,22 +88,20 @@ bool timeseries_compact_all_levels(timeseries_db_t* db) {
       ESP_LOGE(TAG, "Failed listing pages at level %u", from_level);
       return false;
     }
+    free(pages);
 
     // If no pages or fewer than MIN_PAGES_FOR_COMPACTION, skip compaction
     if (page_count < MIN_PAGES_FOR_COMPACTION) {
-      free(pages);
       ESP_LOGV(TAG, "Level-%u has %zu page(s), below threshold=%d => skip", from_level, page_count,
                MIN_PAGES_FOR_COMPACTION);
       continue;
     }
-    free(pages);
 
     int64_t start_time = esp_timer_get_time();
 
     // 2) We have enough pages => do the actual compaction
     if (!timeseries_compact_level_pages(db, from_level, to_level)) {
       ESP_LOGE(TAG, "Compaction from level %u to %u failed.", from_level, to_level);
-      // Decide if you want to continue or break on failure
       return false;
     }
 
@@ -137,6 +142,7 @@ bool timeseries_compact_all_levels_force(timeseries_db_t* db) {
 
     // A run claims at most MAX_PAGES_PER_LEVEL. Drain additional batches
     // before moving upward, including a final batch below the normal threshold.
+    int runs = 0;
     while (true) {
       size_t page_count = 0;
       int64_t start_time = esp_timer_get_time();
@@ -148,7 +154,9 @@ bool timeseries_compact_all_levels_force(timeseries_db_t* db) {
       int64_t elapsed = esp_timer_get_time() - start_time;
       ESP_LOGI(TAG, "Force compaction from level %u to %u took %"PRIu32".%03"PRIu32" ms",
                from_level, to_level, (uint32_t)(elapsed / 1000), (uint32_t)(elapsed % 1000));
-      if (page_count < MAX_PAGES_PER_LEVEL) break;
+      // A run takes the oldest pages free space allows; the next run takes
+      // the rest, until the level is empty.
+      if (++runs == TSDB_MAX_RUNS_PER_LEVEL) break;
     }
   }
 
@@ -273,6 +281,31 @@ static bool compact_level_pages(timeseries_db_t* db, uint8_t from_level,
     free(pages);
     return true;
   }
+  // A run holds its outputs and its sources until it publishes: take only
+  // the oldest pages whose outputs fit in the usable free space above the
+  // insert reserve (timeseries_data.h), so the run completes alongside
+  // inserts; skip the run when none fits. Further runs take the rest. Above
+  // L0 an output can be as large as its sources (data that does not
+  // compress); L0 records are uncompressed, and even random doubles compress
+  // to under half.
+  if (db->space.insert_reserve) {
+    uint32_t usable = tsdb_usable_free(db);
+    uint32_t room = usable > db->space.insert_reserve ? usable - db->space.insert_reserve : 0, total = 0;
+    size_t within = 0;
+    for (; within < page_count; within++) {
+      uint32_t need = from_level ? pages[within].size : pages[within].size / 2;
+      if (need > room - total) break;
+      total += need;
+    }
+    if (within < page_count)
+      ESP_LOGI(TAG, "Level %u: room to compact %zu of %zu page(s) (%" PRIu32 " KiB usable free)", from_level, within,
+               page_count, usable / 1024);
+    if (!within) {
+      free(pages);
+      return true;
+    }
+    page_count = within;
+  }
 
   if (selected_count) *selected_count = page_count;
 
@@ -382,6 +415,17 @@ static bool tsdb_find_level_pages(timeseries_db_t* db, uint8_t source_level, tsd
   if (seen > found)
     ESP_LOGI(TAG, "Level %u has %zu pages; compacting the %zu oldest.", source_level, seen, found);
   timeseries_page_cache_iterator_deinit(&page_iter);
+  // Oldest first, so a run bounded by free space keeps the oldest span.
+  for (size_t i = 1; i < found; i++) {
+    for (size_t j = i; j > 0 && sequence[j - 1] > sequence[j]; j--) {
+      uint32_t seq = sequence[j];
+      sequence[j] = sequence[j - 1];
+      sequence[j - 1] = seq;
+      tsdb_level_page_t page = temp[j];
+      temp[j] = temp[j - 1];
+      temp[j - 1] = page;
+    }
+  }
 
   if (found == 0) {
     free(temp);
@@ -660,21 +704,20 @@ bool timeseries_compact_page_list(timeseries_db_t* db, const uint32_t* page_offs
 
   uint8_t *window = malloc(4096);
   if (!window) return false;
+  // A page that cannot be rewritten (no room for its live records) keeps its
+  // deleted records; the others are still rewritten. Stopping at the first
+  // failure left every later page holding deleted records for good.
+  bool ok = true;
   for (size_t i = 0; i < page_count; i++) {
     uint32_t old_page_ofs = page_offsets[i];
-    // Use our new helper function
     if (db->flash_write_mutex) tsdb_write_lock(db);
     bool rewritten = tsdb_rewrite_page_without_deleted(db, old_page_ofs, window, false);
     if (db->flash_write_mutex) xSemaphoreGive(db->flash_write_mutex);
-    if (!rewritten) {
-      // If there's a fatal error, stop
-      free(window);
-      return false;
-    }
+    if (!rewritten) ok = false;
   }
 
   free(window);
-  return true;
+  return ok;
 }
 
 bool timeseries_salvage_page_prefix(timeseries_db_t* db, uint32_t page_offset) {

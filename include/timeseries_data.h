@@ -66,6 +66,51 @@ bool tsdb_append_multiple_points(timeseries_db_t *db,
 #define TSDB_WEAR_ROTATE_PAGES 16u
 #endif
 
+/*
+ * Free space and reserves (db->space, set from Kconfig by
+ * tsdb_space_config_default()).
+ *
+ * Compaction and expiration write before they free: a compaction writes its
+ * outputs before it retires its sources, and an expiration trims the records
+ * that straddle its horizon before it deletes. Allocations therefore leave
+ * free space for them in tiers:
+ *
+ * - an L0 page (insert) leaves db->space.insert_reserve;
+ * - any other region (compaction, metadata) leaves maintenance_reserve;
+ * - a task that frees space (expiration, reserve_exempt_task) may use all.
+ *
+ * Space is counted in free runs of at least TSDB_USABLE_RUN_MIN: smaller
+ * holes rarely hold the pages maintenance writes. The count is a sum, not
+ * the largest run, because compaction and expiration outputs continue in
+ * further pages (TSDB_STREAM_PAGE_MAX_SIZE), and a page that fits no free
+ * run is split between records (timeseries_page_stream_writer.c).
+ *
+ * A compaction run takes only the oldest pages whose outputs fit in the
+ * usable free space above the insert reserve (above L0, outputs can be as
+ * large as their sources), so it completes alongside inserts.
+ *
+ * Reserves alone cannot keep a full partition writable: free space
+ * fragments until an expiration cannot place its trims. Dropping the oldest
+ * page allocates nothing (tsdb_drop_oldest_page_held(),
+ * timeseries_expiration.h): an expiration whose trims find no room drops
+ * one first, and with db->space.drop_oldest an insert that finds no room
+ * drops pages until an L0 page fits, while the background task clears the
+ * oldest data before free space gets that low (tsdb_clear_space_held()).
+ * Deleted records are reclaimed before any live data is cleared.
+ */
+#define TSDB_USABLE_RUN_MIN (16 * 1024u)
+
+/* From Kconfig, capped for a small partition (reserves at most 1/8 and 1/16
+ * of it, clearing below at most 1/4). db->partition must be set. */
+void tsdb_space_config_default(timeseries_db_t *db);
+/* Usable free space now (free runs of at least TSDB_USABLE_RUN_MIN), also
+ * stored in db->usable_free. Takes snapshot_mutex. */
+uint32_t tsdb_usable_free(timeseries_db_t *db);
+/* Whether a new L0 page would be granted now, leaving the insert reserve.
+ * Waits (bounded) for space another operation may still read, as the
+ * allocator does. */
+bool tsdb_l0_page_fits(timeseries_db_t *db);
+
 /**
  * @brief Reserve a blank region under the region_alloc_mutex.
  *

@@ -645,6 +645,10 @@ static int t_near_full_with_reader(void) {
   int bad = 0;
   timeseries_db_t* db = review_db();
   timeseries_clear_all();
+  // The scene takes every free region by hand: no free-space reserves, and
+  // no dropping of old data (this phase is about space a reader pins).
+  typeof(db->space) space = db->space;
+  memset(&db->space, 0, sizeof(db->space));
   atomic_store(&db->compaction_in_progress, true);  // no auto-compaction while the scene is set
   for (int k = 0; k < 64; k++) {
     uint32_t lv0[5];
@@ -676,7 +680,11 @@ static int t_near_full_with_reader(void) {
   TaskHandle_t h = spawn(&j);
   gate_arm(G_FD_INIT, h);
   xSemaphoreGive(j.start);
-  if (!gate_wait(G_FD_INIT, 20000)) { printf("R11: FAIL reader did not scan pages\n"); return 1; }
+  if (!gate_wait(G_FD_INIT, 20000)) {
+    printf("R11: FAIL reader did not scan pages\n");
+    db->space = space;
+    return 1;
+  }
   atomic_store(&db->compaction_in_progress, false);
   bool c = timeseries_compact_level0_pages(db);  // retires the L0 pages
   // Take all blank space again, except the retired L0 pages: the only space
@@ -706,6 +714,7 @@ static int t_near_full_with_reader(void) {
   }
   for (size_t i = 0; i < nheld; i++)
     if (held[i] != UINT32_MAX) tsdb_release_reserved_region(db, held[i], NULL);
+  db->space = space;
   return bad;
 }
 

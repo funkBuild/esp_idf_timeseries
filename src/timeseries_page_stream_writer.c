@@ -15,7 +15,7 @@
 #include "esp_timer.h"
 #include "gorilla/gorilla_stream_encoder.h"  // Gorilla streaming interface
 #include "timeseries_data.h"                 // for tsdb_reserve_blank_region, timeseries_blank_iterator_*
-#include "timeseries_flash_utils.h"          // for tsdb_round_up_4k, tsdb_safe_rewrite_page_header
+#include "timeseries_flash_utils.h"          // for tsdb_round_up_4k, tsdb_flash_write_byte
 #include "timeseries_internal.h"             // definition of timeseries_db_t, etc.
 #include "timeseries_iterator.h"             // for timeseries_blank_iterator_t
 
@@ -24,194 +24,67 @@
 
 static const char* TAG = "PAGE_STREAM_WRITER";
 
-/**
- * Copy a block of flash from src_offset to dst_offset in 1KB chunks.
- */
-static bool copy_flash_block(const esp_partition_t* part, uint32_t src_offset, uint32_t dst_offset, uint32_t size) {
-  if (!part) {
-    return false;
-  }
-  // Small fixed stack buffer instead of a per-call malloc: relocation is on the
-  // compaction task (6 KB stack) and only copies during region growth, so a
-  // modest 512-byte bounce buffer is both stack-safe and avoids the heap churn
-  // (and the OOM failure path) on every relocation.
-  uint8_t buf[512];
-
-  while (size > 0) {
-    uint32_t chunk = (size > sizeof(buf)) ? sizeof(buf) : size;
-    if (esp_partition_read(part, src_offset, buf, chunk) != ESP_OK) {
-      return false;
-    }
-    if (esp_partition_write(part, dst_offset, buf, chunk) != ESP_OK) {
-      return false;
-    }
-    src_offset += chunk;
-    dst_offset += chunk;
-    size -= chunk;
-  }
-  return true;
-}
-
-/**
- * Relocate the page region from old_offset to a new blank region of size
- * new_size. Copies old_size bytes of data.
- */
-static bool relocate_region(timeseries_page_stream_writer_t* writer_ctx, uint32_t old_offset, uint32_t old_size, uint32_t new_size,
-                            uint32_t* out_new_offset) {
-  timeseries_db_t* db = writer_ctx->db;
-  if (!db || !db->partition) {
-    return false;
-  }
-
-  // 1) Reserve a new blank region (mutex-protected)
-  uint32_t found_ofs = 0, found_sz = 0;
-  if (!tsdb_reserve_blank_region(db, new_size, writer_ctx->batch_snapshot, &found_ofs, &found_sz)) {
-    ESP_LOGE(TAG, "Failed to find blank region for size=%u", (unsigned int)new_size);
-    return false;
-  }
-
-  // 2) Copy old data to new
-  if (!copy_flash_block(db->partition, old_offset, found_ofs, old_size)) {
-    ESP_LOGE(TAG, "Failed copying region 0x%08" PRIx32 " => 0x%08" PRIx32, old_offset, found_ofs);
-    tsdb_release_reserved_region(db, found_ofs, writer_ctx->batch_snapshot);
-    return false;
-  }
-
-  *out_new_offset = found_ofs;
-  ESP_LOGV(TAG, "Relocated region 0x%08" PRIx32 " => 0x%08" PRIx32, old_offset, found_ofs);
-  return true;
-}
-
 // ----------------------------------------------------------------------
-// Gorilla stream flush callback & "ensure_capacity" usage
+// The page under construction
 // ----------------------------------------------------------------------
+//
+// A page is built in RAM (writer->page_buf, PSRAM via malloc) and written to
+// flash once, at finalize, into a region reserved at exactly its final size.
+// Nothing is reserved while records are encoded, a page never moves, and its
+// header is written once: shrinking a reserved page at finalize needed a
+// second erase of its first sector (page_size bits 0 -> 1) and left the
+// unused tail as a small hole other pages rarely fit. Offsets in the writer
+// (write_ptr, fd_hdr_offset, col_hdr_offset, ts_end_offset) are relative to
+// the page start.
 
 /**
- * Ensures that `writer->write_ptr + needed_bytes` fits within the allocated
- * region. If needed, relocate & double capacity.
+ * Ensures that `writer->write_ptr + needed_bytes` fits within the page. If it
+ * does not, the page grows to fit, rounded up to 4096.
  */
 static bool ensure_capacity(timeseries_page_stream_writer_t* writer, size_t needed_bytes) {
-  uint32_t region_end = writer->base_offset + writer->capacity;
-  // Compute available space with subtraction (never write_ptr + needed_bytes):
-  // the addition can wrap uint32 for a corrupt/huge needed_bytes and falsely
-  // report "fits", leading to an out-of-region flash write.
-  uint32_t avail = (writer->write_ptr <= region_end) ? (region_end - writer->write_ptr) : 0;
+  // Subtraction, never write_ptr + needed_bytes: the addition can wrap
+  // uint32 for a corrupt/huge needed_bytes and falsely report "fits".
+  uint32_t avail = writer->write_ptr <= writer->capacity ? writer->capacity - writer->write_ptr : 0;
   if (needed_bytes <= avail) {
     return true;  // enough space already
   }
-
-  // Need to relocate. Grow to exactly fit the request, rounded up to 4096.
-  // Invariant: needed_from_base > old_size (we only arrive here when the
-  // request does not fit), so new_size is always strictly > old_size.
-  uint32_t old_offset = writer->base_offset;
-  uint32_t old_size = writer->capacity;
-  uint32_t used_from_base = writer->write_ptr - writer->base_offset;
-  uint32_t needed_from_base = used_from_base + (uint32_t)needed_bytes;
-  uint32_t new_size = (needed_from_base + 4095u) & ~4095u;
-  uint32_t new_offset = 0;
-
-  ESP_LOGV(TAG, "Relocation needed: old=0x%08" PRIx32 " size %u => %u",
-           old_offset, (unsigned int)old_size, (unsigned int)new_size);
-
-  if (!relocate_region(writer, old_offset, old_size, new_size, &new_offset)) {
+  if (needed_bytes > writer->db->partition->size - writer->write_ptr) {
+    ESP_LOGE(TAG, "Page cannot hold %zu more bytes", needed_bytes);
     return false;
   }
-
-  ESP_LOGV(TAG, "Relocated: 0x%08" PRIx32 " => 0x%08" PRIx32, old_offset, new_offset);
-
-  // Add the new cache entry FIRST, before removing the old one.
-  // If the add fails, we keep old state intact (old page stays ACTIVE,
-  // old cache entry remains) so the writer is not left in an
-  // unrecoverable state.
-  timeseries_page_header_t verify_hdr;
-  if (esp_partition_read(writer->db->partition, new_offset, &verify_hdr, sizeof(verify_hdr)) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed reading header at new location 0x%08" PRIx32, new_offset);
-    tsdb_release_reserved_region(writer->db, new_offset, writer->batch_snapshot);
+  uint32_t new_size = tsdb_round_up_4k(writer->write_ptr + (uint32_t)needed_bytes);
+  uint8_t* grown = realloc(writer->page_buf, new_size);
+  if (!grown) {
+    ESP_LOGE(TAG, "OOM growing page buffer to %" PRIu32 " bytes", new_size);
     return false;
   }
-
-  ESP_LOGV(TAG, "After relocation: type=%u state=%u level=%u",
-           verify_hdr.page_type, verify_hdr.page_state, verify_hdr.field_data_level);
-  verify_hdr.page_size = new_size;
-  // The copy stays FREE on flash until finalize; only the cache sees it live.
-  verify_hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
-
-  if (writer->batch_snapshot) {
-    if (!tsdb_pagecache_batch_add(writer->batch_snapshot, new_offset, &verify_hdr)) {
-      ESP_LOGE(TAG, "OOM updating batch cache after relocation");
-      tsdb_release_reserved_region(writer->db, new_offset, writer->batch_snapshot);
-      return false;
-    }
-  } else {
-    if (!tsdb_pagecache_add_entry(writer->db, new_offset, &verify_hdr)) {
-      ESP_LOGE(TAG, "OOM updating page cache after relocation @0x%08" PRIx32, new_offset);
-      tsdb_release_reserved_region(writer->db, new_offset, writer->batch_snapshot);
-      return false;
-    }
-  }
-
-  // New cache entry succeeded. Now safe to remove old entry and mark old page OBSOLETE.
-  if (writer->batch_snapshot) {
-    tsdb_pagecache_batch_remove(writer->batch_snapshot, old_offset);
-  } else {
-    tsdb_pagecache_remove_entry(writer->db, old_offset);
-  }
-
-  // Mark old page as OBSOLETE on flash so it won't be found after reboot
-  // (ACTIVE=0x01 -> OBSOLETE=0x00 is bit-clearing, safe on NOR flash)
-  timeseries_page_header_t old_hdr;
-  if (esp_partition_read(writer->db->partition, old_offset, &old_hdr, sizeof(old_hdr)) == ESP_OK) {
-    old_hdr.page_state = TIMESERIES_PAGE_STATE_OBSOLETE;
-    esp_partition_write(writer->db->partition, old_offset, &old_hdr, sizeof(old_hdr));
-  }
-
-  // Recompute writer pointers relative to the new base.
-  // Using relative offsets avoids unsigned-wrap bugs when new_offset < old_offset.
-  writer->write_ptr = new_offset + (writer->write_ptr - writer->base_offset);
-  writer->fd_hdr_offset = new_offset + (writer->fd_hdr_offset - writer->base_offset);
-  writer->col_hdr_offset = new_offset + (writer->col_hdr_offset - writer->base_offset);
-  if (writer->ts_end_offset != 0) {
-    writer->ts_end_offset = new_offset + (writer->ts_end_offset - writer->base_offset);
-  }
-  writer->base_offset = new_offset;
+  memset(grown + writer->capacity, 0xFF, new_size - writer->capacity);
+  ESP_LOGV(TAG, "Page grows from %" PRIu32 " to %" PRIu32 " bytes", writer->capacity, new_size);
+  writer->page_buf = grown;
   writer->capacity = new_size;
+  return true;
+}
 
-  // Check again (subtraction-based to avoid uint32 wrap, as above)
-  region_end = writer->base_offset + writer->capacity;
-  uint32_t avail_after = (writer->write_ptr <= region_end) ? (region_end - writer->write_ptr) : 0;
-  if (needed_bytes > avail_after) {
-    ESP_LOGE(TAG, "Relocation insufficient for needed=%zu bytes", needed_bytes);
-    return false;
-  }
+// Copies `len` bytes to page offset `at`, inside the capacity already ensured.
+static void page_put(timeseries_page_stream_writer_t* writer, uint32_t at, const void* data, size_t len) {
+  if (len) memcpy(writer->page_buf + at, data, len);
+}
+
+// Appends `len` bytes at write_ptr, growing the page as needed.
+static bool page_append(timeseries_page_stream_writer_t* writer, const void* data, size_t len) {
+  if (!ensure_capacity(writer, len)) return false;
+  page_put(writer, writer->write_ptr, data, len);
+  writer->write_ptr += len;
   return true;
 }
 
 /**
- * Gorilla flush callback that writes compressed bytes directly to flash,
- * extending the region as needed.
+ * Gorilla flush callback: appends compressed bytes to the page.
  */
-static bool gorilla_flush_to_flash(void* context, const uint8_t* data, size_t len) {
+static bool gorilla_flush_to_page(void* context, const uint8_t* data, size_t len) {
   gorilla_flush_ctx_t* ctx = (gorilla_flush_ctx_t*)context;
-  timeseries_page_stream_writer_t* writer = ctx->writer;
-
-  // Ensure we have capacity
-  if (!ensure_capacity(writer, len)) {
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Flushing %zu bytes to flash @0x%08" PRIx32, len, writer->write_ptr);
-
-  // Write to flash
-  if (esp_partition_write(writer->db->partition, writer->write_ptr, data, len) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed writing Gorilla stream flush chunk");
-    return false;
-  }
-
-  // Advance
-  writer->write_ptr += len;
-  // Accumulate total
+  if (!page_append(ctx->writer, data, len)) return false;
   *(ctx->accum_bytes) += len;
-
   return true;
 }
 
@@ -235,74 +108,28 @@ static bool prepare_revisions(timeseries_page_stream_writer_t *writer, size_t co
   return tsdb_revision_encode(writer->point_revisions, count, revision, encoded, length, flags);
 }
 
-// Opens a new FREE output page at writer->level with room for `needed` bytes
+// Starts a new output page at writer->level with room for `needed` bytes
 // after its header: sized to the source bytes still expected, at most
-// TSDB_STREAM_PAGE_MAX_SIZE unless `needed` itself is larger. On failure the
-// writer is unchanged and nothing stays reserved.
+// TSDB_STREAM_PAGE_MAX_SIZE unless `needed` itself is larger. The header is
+// completed at finalize. On failure the writer is unchanged.
 static bool open_page(timeseries_page_stream_writer_t* writer, uint32_t needed) {
   timeseries_db_t* db = writer->db;
-  int64_t start_time = esp_timer_get_time();
-
-  // 1) Reserve a blank region (mutex-protected, registers placeholder in both snapshots)
   uint32_t want = writer->source_left < TSDB_STREAM_PAGE_MAX_SIZE ? writer->source_left : TSDB_STREAM_PAGE_MAX_SIZE;
-  if (needed > db->partition->size) return false;
+  if (needed > db->partition->size - sizeof(timeseries_page_header_t)) return false;
   uint32_t fit = needed + (uint32_t)sizeof(timeseries_page_header_t);
   uint32_t initial_size = tsdb_round_up_4k(want > fit ? want : fit);
-  uint32_t region_ofs = 0;
-  uint32_t found_page_size = 0;
-
-  if (!tsdb_reserve_blank_region(db, initial_size, writer->batch_snapshot, &region_ofs, &found_page_size)) {
-    ESP_LOGE(TAG, "Failed to find blank region (size=%u)", (unsigned int)initial_size);
+  uint8_t* buf = malloc(initial_size);
+  if (!buf) {
+    ESP_LOGE(TAG, "OOM allocating a %" PRIu32 "-byte page buffer", initial_size);
     return false;
   }
-  if (found_page_size < initial_size) {
-    ESP_LOGE(TAG, "Reserved region is smaller than requested (%u < %u)",
-             (unsigned int)found_page_size, (unsigned int)initial_size);
-    tsdb_release_reserved_region(db, region_ofs, writer->batch_snapshot);
-    return false;
-  }
-
-  int64_t end_time = esp_timer_get_time();
-  ESP_LOGI(TAG, "Reserved blank region in %.3f ms", (end_time - start_time) / 1000.0);
-
-  // 2) Write proper page header (replaces placeholder written by reserve)
-  timeseries_page_header_t hdr;
-  memset(&hdr, 0xFF, sizeof(hdr));
-  hdr.magic_number = TIMESERIES_MAGIC_NUM;
-  hdr.page_type = TIMESERIES_PAGE_TYPE_FIELD_DATA;
-  // FREE on flash until finalize: a reset mid-compaction must leave no
-  // partially written page for startup (or 1.0.19, which also skips FREE
-  // pages) to read. The live cache keeps the reservation's ACTIVE placeholder,
-  // which excludes other allocators meanwhile.
-  hdr.page_state = TIMESERIES_PAGE_STATE_FREE;
-  // Reserve a unique physical page sequence across concurrent allocations.
-  hdr.sequence_num = atomic_fetch_add(&db->sequence_num, 1) + 1;
-  hdr.field_data_level = writer->level;
-  hdr.page_size = found_page_size;
-
-  ESP_LOGV(TAG, "Init: Writing header @0x%08" PRIx32 " type=%u state=%u level=%u",
-           region_ofs, hdr.page_type, hdr.page_state, writer->level);
-
-  if (esp_partition_write(db->partition, region_ofs, &hdr, sizeof(hdr)) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed writing initial page header");
-    tsdb_release_reserved_region(db, region_ofs, writer->batch_snapshot);
-    return false;
-  }
-
-  // Verify the write by reading back
-  timeseries_page_header_t verify_hdr;
-  if (esp_partition_read(db->partition, region_ofs, &verify_hdr, sizeof(verify_hdr)) == ESP_OK) {
-    ESP_LOGV(TAG, "Init verify: type=%u state=%u level=%u",
-             verify_hdr.page_type, verify_hdr.page_state, verify_hdr.field_data_level);
-  }
-
-  ESP_LOGV(TAG, "Added initial page to cache @0x%08" PRIx32, region_ofs);
-
-  writer->base_offset = region_ofs;
-  writer->write_ptr = region_ofs + sizeof(timeseries_page_header_t);
-  writer->capacity = found_page_size;
+  memset(buf, 0xFF, initial_size);
+  free(writer->page_buf);
+  writer->page_buf = buf;
+  writer->base_offset = 0;
+  writer->write_ptr = sizeof(timeseries_page_header_t);
+  writer->capacity = initial_size;
   writer->finalized = false;
-
   return true;
 }
 
@@ -323,10 +150,11 @@ bool timeseries_page_stream_writer_init(timeseries_db_t* db, timeseries_page_str
 
 // Finishes the current page and continues the output in a new one. Called
 // only between records: a record never spans pages. The finished page is
-// published like a single output (batch or live cache); if the new page
-// cannot be opened, the caller's abort releases the finished one.
+// published like a single output (batch or live cache); if the output then
+// fails, the caller gives back the finished pages (a compaction batch is
+// abandoned whole).
 static bool rollover(timeseries_page_stream_writer_t* writer, uint32_t needed) {
-  uint32_t used = writer->write_ptr - writer->base_offset;
+  uint32_t used = writer->write_ptr;
   if (!timeseries_page_stream_writer_finalize(writer)) return false;
   writer->source_left = used < writer->source_left ? writer->source_left - used : 0;
   writer->finalized = false;  // the writer continues; abort now refers to the finished page
@@ -336,21 +164,20 @@ static bool rollover(timeseries_page_stream_writer_t* writer, uint32_t needed) {
 }
 
 static bool page_has_records(const timeseries_page_stream_writer_t* writer) {
-  return writer->write_ptr > writer->base_offset + sizeof(timeseries_page_header_t);
+  return writer->write_ptr > sizeof(timeseries_page_header_t);
 }
 
 // Room for a whole record of `needed` bytes at a record boundary: a new page
 // once this one holds records, else (one oversized record) a larger page.
 static bool make_room_for_record(timeseries_page_stream_writer_t* writer, uint32_t needed) {
-  uint32_t region_end = writer->base_offset + writer->capacity;
-  uint32_t avail = writer->write_ptr <= region_end ? region_end - writer->write_ptr : 0;
+  uint32_t avail = writer->write_ptr <= writer->capacity ? writer->capacity - writer->write_ptr : 0;
   if (needed <= avail) return true;
   if (page_has_records(writer)) return rollover(writer, needed);
   return ensure_capacity(writer, needed);
 }
 
 // Space left in a page below which a Gorilla-streamed record (size unknown
-// until it ends) starts a new page rather than grow this one by relocation.
+// until it ends) starts a new page rather than grow this one.
 #define SERIES_HEADROOM 4096u
 
 bool timeseries_page_stream_writer_begin_series(timeseries_page_stream_writer_t* writer,
@@ -358,8 +185,7 @@ bool timeseries_page_stream_writer_begin_series(timeseries_page_stream_writer_t*
   if (!writer || writer->finalized) {
     return false;
   }
-  uint32_t region_end = writer->base_offset + writer->capacity;
-  uint32_t avail = writer->write_ptr <= region_end ? region_end - writer->write_ptr : 0;
+  uint32_t avail = writer->write_ptr <= writer->capacity ? writer->capacity - writer->write_ptr : 0;
   if (avail < SERIES_HEADROOM && page_has_records(writer) && !rollover(writer, SERIES_HEADROOM)) {
     return false;
   }
@@ -368,6 +194,7 @@ bool timeseries_page_stream_writer_begin_series(timeseries_page_stream_writer_t*
   memset(&writer->fd_hdr, 0xff, sizeof(writer->fd_hdr));
   memcpy(writer->fd_hdr.series_id, series_id, 16);
   writer->fd_hdr.flags &= ~TSDB_FIELDDATA_FLAG_COMPRESSED;
+  if (!ensure_capacity(writer, sizeof(writer->fd_hdr) + sizeof(timeseries_col_data_header_t))) return false;
   writer->fd_hdr_offset = writer->write_ptr;
   writer->fd_hdr.record_count = 0;
   writer->fd_hdr.start_time = UINT64_MAX;
@@ -395,7 +222,7 @@ bool timeseries_page_stream_writer_begin_series(timeseries_page_stream_writer_t*
   // Initialize Gorilla streams
   // For timestamps we use GORILLA_STREAM_INT (64-bit integer deltas)
   if (!gorilla_stream_init(&writer->ts_stream, GORILLA_STREAM_INT,
-                           /*initial_xor=*/NULL, 0 /*leading_zeros*/, gorilla_flush_to_flash, &writer->ts_flush_ctx)) {
+                           /*initial_xor=*/NULL, 0 /*leading_zeros*/, gorilla_flush_to_page, &writer->ts_flush_ctx)) {
     ESP_LOGE(TAG, "Failed to init Gorilla ts_stream");
     return false;
   }
@@ -419,7 +246,7 @@ bool timeseries_page_stream_writer_begin_series(timeseries_page_stream_writer_t*
   }
 
   if (!gorilla_stream_init(&writer->val_stream, val_mode,
-                           /*initial_xor=*/NULL, 0 /*leading_zeros*/, gorilla_flush_to_flash, &writer->val_flush_ctx)) {
+                           /*initial_xor=*/NULL, 0 /*leading_zeros*/, gorilla_flush_to_page, &writer->val_flush_ctx)) {
     ESP_LOGE(TAG, "Failed to init Gorilla val_stream");
     // best-effort cleanup
     gorilla_stream_deinit(&writer->ts_stream);
@@ -597,10 +424,7 @@ bool timeseries_page_stream_writer_end_series(timeseries_page_stream_writer_t* w
            writer->fd_hdr.series_id[1], writer->fd_hdr.series_id[2], writer->fd_hdr.series_id[3],
            (unsigned int)col_hdr.ts_len, (unsigned int)col_hdr.val_len);
 
-  if (esp_partition_write(writer->db->partition, writer->col_hdr_offset, &col_hdr, sizeof(col_hdr)) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed patching col_data_header");
-    return false;
-  }
+  page_put(writer, writer->col_hdr_offset, &col_hdr, sizeof(col_hdr));
 
   // 5) If no points were added, fix the header's timestamps
   if (writer->fd_hdr.record_count == 0) {
@@ -621,12 +445,9 @@ bool timeseries_page_stream_writer_end_series(timeseries_page_stream_writer_t* w
   size_t revisions_len = 0;
   if (!prepare_revisions(writer, writer->fd_hdr.record_count, &revisions, &revisions_len, &writer->fd_hdr.flags))
     return false;
-  bool revisions_ok = revisions_len <= UINT16_MAX - total_col_bytes &&
-      ensure_capacity(writer, revisions_len) &&
-      esp_partition_write(writer->db->partition, writer->write_ptr, revisions, revisions_len) == ESP_OK;
+  bool revisions_ok = revisions_len <= UINT16_MAX - total_col_bytes && page_append(writer, revisions, revisions_len);
   free(revisions);
   if (!revisions_ok) return false;
-  writer->write_ptr += revisions_len;
   writer->fd_hdr.record_length = (uint16_t)(total_col_bytes + revisions_len);
 
   ESP_LOGI(TAG, "Series %02X%02X%02X%02X: record_count=%u, record_length=%u bytes (ts=%u, val=%u), times=[%" PRIu64 "-%" PRIu64 "]",
@@ -639,11 +460,7 @@ bool timeseries_page_stream_writer_end_series(timeseries_page_stream_writer_t* w
   ESP_LOGV(TAG, "Header offset=0x%08" PRIx32 ", col_hdr=0x%08" PRIx32, writer->fd_hdr_offset, writer->col_hdr_offset);
 
   // 7) Patch the field_data_header with the updated metadata
-  if (esp_partition_write(writer->db->partition, writer->fd_hdr_offset, &writer->fd_hdr, sizeof(writer->fd_hdr)) !=
-      ESP_OK) {
-    ESP_LOGE(TAG, "Failed patching field_data_header");
-    return false;
-  }
+  page_put(writer, writer->fd_hdr_offset, &writer->fd_hdr, sizeof(writer->fd_hdr));
 
   return true;
 }
@@ -687,43 +504,19 @@ static bool write_alp_with_revisions(
   // Clear COMPRESSED bit (0 = compressed) and ENCODING_ALP bit (0 = ALP)
   fd_hdr.flags = revision_flags & ~(TSDB_FIELDDATA_FLAG_COMPRESSED | TSDB_FIELDDATA_FLAG_ENCODING_ALP);
 
-  // Write fd_hdr
-  uint32_t fd_offset = sw->write_ptr;
-  if (esp_partition_write(sw->db->partition, fd_offset, &fd_hdr, sizeof(fd_hdr)) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed writing ALP fd_hdr @0x%08" PRIx32, fd_offset);
-    return false;
-  }
-  sw->write_ptr += sizeof(fd_hdr);
-
-  // Write col_hdr
+  // make_room_for_record ensured room for the whole record.
   timeseries_col_data_header_t col_hdr;
   col_hdr.ts_len  = (uint32_t)ts_len;
   col_hdr.val_len = (uint32_t)val_len;
-  if (esp_partition_write(sw->db->partition, sw->write_ptr, &col_hdr, sizeof(col_hdr)) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed writing ALP col_hdr");
-    return false;
-  }
+  page_put(sw, sw->write_ptr, &fd_hdr, sizeof(fd_hdr));
+  sw->write_ptr += sizeof(fd_hdr);
+  page_put(sw, sw->write_ptr, &col_hdr, sizeof(col_hdr));
   sw->write_ptr += sizeof(col_hdr);
-
-  // Write ALP timestamp blob
-  if (ts_len > 0) {
-    if (esp_partition_write(sw->db->partition, sw->write_ptr, ts_buf, ts_len) != ESP_OK) {
-      ESP_LOGE(TAG, "Failed writing ALP timestamp blob");
-      return false;
-    }
-    sw->write_ptr += ts_len;
-  }
-
-  // Write ALP value blob
-  if (val_len > 0) {
-    if (esp_partition_write(sw->db->partition, sw->write_ptr, val_buf, val_len) != ESP_OK) {
-      ESP_LOGE(TAG, "Failed writing ALP value blob");
-      return false;
-    }
-    sw->write_ptr += val_len;
-  }
-
-  if (esp_partition_write(sw->db->partition, sw->write_ptr, revisions, revisions_len) != ESP_OK) return false;
+  page_put(sw, sw->write_ptr, ts_buf, ts_len);
+  sw->write_ptr += ts_len;
+  page_put(sw, sw->write_ptr, val_buf, val_len);
+  sw->write_ptr += val_len;
+  page_put(sw, sw->write_ptr, revisions, revisions_len);
   sw->write_ptr += revisions_len;
 
   ESP_LOGD(TAG, "ALP series %02X%02X%02X%02X: count=%u, ts_len=%zu, val_len=%zu, times=[%" PRIu64 "-%" PRIu64 "]",
@@ -747,74 +540,105 @@ bool timeseries_page_stream_writer_write_alp_series(
   return ok;
 }
 
-bool timeseries_page_stream_writer_finalize(timeseries_page_stream_writer_t* writer) {
-  if (!writer || writer->finalized) {
-    return false;
-  }
+// Writes the records in page_buf[from, to) as one page, into a region of
+// exactly its size, and publishes it (batch or live cache). *placed is false
+// when no free region holds it: then nothing was written.
+static bool publish_span(timeseries_page_stream_writer_t* writer, uint32_t from, uint32_t to, bool* placed) {
+  timeseries_db_t* db = writer->db;
+  uint32_t used = (uint32_t)sizeof(timeseries_page_header_t) + (to - from);
+  uint32_t size = tsdb_round_up_4k(used);
+  uint32_t region_ofs = 0, region_size = 0;
+  *placed = false;
+  if (!tsdb_reserve_blank_region(db, size, writer->batch_snapshot, &region_ofs, &region_size)) return false;
+  *placed = true;
+  writer->base_offset = region_ofs;
+  writer->reserved = true;
 
-  // Figure out how many bytes we used
-  uint32_t used_bytes = writer->write_ptr - writer->base_offset;
-  uint32_t final_size = tsdb_round_up_4k(used_bytes);
-
-  // Read existing page header
+  // FREE until every byte is on flash: a reset in between leaves no partly
+  // written page for startup (or 1.0.19, which also skips FREE pages) to
+  // read. The live cache keeps the reservation's ACTIVE placeholder, which
+  // excludes other allocators.
   timeseries_page_header_t hdr;
-  if (esp_partition_read(writer->db->partition, writer->base_offset, &hdr, sizeof(hdr)) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed reading existing page header");
-    return false;
-  }
-  if (hdr.magic_number != TIMESERIES_MAGIC_NUM || hdr.page_state != TIMESERIES_PAGE_STATE_FREE) {
-    ESP_LOGE(TAG, "Page @0x%08" PRIx32 " is not an unpublished output page", writer->base_offset);
-    return false;
-  }
-
-  // 1) Final size while the page is still FREE: if the shrink needs a sector
-  //    erase, a reset in the middle loses only this invisible page (the
-  //    sources are retired after finalize). Any failure aborts (the caller
-  //    releases the page); nothing is retried over partly programmed bytes.
-  uint32_t old_page_size = hdr.page_size;
-  hdr.page_size = final_size;
-
-  if (!tsdb_safe_rewrite_page_header(writer->db->partition, writer->base_offset, &hdr, old_page_size)) {
-    ESP_LOGE(TAG, "Failed patching final page header");
-    return false;
+  memset(&hdr, 0xFF, sizeof(hdr));
+  hdr.magic_number = TIMESERIES_MAGIC_NUM;
+  hdr.page_type = TIMESERIES_PAGE_TYPE_FIELD_DATA;
+  hdr.page_state = TIMESERIES_PAGE_STATE_FREE;
+  // Reserve a unique physical page sequence across concurrent allocations.
+  hdr.sequence_num = atomic_fetch_add(&db->sequence_num, 1) + 1;
+  hdr.field_data_level = writer->level;
+  hdr.page_size = size;
+  if (esp_partition_write(db->partition, region_ofs, &hdr, sizeof(hdr)) != ESP_OK ||
+      (to > from &&
+       esp_partition_write(db->partition, region_ofs + sizeof(hdr), writer->page_buf + from, to - from) != ESP_OK)) {
+    ESP_LOGE(TAG, "Failed writing page @0x%08" PRIx32, region_ofs);
+    return false;  // the caller aborts, releasing the region
   }
 
-  // 2) Every record is complete: publish on flash. FREE (0xFF) -> ACTIVE
-  //    (0x01) only clears bits.
-  if (tsdb_flash_write_byte(writer->db->partition,
-                            writer->base_offset + offsetof(timeseries_page_header_t, page_state),
+  // Publish on flash. FREE (0xFF) -> ACTIVE (0x01) only clears bits.
+  if (tsdb_flash_write_byte(db->partition, region_ofs + offsetof(timeseries_page_header_t, page_state),
                             TIMESERIES_PAGE_STATE_ACTIVE) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed activating page @0x%08" PRIx32, writer->base_offset);
+    ESP_LOGE(TAG, "Failed activating page @0x%08" PRIx32, region_ofs);
     return false;
   }
   hdr.page_state = TIMESERIES_PAGE_STATE_ACTIVE;
-
-  ESP_LOGI(TAG, "Finalize: Page @0x%08" PRIx32 " size=%" PRIu32 " type=%u state=%u level=%u",
-           writer->base_offset, final_size, hdr.page_type, hdr.page_state, hdr.field_data_level);
-
-  float page_utilization = (float)used_bytes / final_size;
-  ESP_LOGI(TAG, "Page utilization: %.2f%%. page_size=%u level=%u", page_utilization * 100.0, (unsigned int)final_size,
-           (unsigned int)hdr.field_data_level);
+  ESP_LOGI(TAG, "Finalize: Page @0x%08" PRIx32 " size=%" PRIu32 " used=%" PRIu32 " level=%u", region_ofs, size,
+           used, (unsigned int)hdr.field_data_level);
 
   // Update page cache entry with final header (batch_add updates in-place if offset exists)
   if (writer->batch_snapshot) {
-    if (!tsdb_pagecache_batch_add(writer->batch_snapshot, writer->base_offset, &hdr)) {
+    if (!tsdb_pagecache_batch_add(writer->batch_snapshot, region_ofs, &hdr)) {
       ESP_LOGE(TAG, "OOM updating batch cache in finalize");
       return false;
     }
     tsdb_pagecache_batch_sort(writer->batch_snapshot);
-    ESP_LOGI(TAG, "Updated batch page cache entry @0x%08" PRIx32,
-             writer->base_offset);
-  } else {
-    if (!tsdb_pagecache_add_entry(writer->db, writer->base_offset, &hdr)) {
-      ESP_LOGE(TAG, "OOM updating page cache in finalize @0x%08" PRIx32,
-               writer->base_offset);
-      return false;
-    }
-    ESP_LOGI(TAG, "Updated page cache entry @0x%08" PRIx32,
-             writer->base_offset);
+  } else if (!tsdb_pagecache_add_entry(db, region_ofs, &hdr)) {
+    ESP_LOGE(TAG, "OOM updating page cache in finalize @0x%08" PRIx32, region_ofs);
+    return false;
   }
+  writer->reserved = false;
+  return true;
+}
 
+// The record boundary in (from, to) nearest its middle, or `from` when the
+// span holds a single record.
+static uint32_t split_point(const timeseries_page_stream_writer_t* writer, uint32_t from, uint32_t to) {
+  uint32_t mid = from + (to - from) / 2, best = from;
+  for (uint32_t at = from; at < to;) {
+    timeseries_field_data_header_t rec;
+    memcpy(&rec, writer->page_buf + at, sizeof(rec));
+    uint32_t next = at + (uint32_t)sizeof(rec) + rec.record_length;
+    if (next >= to) break;
+    uint32_t d = next > mid ? next - mid : mid - next, best_d = best > mid ? best - mid : mid - best;
+    if (best == from || d < best_d) best = next;
+    at = next;
+  }
+  return best;
+}
+
+// Publishes the records in page_buf[from, to): as one page if a free region
+// holds it, else split between records into smaller pages. Free space may be
+// plentiful but fragmented; a record is never split.
+static bool publish_records(timeseries_page_stream_writer_t* writer, uint32_t from, uint32_t to) {
+  bool placed = false;
+  if (publish_span(writer, from, to, &placed)) return true;
+  if (placed) return false;  // a write failed
+  uint32_t mid = split_point(writer, from, to);
+  if (mid == from) {
+    ESP_LOGE(TAG, "Failed to find blank region (size=%" PRIu32 ")",
+             tsdb_round_up_4k((uint32_t)sizeof(timeseries_page_header_t) + (to - from)));
+    return false;
+  }
+  ESP_LOGI(TAG, "No free region holds %" PRIu32 " bytes; splitting the page", to - from);
+  return publish_records(writer, from, mid) && publish_records(writer, mid, to);
+}
+
+bool timeseries_page_stream_writer_finalize(timeseries_page_stream_writer_t* writer) {
+  if (!writer || writer->finalized || !writer->page_buf) {
+    return false;
+  }
+  if (!publish_records(writer, sizeof(timeseries_page_header_t), writer->write_ptr)) return false;
+  free(writer->page_buf);
+  writer->page_buf = NULL;
   writer->finalized = true;
   return true;
 }
@@ -823,8 +647,7 @@ void timeseries_page_stream_writer_abort(timeseries_page_stream_writer_t* writer
   if (!writer || !writer->db) {
     return;
   }
-  ESP_LOGW(TAG, "Aborting stream writer for page @0x%08" PRIx32,
-           writer->base_offset);
+  ESP_LOGW(TAG, "Aborting stream writer (level %u)", (unsigned int)writer->level);
   writer->finalized = true;
 
   // Release any in-progress Gorilla encoders.  If a series was begun but never
@@ -836,6 +659,10 @@ void timeseries_page_stream_writer_abort(timeseries_page_stream_writer_t* writer
   gorilla_stream_deinit(&writer->ts_stream);
   gorilla_stream_deinit(&writer->val_stream);
 
-  tsdb_release_reserved_region(writer->db, writer->base_offset,
-                               writer->batch_snapshot);
+  // A page that failed during finalize gives its region back. Pages already
+  // finished belong to the caller (a compaction batch abandons them).
+  if (writer->reserved) tsdb_release_reserved_region(writer->db, writer->base_offset, writer->batch_snapshot);
+  writer->reserved = false;
+  free(writer->page_buf);
+  writer->page_buf = NULL;
 }

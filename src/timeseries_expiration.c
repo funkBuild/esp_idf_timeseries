@@ -16,6 +16,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include <inttypes.h>
 #include <stdlib.h>
@@ -481,6 +482,9 @@ static bool expire_to_horizon(timeseries_db_t *db, uint32_t bytes_to_free) {
     if (modified.count && !timeseries_compact_page_list(db, modified.pages, modified.count)) ok = false;
     free(modified.pages);
     if (!ok) break;
+    // Nothing read so far is used again: the pages this round retired can
+    // hold the next round's trims.
+    tsdb_epoch_quiesce(db);
     previous = horizon;
   }
   return ok;
@@ -503,7 +507,376 @@ bool timeseries_expiration_run(timeseries_db_t *db, float usage_threshold,
   if (!atomic_compare_exchange_strong(&db->compaction_in_progress, &expected, true)) return false;
   uint32_t bytes_to_free = (uint32_t)((float)db->partition->size * reduction_threshold);
   if (!bytes_to_free) bytes_to_free = 1;
-  bool ok = expire_to_horizon(db, bytes_to_free);
+  bool ok = tsdb_expire_bytes_held(db, bytes_to_free);
   atomic_store(&db->compaction_in_progress, false);
+  return ok;
+}
+
+// The calling task frees space: its allocations may use the reserves
+// (timeseries_data.h). Returns the previous holder, for exempt_end().
+static TaskHandle_t exempt_begin(timeseries_db_t *db) {
+  TaskHandle_t previous = atomic_load(&db->reserve_exempt_task);
+  atomic_store(&db->reserve_exempt_task, xTaskGetCurrentTaskHandle());
+  return previous;
+}
+
+static void exempt_end(timeseries_db_t *db, TaskHandle_t previous) {
+  atomic_store(&db->reserve_exempt_task, previous);
+}
+
+// Dropped pages a run may need before its trims fit.
+#define TSDB_EXPIRE_MAX_DROPS 16
+
+bool tsdb_expire_bytes_held(timeseries_db_t *db, uint32_t bytes_to_free) {
+  if (!db || !db->partition || !bytes_to_free) return false;
+  TaskHandle_t previous = exempt_begin(db);
+  uint32_t no_room = atomic_load(&db->no_room_count);
+  bool ok = expire_to_horizon(db, bytes_to_free);
+  // On a full, fragmented partition the trims may find no room even in the
+  // reserves; a failed trim deletes nothing. Dropping the oldest page needs no
+  // room: drop one and try again. (Other failures are reported as they are.)
+  for (int drops = 0; !ok && atomic_load(&db->no_room_count) != no_room && drops < TSDB_EXPIRE_MAX_DROPS;
+       drops++) {
+    no_room = atomic_load(&db->no_room_count);
+    bool dropped = false;
+    if (!tsdb_drop_oldest_page_held(db, &dropped) || !dropped) break;
+    tsdb_epoch_quiesce(db);
+    ESP_LOGW(TAG, "Expiration found no room for its trims; dropped the oldest page and retrying");
+    ok = expire_to_horizon(db, bytes_to_free);
+  }
+  exempt_end(db, previous);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Reclaiming deleted records
+// ---------------------------------------------------------------------------
+
+/*
+ * A deleted record keeps its space until its page is rewritten. Expiration
+ * and dropping rewrite the pages they change, and compaction drops deleted
+ * records as it merges, but a rewrite can fail for lack of room, and the top
+ * level is never compacted: deleted records left there would hold the space
+ * while clearing expired live data instead.
+ */
+typedef struct {
+  uint32_t offset, size, live;
+} page_garbage_t;
+
+// The live and deleted record bytes of an ACTIVE field-data page.
+static bool page_record_bytes(timeseries_db_t *db, uint32_t offset, uint32_t size, uint8_t *window, uint32_t *live,
+                              uint32_t *dead) {
+  timeseries_fielddata_iterator_t it;
+  timeseries_field_data_header_t r;
+  *live = *dead = 0;
+  if (!timeseries_fielddata_iterator_init_window(db, offset, size, window, 4096, &it)) return false;
+  while (timeseries_fielddata_iterator_next(&it, &r)) {
+    uint32_t b = (uint32_t)sizeof(r) + r.record_length;
+    if (r.flags & TSDB_FIELDDATA_FLAG_DELETED) *live += b;  // bit cleared = deleted
+    else *dead += b;
+  }
+  bool ok = !it.read_error;
+  timeseries_fielddata_iterator_deinit(&it);
+  return ok;
+}
+
+// Pages without live records first (retiring them allocates nothing), then
+// by the bytes a rewrite frees, roughly.
+static int compare_garbage(const void *a, const void *b) {
+  const page_garbage_t *x = a, *y = b;
+  if (!x->live != !y->live) return x->live ? 1 : -1;
+  uint32_t gx = x->size - x->live, gy = y->size - y->live;
+  return gx > gy ? -1 : gx < gy;
+}
+
+bool tsdb_reclaim_deleted_held(timeseries_db_t *db, bool rewrite, uint32_t *reclaimed) {
+  if (reclaimed) *reclaimed = 0;
+  if (!db || !db->partition) return false;
+  page_garbage_t *pages = NULL;
+  size_t count = 0, capacity = 0;
+  uint8_t *window = malloc(4096);
+  bool ok = window != NULL;
+  timeseries_page_cache_iterator_t it;
+  timeseries_page_header_t hdr;
+  uint32_t offset = 0, size = 0;
+  if (ok) ok = timeseries_page_cache_iterator_init(db, &it);
+  if (!ok) {
+    free(window);
+    return false;
+  }
+  while (ok && timeseries_page_cache_iterator_next(&it, &hdr, &offset, &size)) {
+    if (hdr.magic_number != TIMESERIES_MAGIC_NUM || hdr.page_type != TIMESERIES_PAGE_TYPE_FIELD_DATA ||
+        hdr.page_state != TIMESERIES_PAGE_STATE_ACTIVE)
+      continue;
+    uint32_t live = 0, dead = 0;
+    if (!page_record_bytes(db, offset, size, window, &live, &dead) || !dead) continue;
+    // A rewrite frees the page less its live records, in whole sectors.
+    if (live && (!rewrite || tsdb_round_up_4k((uint32_t)sizeof(hdr) + live) + 4096 > size)) continue;
+    if (count == capacity) {
+      size_t cap = capacity ? capacity * 2 : 32;
+      page_garbage_t *grown = realloc(pages, cap * sizeof(*grown));
+      if (!grown) {
+        ok = false;
+        break;
+      }
+      pages = grown;
+      capacity = cap;
+    }
+    pages[count++] = (page_garbage_t){offset, size, live};
+  }
+  timeseries_page_cache_iterator_deinit(&it);
+  free(window);
+  if (count) qsort(pages, count, sizeof(*pages), compare_garbage);
+  TaskHandle_t previous = exempt_begin(db);
+  for (size_t i = 0; ok && i < count; i++) {
+    if (!timeseries_compact_page_list(db, &pages[i].offset, 1)) continue;  // no room: a later run retries
+    if (reclaimed) *reclaimed += pages[i].size;
+  }
+  exempt_end(db, previous);
+  if (count) ESP_LOGI(TAG, "Reclaiming deleted records on %zu page(s)", count);
+  free(pages);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Dropping the oldest page
+// ---------------------------------------------------------------------------
+
+/*
+ * Every record of the page whose newest point is oldest is deleted, and the
+ * page is then reclaimed without a rewrite, so nothing is allocated: this
+ * works however full and fragmented the partition is.
+ *
+ * Records of the same series that overlap a dropped record in time are
+ * dropped with it (and so on, transitively): one of them may hold an older
+ * revision of a point the dropped record replaced, which would otherwise be
+ * visible again. They are deleted oldest page first, so a reset part way
+ * leaves the newer revisions. Unlike a horizon run, the other series keep
+ * their points older than the dropped page.
+ */
+typedef struct {
+  uint32_t offset, sequence;
+  uint64_t newest;
+} page_age_t;
+
+typedef struct {
+  page_age_t *pages;
+  size_t count, capacity;
+  bool oom;
+} page_ages_t;
+
+static bool visit_page_age(void *p, uint32_t po, const timeseries_page_header_t *ph, uint32_t ro,
+                           const timeseries_field_data_header_t *r) {
+  (void)ro;
+  page_ages_t *a = p;
+  // Records are visited page by page.
+  if (a->count && a->pages[a->count - 1].offset == po) {
+    if (r->end_time > a->pages[a->count - 1].newest) a->pages[a->count - 1].newest = r->end_time;
+    return true;
+  }
+  if (a->count == a->capacity) {
+    size_t cap = a->capacity ? a->capacity * 2 : 64;
+    page_age_t *grown = realloc(a->pages, cap * sizeof(*grown));
+    if (!grown) {
+      a->oom = true;
+      return false;
+    }
+    a->pages = grown;
+    a->capacity = cap;
+  }
+  a->pages[a->count++] = (page_age_t){po, ph->sequence_num, r->end_time};
+  return true;
+}
+
+typedef struct {
+  uint32_t page;              // the page being dropped
+  tsdb_record_ref_t *refs;    // records to delete
+  size_t count, capacity;
+  bool grew, oom;
+} drop_set_t;
+
+static bool drop_set_has(const drop_set_t *d, uint32_t po, uint32_t ro) {
+  for (size_t i = 0; i < d->count; i++)
+    if (d->refs[i].page_offset == po && d->refs[i].record_offset == ro) return true;
+  return false;
+}
+
+static bool drop_set_add(drop_set_t *d, uint32_t po, const timeseries_page_header_t *ph, uint32_t ro,
+                         const timeseries_field_data_header_t *r) {
+  if (d->count == d->capacity) {
+    size_t cap = d->capacity ? d->capacity * 2 : 32;
+    tsdb_record_ref_t *grown = realloc(d->refs, cap * sizeof(*grown));
+    if (!grown) {
+      d->oom = true;
+      return false;
+    }
+    d->refs = grown;
+    d->capacity = cap;
+  }
+  d->refs[d->count++] = (tsdb_record_ref_t){po, ph->sequence_num, ro, *r};
+  d->grew = true;
+  return true;
+}
+
+static bool visit_drop_page(void *p, uint32_t po, const timeseries_page_header_t *ph, uint32_t ro,
+                            const timeseries_field_data_header_t *r) {
+  drop_set_t *d = p;
+  return po != d->page || drop_set_add(d, po, ph, ro, r);
+}
+
+static bool visit_drop_overlaps(void *p, uint32_t po, const timeseries_page_header_t *ph, uint32_t ro,
+                                const timeseries_field_data_header_t *r) {
+  drop_set_t *d = p;
+  if (drop_set_has(d, po, ro)) return true;
+  for (size_t i = 0; i < d->count; i++) {
+    const timeseries_field_data_header_t *x = &d->refs[i].header;
+    if (!memcmp(x->series_id, r->series_id, sizeof(r->series_id)) && r->start_time <= x->end_time &&
+        x->start_time <= r->end_time)
+      return drop_set_add(d, po, ph, ro, r);
+  }
+  return true;
+}
+
+static int compare_ref_age(const void *a, const void *b) {
+  uint32_t x = ((const tsdb_record_ref_t *)a)->page_sequence, y = ((const tsdb_record_ref_t *)b)->page_sequence;
+  return x < y ? -1 : x > y;
+}
+
+typedef struct {
+  const uint32_t *pages;
+  size_t count;
+  bool *live;
+} live_pages_t;
+
+static bool visit_live_pages(void *p, uint32_t po, const timeseries_page_header_t *ph, uint32_t ro,
+                             const timeseries_field_data_header_t *r) {
+  (void)ph;
+  (void)ro;
+  (void)r;
+  live_pages_t *l = p;
+  for (size_t i = 0; i < l->count; i++)
+    if (l->pages[i] == po) l->live[i] = true;
+  return true;
+}
+
+#define TSDB_DROP_MAX_PASSES 16
+
+bool tsdb_drop_oldest_page_held(timeseries_db_t *db, bool *dropped) {
+  if (dropped) *dropped = false;
+  if (!db || !db->partition) return false;
+  // Pages left without live records go first: no data is lost.
+  uint32_t reclaimed = 0;
+  if (tsdb_reclaim_deleted_held(db, false, &reclaimed) && reclaimed) {
+    if (dropped) *dropped = true;
+    return true;
+  }
+  TaskHandle_t previous = exempt_begin(db);
+  page_ages_t ages = {0};
+  drop_set_t d = {0};
+  page_list_t modified = {0};
+  bool *live = NULL;
+  bool ok = visit_live_records(db, false, visit_page_age, &ages) && !ages.oom;
+  if (!ok || !ages.count) goto done;
+
+  size_t oldest = 0;
+  for (size_t i = 1; i < ages.count; i++)
+    if (ages.pages[i].newest < ages.pages[oldest].newest ||
+        (ages.pages[i].newest == ages.pages[oldest].newest && ages.pages[i].sequence < ages.pages[oldest].sequence))
+      oldest = i;
+  d.page = ages.pages[oldest].offset;
+
+  ok = visit_live_records(db, false, visit_drop_page, &d) && !d.oom;
+  for (int pass = 0; ok && d.grew; pass++) {
+    if (pass == TSDB_DROP_MAX_PASSES) {
+      ESP_LOGW(TAG, "Overlapping records of page @0x%08" PRIx32 " did not settle; not dropping it", d.page);
+      ok = false;
+      break;
+    }
+    d.grew = false;
+    ok = visit_live_records(db, false, visit_drop_overlaps, &d) && !d.oom;
+  }
+  if (!ok || !d.count) goto done;
+
+  qsort(d.refs, d.count, sizeof(*d.refs), compare_ref_age);
+  tsdb_write_lock(db);
+  for (size_t i = 0; ok && i < d.count; i++)
+    ok = soft_delete(db, &d.refs[i]) && page_list_add(&modified, d.refs[i].page_offset);
+  if (db->flash_write_mutex) xSemaphoreGive(db->flash_write_mutex);
+  ESP_LOGI(TAG, "Dropped page @0x%08" PRIx32 ": %zu record(s) deleted on %zu page(s)", d.page, d.count,
+           modified.count);
+  if (dropped) *dropped = modified.count > 0;
+
+  // Reclaim the pages left without live records; a page that keeps some is
+  // rewritten by a later compaction (rewriting it now would allocate).
+  live = modified.count ? calloc(modified.count, sizeof(*live)) : NULL;
+  if (live) {
+    live_pages_t l = {modified.pages, modified.count, live};
+    if (visit_live_records(db, false, visit_live_pages, &l)) {
+      for (size_t i = 0; i < modified.count; i++)
+        if (!live[i] && !timeseries_compact_page_list(db, &modified.pages[i], 1)) ok = false;
+    }
+  }
+
+done:
+  free(live);
+  free(modified.pages);
+  free(d.refs);
+  free(ages.pages);
+  exempt_end(db, previous);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Clearing space in the background
+// ---------------------------------------------------------------------------
+
+// Expiration frees in steps of at least this much, so the task does not wake
+// for every page an insert takes.
+#define TSDB_CLEAR_STEP (64 * 1024u)
+
+bool tsdb_clear_space_needed(timeseries_db_t *db) {
+  if (!db || !db->partition || !db->space.drop_oldest) return false;
+  if (db->space.clear_free && atomic_load(&db->usable_free) < db->space.clear_free) return true;
+  return db->space.max_usage_percent && (uint64_t)tsdb_pagecache_get_total_active_size(db) * 100 >
+                                            (uint64_t)db->partition->size * db->space.max_usage_percent;
+}
+
+bool tsdb_clear_space_held(timeseries_db_t *db) {
+  if (!db || !db->partition || !db->space.drop_oldest) return true;
+  uint64_t need = 0;
+  uint32_t usable = tsdb_usable_free(db);
+  if (db->space.clear_free && usable < db->space.clear_free) need = db->space.clear_free - usable;
+  if (db->space.max_usage_percent) {
+    uint64_t used = tsdb_pagecache_get_total_active_size(db);
+    uint64_t limit = (uint64_t)db->partition->size * db->space.max_usage_percent / 100;
+    if (used > limit && used - limit > need) need = used - limit;
+  }
+  if (!need) return true;
+  // Deleted records first: reclaiming them loses no data.
+  uint32_t reclaimed = 0;
+  (void)tsdb_reclaim_deleted_held(db, true, &reclaimed);
+  if (reclaimed) {
+    tsdb_epoch_quiesce(db);
+    if (reclaimed >= need) {
+      tsdb_usable_free(db);
+      return true;
+    }
+    need -= reclaimed;
+  }
+  need += TSDB_CLEAR_STEP;
+  if (need > db->partition->size) need = db->partition->size;
+  ESP_LOGI(TAG, "Clearing the oldest data: %" PRIu32 " KiB usable free, freeing %" PRIu32 " KiB", usable / 1024,
+           (uint32_t)(need / 1024));
+  uint32_t used_before = tsdb_pagecache_get_total_active_size(db);
+  bool ok = tsdb_expire_bytes_held(db, (uint32_t)need);
+  tsdb_epoch_quiesce(db);
+  // An expiration that could not place its trims frees nothing; dropping a
+  // page needs no space.
+  if (!ok || tsdb_pagecache_get_total_active_size(db) >= used_before) {
+    bool dropped = false;
+    ok = tsdb_drop_oldest_page_held(db, &dropped) && dropped;
+    tsdb_epoch_quiesce(db);
+  }
+  tsdb_usable_free(db);
   return ok;
 }
